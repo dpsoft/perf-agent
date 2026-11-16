@@ -1264,11 +1264,43 @@ func (r *Run) exitError(stderr string) *Error {
 		}
 		for _, name := range names {
 			if fi, err := r.spec.Staging.Lstat(name); err != nil || fi.Size() == 0 {
-				return withTail(Errorf(CodeNoOutput, "capture again", "perf-agent exited 0 but wrote no %s profile (%s)", m, name))
+				return withTail(r.noOutput(m, name))
 			}
 		}
 	}
 	return nil
+}
+
+// noOutput is a mode's profile perf-agent did not write although it exited
+// 0: it recorded no sample of the target. A capture its target's exit
+// stopped is not retryable, as the same target ends the same way; one
+// that ran its course says what the target did not do.
+func (r *Run) noOutput(m Mode, name string) *Error {
+	e := Errorf(CodeNoOutput, "", "perf-agent exited 0 but wrote no %s profile (%s)", m, name)
+	switch r.o.StoppedBy {
+	case StoppedByCommandExit:
+		e.Retryable = false
+		e.Next = "the command ended during the capture before perf-agent recorded a sample of it: give it more work; " +
+			"if it starts a daemon or a server and returns, start that yourself and capture it with pid"
+	case StoppedByTargetExit:
+		e.Retryable = false
+		e.Next = fmt.Sprintf("pid %d ended during the capture before perf-agent recorded a sample of it: "+
+			"if it was restarted, capture its new pid", r.spec.PID)
+	default:
+		other := ", or capture its new pid"
+		if r.spec.Launch != nil {
+			other = ""
+		}
+		switch m {
+		case ModeCPU:
+			e.Next = "the target did not run on CPU during the capture: add offcpu, give it work" + other
+		case ModeOffCPU:
+			e.Next = "the target did not block off CPU during the capture: give it work" + other
+		default:
+			e.Next = "the target ran no GPU work perf-agent recorded during the capture: give it GPU work, or capture again"
+		}
+	}
+	return e
 }
 
 // lastLine is the last non-empty line of s.

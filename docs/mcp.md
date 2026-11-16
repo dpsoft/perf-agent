@@ -201,7 +201,7 @@ A failure is an `isError` result whose text is one JSON object, so a loop can br
 | `start_timeout` | yes | perf-agent was not ready within `Capture.StartTimeout` |
 | `finish_timeout` | yes | perf-agent did not finish within `Capture.FinishTimeout` |
 | `too_large` | no | A file passed `Capture.MaxProfileBytes` or `Capture.MaxExeclogBytes` while written; capture shorter or at a lower rate |
-| `no_output` | yes | perf-agent exited 0 without the expected file, or a failure recorded no cause |
+| `no_output` | yes; no when the target's exit stopped the capture | perf-agent exited 0 without the expected file: it recorded no sample of the target (or a failure recorded no cause). `next` says what to change: for a target that did not run in the mode (idle in `cpu`), add `offcpu`, give it work or capture its new pid; for one that ended during the capture, which ends the same way again, give the command more work or capture the restarted process's new pid |
 | `stuck_child` | no | Processes survived `Capture.StopGrace`; `survivors` lists their PID, comm, start time and state. Do not retry; look at them |
 | `closing` | no | The server is shutting down and starts no capture; start a new one |
 | `cancelled` | no; yes when `status` is `interrupted` | The job was cancelled. `status: "interrupted"` (with `retry_after: "0s"`) means the server ended under the capture and recovery recorded it: capture again |

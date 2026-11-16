@@ -526,7 +526,7 @@ because a loop branches on it:
 | `binary_changed` | no | §5.1: restart the server |
 | `start_timeout`, `finish_timeout` | yes | Names the limit and its value |
 | `too_large` | no | A file passed its limit; suggests a shorter duration or a lower rate |
-| `no_output` | yes | Exit 0 without the expected file |
+| `no_output` | yes; no when the target's exit stopped the capture | Exit 0 without the expected file: perf-agent recorded no sample of the target. A capture the target's or command's exit stopped is not retryable (the same target ends the same way, the CAP-R85 class), and `next` says to give the command more work or capture a restarted process's new pid; otherwise `next` names what the target did not do in the mode: for `cpu`, "the target did not run on CPU during the capture: add offcpu, give it work, or capture its new pid" |
 | `stuck_child` | no | Processes survived `StopGrace`; `survivors` lists their PID, `comm`, start time and state (CAP-R3b); do not retry; tell the user |
 | `closing` | no | The server is shutting down and starts no capture; start a new one |
 | `cancelled` | no; yes when interrupted | `capture_wait` answers it for a job cancelled by `capture_cancel` or by the end of the stdio session (`status: "cancelled"`), and with `status: "interrupted"`, `retryable: true` and `retry_after: "0s"` for a capture whose server ended under it (recovery wrote its manifest); `capture_list` shows it as the outcome. `notifications/cancelled` on a request sends no response at all |

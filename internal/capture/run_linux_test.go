@@ -368,6 +368,35 @@ func TestRunPerfAgentExitAfterTheTargetIsTargetExit(t *testing.T) {
 	}
 }
 
+// No output from a capture its target's exit stopped is not retryable:
+// the same target ends the same way. The next says what to change.
+func TestRunNoOutputAfterTheTargetEndedIsNotRetryable(t *testing.T) {
+	t.Run("command", func(t *testing.T) {
+		spec := runSpec(t, capturetest.FakeOptions{Mode: capturetest.FakeNoFile})
+		spec.Settings.Duration = 20 * time.Second
+		spec.Launch = launchOf(t, "exit-after", "500ms", "0")
+		o := waitRun(t, startRun(t, spec), 30*time.Second)
+		if o.StoppedBy != StoppedByCommandExit || errCode(o.Err) != CodeNoOutput || o.Err.Retryable ||
+			!strings.Contains(o.Err.Next, "give it more work") {
+			t.Fatalf("stopped by %q, Err %+v; want no_output, not retryable, telling to give it more work", o.StoppedBy, o.Err)
+		}
+	})
+	t.Run("pid", func(t *testing.T) {
+		spec := runSpec(t, capturetest.FakeOptions{Mode: capturetest.FakeNoFile})
+		spec.Settings.Duration = 20 * time.Second
+		target := startChild(t, "sleep")
+		spec.PID = target.PID
+		r := startRun(t, spec)
+		waitPhase(t, r, PhaseProfiling, 10*time.Second)
+		target.exit()
+		o := waitRun(t, r, 30*time.Second)
+		if o.StoppedBy != StoppedByTargetExit || errCode(o.Err) != CodeNoOutput || o.Err.Retryable ||
+			!strings.Contains(o.Err.Next, "capture its new pid") {
+			t.Fatalf("stopped by %q, Err %+v; want no_output, not retryable, telling to capture its new pid", o.StoppedBy, o.Err)
+		}
+	})
+}
+
 func TestRunTargetExitedBeforeReadiness(t *testing.T) {
 	spec := runSpec(t, capturetest.FakeOptions{ReadyAfter: 3 * time.Second})
 	target := startChild(t, "sleep")
@@ -524,7 +553,7 @@ func TestRunExitCodes(t *testing.T) {
 		{capturetest.FakeExit2, CodePerfAgentRefusedArgs, false, "v0.0.0-test", ""},
 		{capturetest.FakeExit1Stderr, CodePerfAgentFailed, false, "the capture failed", "setcap"},
 		{capturetest.FakeExit127Loader, CodePerfAgentUnstartable, false, "could not start", "link blazesym statically"},
-		{capturetest.FakeNoFile, CodeNoOutput, true, "wrote no cpu profile", ""},
+		{capturetest.FakeNoFile, CodeNoOutput, true, "wrote no cpu profile", "did not run on CPU during the capture: add offcpu"},
 	} {
 		t.Run(string(tc.mode), func(t *testing.T) {
 			spec := runSpec(t, capturetest.FakeOptions{Mode: tc.mode})

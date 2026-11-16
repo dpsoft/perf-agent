@@ -61,7 +61,7 @@ func run(mode string, args []string) error {
 	// Arguments are parsed up front so a bad one is an error, never a
 	// zero duration.
 	switch mode {
-	case "busy", "sleep", "fork-and-exit", spawnSetsid, "ignore-sigterm":
+	case "busy", "read-zero", "sleep", "fork-and-exit", spawnSetsid, "ignore-sigterm":
 		dur(0)
 	case "double-fork-setsid":
 		dur(0)
@@ -85,8 +85,9 @@ func run(mode string, args []string) error {
 	}
 	switch mode {
 	case "busy":
-		for end := time.Now().Add(dur(0)); time.Now().Before(end); {
-		}
+		spin(dur(0))
+	case "read-zero":
+		return readZero(dur(0))
 	case "sleep":
 		time.Sleep(dur(0))
 	case "exit-after":
@@ -128,6 +129,34 @@ func run(mode string, args []string) error {
 		return syscall.Exec(args[0], args, os.Environ())
 	default:
 		return fmt.Errorf("unknown mode %q", mode)
+	}
+	return nil
+}
+
+// spin keeps a CPU busy in user space for d. It is a named function of its
+// own so a real profile of the workload has a frame to look for.
+//
+//go:noinline
+func spin(d time.Duration) {
+	for end := time.Now().Add(d); time.Now().Before(end); {
+	}
+}
+
+// readZero reads /dev/zero for d, so most of its CPU time is spent in the
+// kernel: a real profile with kernel stacks has kernel frames to show.
+//
+//go:noinline
+func readZero(d time.Duration) error {
+	f, err := os.Open("/dev/zero")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	buf := make([]byte, 1<<20)
+	for end := time.Now().Add(d); time.Now().Before(end); {
+		if _, err := f.Read(buf); err != nil {
+			return err
+		}
 	}
 	return nil
 }

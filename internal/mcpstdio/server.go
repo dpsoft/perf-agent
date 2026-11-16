@@ -48,9 +48,9 @@ func (s *Server) warn(kind, subject string, level slog.Level, args ...any) {
 	}
 }
 
-// reportWarnings logs, off the caller's goroutine, how many warnings of
+// FlushWarnings logs, off the caller's goroutine, how many warnings of
 // each kind went unlogged, and starts the counts again.
-func (s *Server) reportWarnings() {
+func (s *Server) FlushWarnings() {
 	s.warnMu.Lock()
 	var args []any
 	for kind, n := range s.warned {
@@ -135,7 +135,7 @@ func New(o Options) *Server {
 func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	ss := s.newSession(ctx, w)
 	defer ss.hcancel()
-	defer s.reportWarnings()
+	defer s.FlushWarnings()
 	go ss.out.run()
 	go ss.dispatch()
 	go ss.read(r)
@@ -262,7 +262,7 @@ var knownMethods = map[string]bool{
 func (s *Server) handle(ctx context.Context, method string, params json.RawMessage) (any, *rpcError) {
 	switch method {
 	case "initialize":
-		return s.initialize(params)
+		return s.initialize(ctx, params)
 	case "ping":
 		return struct{}{}, nil
 	case "tools/list":
@@ -284,7 +284,7 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 	case "resources/templates/list":
 		return map[string]any{"resourceTemplates": []struct{}{}}, nil
 	case "resources/read":
-		return s.readResource(params)
+		return s.readResource(ctx, params)
 	}
 	return nil, &rpcError{Code: codeMethodNotFound, Message: "method not found: " + echoName(method)}
 }
@@ -306,9 +306,12 @@ func decodeParams(params json.RawMessage, v any) *rpcError {
 	return nil
 }
 
-func (s *Server) initialize(params json.RawMessage) (any, *rpcError) {
+func (s *Server) initialize(ctx context.Context, params json.RawMessage) (any, *rpcError) {
 	var p struct {
 		ProtocolVersion string `json:"protocolVersion"`
+		ClientInfo      struct {
+			Name string `json:"name"`
+		} `json:"clientInfo"`
 	}
 	if e := decodeParams(params, &p); e != nil {
 		return nil, e
@@ -316,6 +319,9 @@ func (s *Server) initialize(params json.RawMessage) (any, *rpcError) {
 	version := LatestVersion
 	if slices.Contains(SupportedVersions, p.ProtocolVersion) {
 		version = p.ProtocolVersion
+	}
+	if ps, ok := ctx.Value(protoKey{}).(*Session); ok {
+		ps.record(version, clientLabel(p.ClientInfo.Name))
 	}
 	type listChanged struct {
 		ListChanged bool `json:"listChanged"`
@@ -444,7 +450,7 @@ func (s *Server) getPrompt(params json.RawMessage) (any, *rpcError) {
 	return res, nil
 }
 
-func (s *Server) readResource(params json.RawMessage) (any, *rpcError) {
+func (s *Server) readResource(ctx context.Context, params json.RawMessage) (any, *rpcError) {
 	var p struct {
 		URI string `json:"uri"`
 	}
@@ -456,7 +462,14 @@ func (s *Server) readResource(params json.RawMessage) (any, *rpcError) {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown resource: " + echoName(p.URI)}
 	}
 	r := s.o.Resources[i]
-	content := map[string]string{"uri": r.URI, "text": r.Text}
+	text := r.Text
+	if r.Read != nil {
+		var err error
+		if text, err = r.Read(ctx); err != nil {
+			return nil, &rpcError{Code: codeInternalError, Message: err.Error()}
+		}
+	}
+	content := map[string]string{"uri": r.URI, "text": text}
 	if r.MIMEType != "" {
 		content["mimeType"] = r.MIMEType
 	}

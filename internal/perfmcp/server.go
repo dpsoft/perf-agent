@@ -218,8 +218,9 @@ func New(cfg Config) (_ *Server, err error) {
 		MaxToolErrorBytes: max(lim.MaxResponseBytes, minToolErrorBytes),
 		// MaxOutBytes is left to mcpstdio, which makes room for two
 		// answers of MaxToolErrorBytes at their worst escaping.
-		DrainTimeout: drainTimeout,
-		Log:          s.log,
+		MaxOutMessages: cfg.OutputQueueMessages,
+		DrainTimeout:   drainTimeout,
+		Log:            s.log,
 		// Nobody collects a stdio session's jobs once it ends.
 		OnClose: func(mcpstdio.CloseReason) { s.cancelAllJobs() },
 	})

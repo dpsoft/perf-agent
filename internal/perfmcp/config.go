@@ -39,6 +39,10 @@ type Config struct {
 	Log *slog.Logger
 	// Capture configures the capture tools.
 	Capture CaptureConfig
+	// OutputQueueMessages bounds the messages waiting to be written to the
+	// client; 0 means 64. The command never sets it: a test lowers it to
+	// fill the output queue behind a small pipe.
+	OutputQueueMessages int
 }
 
 // CaptureConfig configures capturing. With PerfAgent empty capture is

@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,6 +24,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/dpsoft/perf-agent/internal/capture"
+	"github.com/dpsoft/perf-agent/internal/capture/capturetest"
 	"github.com/dpsoft/perf-agent/internal/perfmcp"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
 )
@@ -32,17 +35,79 @@ import (
 // the same run function, and a subprocess is this package's test binary, built without -race.
 const liveEnv = "PERF_AGENT_MCP_TEST_LIVE"
 
+// fakeVerifyEnv makes a test binary run as the server and accept any
+// --perf-agent, such as the fake perf-agent, which cannot be setcap'd.
+const fakeVerifyEnv = "PERF_AGENT_MCP_TEST_FAKE_VERIFY"
+
+// outqEnv makes a test binary run as the server with an output queue of
+// that many messages, so a test can fill it with a pipe of a few KiB.
+const outqEnv = "PERF_AGENT_MCP_TEST_OUTQ"
+
+// TestMain lets this test binary serve as a capture's reaper and launcher,
+// as the command's own binary does, and as the server itself when a test
+// runs it with one of the environment variables above.
 func TestMain(m *testing.M) {
-	if os.Getenv(liveEnv) == "1" {
-		configHook = func(c *perfmcp.Config) { c.Live = true }
+	if code, handled := capture.RunInternal(); handled {
+		os.Exit(code)
+	}
+	if hook := envConfigHook(); hook != nil {
+		configHook = hook
 		main()
 		return
 	}
-	code := m.Run()
+	code := capturetest.Main(m)
 	if liveBinDir != "" {
 		_ = os.RemoveAll(liveBinDir)
 	}
 	os.Exit(code)
+}
+
+// envConfigHook is the configHook the environment asks for, composed of
+// every test variable set, or nil when none is.
+func envConfigHook() func(*perfmcp.Config) {
+	var steps []func(*perfmcp.Config)
+	if os.Getenv(liveEnv) == "1" {
+		steps = append(steps, func(c *perfmcp.Config) { c.Live = true })
+	}
+	if os.Getenv(fakeVerifyEnv) == "1" {
+		steps = append(steps, func(c *perfmcp.Config) { c.Capture.Verify = fakeVerify })
+	}
+	if v := os.Getenv(outqEnv); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			fmt.Fprintf(os.Stderr, "%s=%q is not a positive integer\n", outqEnv, v)
+			os.Exit(2)
+		}
+		steps = append(steps, func(c *perfmcp.Config) { c.OutputQueueMessages = n })
+	}
+	if len(steps) == 0 {
+		return nil
+	}
+	return func(c *perfmcp.Config) {
+		for _, step := range steps {
+			step(c)
+		}
+	}
+}
+
+// fakeVerify accepts any file as a perf-agent without capabilities; its
+// identity is still read, so the check before each run holds.
+func fakeVerify(p string) (capture.Binary, error) {
+	id, err := capture.IdentityOf(p)
+	return capture.Binary{Path: p, ID: id, Version: "v0.0.0-test"}, err
+}
+
+// fakeCommand is a subprocess running the server, this package's test
+// binary built without -race, with env added to the test's environment.
+func fakeCommand(t *testing.T, env []string, args ...string) *exec.Cmd {
+	t.Helper()
+	exe, err := liveTestBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, args...)
+	cmd.Env = append(os.Environ(), env...)
+	return cmd
 }
 
 // liveBinDir holds the test binary liveCommand builds.
@@ -73,13 +138,7 @@ func withLive(t *testing.T) {
 // liveCommand is a subprocess running the server with the live page engine.
 func liveCommand(t *testing.T, args ...string) *exec.Cmd {
 	t.Helper()
-	exe, err := liveTestBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command(exe, args...)
-	cmd.Env = append(os.Environ(), liveEnv+"=1")
-	return cmd
+	return fakeCommand(t, []string{liveEnv + "=1"}, args...)
 }
 
 func TestRunNeedsAProfilesRoot(t *testing.T) {
@@ -111,6 +170,69 @@ func TestRunAppliesLimits(t *testing.T) {
 	}
 	if code := run([]string{"--profiles", t.TempDir(), "--limit", "MaxRows=x"}, strings.NewReader(""), &out, &errb); code != 2 {
 		t.Errorf("non-integer limit: exit %d, want 2", code)
+	}
+}
+
+// The capture flags reach the server's configuration as given, and
+// --capture-ttl wins over --limit Capture.TTL wherever it stands.
+func TestRunCaptureFlagsReachTheConfig(t *testing.T) {
+	var got perfmcp.Config
+	// The hook keeps what the flags made and turns capture off, so the
+	// made-up paths are never verified.
+	configHook = func(c *perfmcp.Config) {
+		got = *c
+		c.Capture = perfmcp.CaptureConfig{}
+	}
+	t.Cleanup(func() { configHook = nil })
+	runOK := func(args ...string) perfmcp.Config {
+		t.Helper()
+		got = perfmcp.Config{}
+		var out, errb bytes.Buffer
+		if code := run(append([]string{"--profiles", t.TempDir()}, args...), strings.NewReader(""), &out, &errb); code != 0 {
+			t.Fatalf("%v: exit %d, stderr %q", args, code, errb.String())
+		}
+		return got
+	}
+
+	c := runOK("--perf-agent", "/opt/pa/perf-agent", "--captures", "runs",
+		"--capture-command", "/usr/bin/true", "--capture-command", "/usr/bin/false",
+		"--gpu-shim", "/opt/pa/libshim.so", "--capture-ttl", "48h", "--limit", "Capture.TTL=1h")
+	want := perfmcp.CaptureConfig{PerfAgent: "/opt/pa/perf-agent", Dir: "runs", GPUShim: "/opt/pa/libshim.so", Owner: "stdio",
+		Commands: []string{"/usr/bin/true", "/usr/bin/false"}}
+	if c.Capture.Verify != nil {
+		t.Error("the command set a Verify seam")
+	}
+	c.Capture.Verify = nil
+	if !reflect.DeepEqual(c.Capture, want) {
+		t.Errorf("Capture = %+v, want %+v", c.Capture, want)
+	}
+	if c.Limits.Capture.TTL != 48*time.Hour {
+		t.Errorf("--capture-ttl 48h after --limit: TTL %v", c.Limits.Capture.TTL)
+	}
+	if c := runOK("--capture-ttl", "48h", "--limit", "Capture.TTL=1h"); c.Limits.Capture.TTL != 48*time.Hour {
+		t.Errorf("--capture-ttl 48h before --limit: TTL %v", c.Limits.Capture.TTL)
+	}
+	if c := runOK("--limit", "Capture.TTL=1h"); c.Limits.Capture.TTL != time.Hour {
+		t.Errorf("--limit Capture.TTL=1h alone: TTL %v", c.Limits.Capture.TTL)
+	}
+	if c := runOK("--capture-ttl", "0s"); c.Limits.Capture.TTL != 0 {
+		t.Errorf("--capture-ttl 0s: TTL %v, want 0 (no age limit)", c.Limits.Capture.TTL)
+	}
+	c = runOK()
+	if c.Limits.Capture.TTL != perfmcp.DefaultLimits().Capture.TTL || c.Capture.PerfAgent != "" || c.Capture.Dir != "" {
+		t.Errorf("defaults: TTL %v, Capture %+v", c.Limits.Capture.TTL, c.Capture)
+	}
+
+	for _, args := range [][]string{
+		{"--capture-ttl", "-1h"},
+		{"--capture-ttl", "soon"},
+		{"--gpu-shim", "lib/shim.so"},
+		{"--capture-command", "bin/bench"},
+	} {
+		var out, errb bytes.Buffer
+		if code := run(append([]string{"--profiles", t.TempDir()}, args...), strings.NewReader(""), &out, &errb); code != 2 || !strings.Contains(errb.String(), strings.TrimLeft(args[0], "-")) {
+			t.Errorf("%v: exit %d, stderr %q; want 2 naming %s", args, code, errb.String(), args[0])
+		}
 	}
 }
 

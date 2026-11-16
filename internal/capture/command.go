@@ -62,6 +62,11 @@ const (
 // echo is an agent's argument cut to maxEcho characters.
 func echo(s string) string { return cut(s, maxEcho) }
 
+// Echo is an agent's argument as a message may repeat it: cut to 64
+// characters, ending in "…" when cut. The MCP layer repeats arguments the
+// same way.
+func Echo(s string) string { return echo(s) }
+
 // cut is s cut to n characters, ending in "…" when cut.
 func cut(s string, n int) string {
 	r := []rune(s)

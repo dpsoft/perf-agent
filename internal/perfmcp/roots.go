@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"github.com/dpsoft/perf-agent/internal/capture"
 )
 
 // Root kinds, as error messages name them.
@@ -147,14 +149,6 @@ func describeType(m fs.FileMode) string {
 	return "mode " + m.Type().String()
 }
 
-// maxEcho is the most characters of an agent's argument a message repeats.
-const maxEcho = 64
-
-// echo is s cut to maxEcho characters, ending in "…" when cut.
-func echo(s string) string {
-	r := []rune(s)
-	if len(r) <= maxEcho {
-		return s
-	}
-	return string(r[:maxEcho-1]) + "…"
-}
+// echo is s as a message may repeat an agent's argument: cut to 64
+// characters, ending in "…" when cut.
+func echo(s string) string { return capture.Echo(s) }

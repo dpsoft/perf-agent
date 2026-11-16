@@ -458,7 +458,7 @@ func (r *reaper) fail(who, msg string) {
 
 // report publishes a child's first event, unless the fault pause holds it
 // back; a child never reported gets no exited event either.
-func (r *reaper) report(c *child, op, pause string, ev Event) {
+func (r *reaper) report(c *child, pause string, ev Event) {
 	if r.spec.FaultPause == pause {
 		return
 	}
@@ -503,7 +503,7 @@ func (r *reaper) attach(c Command) {
 	}
 	r.perfOut, r.perfErr = nil, nil
 	r.perf = ch
-	r.report(ch, EventAttached, PauseAfterPerfAgentFork,
+	r.report(ch, PauseAfterPerfAgentFork,
 		Event{Op: EventAttached, Who: WhoPerfAgent, PID: ch.pid, PGID: ch.pid, StartTime: ch.start})
 }
 
@@ -625,7 +625,7 @@ func (r *reaper) launchDone(err error) {
 		r.fail(WhoWorkload, "launch: "+err.Error())
 		return
 	}
-	r.report(w, EventLaunched, PauseAfterLauncherFork,
+	r.report(w, PauseAfterLauncherFork,
 		Event{Op: EventLaunched, Who: WhoWorkload, PID: w.pid, PGID: w.pid, StartTime: w.start, Cgroup: r.inCgroup})
 	if r.heldExit != nil && w.reported {
 		r.out.publish(*r.heldExit)

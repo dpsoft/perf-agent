@@ -107,17 +107,18 @@ func (s *Server) waitJobs(d time.Duration) {
 // not hold Close for good.
 const maintenanceJoin = 2 * time.Second
 
-// waitMaintenance waits up to d for the maintenance goroutine to return.
-func (s *Server) waitMaintenance(d time.Duration) {
+// waitMaintenance waits up to maintenanceJoin for the maintenance
+// goroutine to return.
+func (s *Server) waitMaintenance() {
 	if s.maintained == nil {
 		return
 	}
-	t := time.NewTimer(d)
+	t := time.NewTimer(maintenanceJoin)
 	defer t.Stop()
 	select {
 	case <-s.maintained:
 	case <-t.C:
-		s.logBounded(slog.LevelWarn, "capture maintenance still running at close", "waited", d)
+		s.logBounded(slog.LevelWarn, "capture maintenance still running at close", "waited", maintenanceJoin)
 	}
 }
 

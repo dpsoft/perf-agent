@@ -400,7 +400,7 @@ func (s *Server) Close() error {
 	s.KillCaptures()
 	if !signalled {
 		s.waitJobs(s.lim.Capture.StopGrace + time.Second)
-		s.waitMaintenance(maintenanceJoin)
+		s.waitMaintenance()
 	}
 	if s.lookups != nil {
 		s.lookups.close()

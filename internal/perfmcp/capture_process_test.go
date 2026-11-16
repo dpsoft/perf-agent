@@ -279,11 +279,13 @@ func TestAHungServerIsBoundedByTheDeadline(t *testing.T) {
 		t.Fatalf("the server ran (state %c) before the children were gone: the deadline was not what ended them", v)
 	}
 	a.cont()
+	// Resumed, the server decides by its own start bound or by the
+	// reaper's deadline event, whichever it reads first: either way the
+	// capture is start_timeout, never the exits the deadline's kills caused.
 	text, isErr := a.waitEnd(job)
-	if !isErr {
-		t.Fatalf("the capture ended well: %s", text)
+	if w := toolErrorOf(t, text); !isErr || w.Code != string(capture.CodeStartTimeout) {
+		t.Fatalf("the capture the reaper's deadline ended before readiness: %s", text)
 	}
-	t.Logf("after the deadline: %s", text)
 	e.invariant()
 }
 

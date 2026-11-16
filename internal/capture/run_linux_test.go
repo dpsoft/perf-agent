@@ -1522,3 +1522,42 @@ func TestASignalledPerfAgentNamesItsSignal(t *testing.T) {
 		}
 	}
 }
+
+// A capture the reaper ended at its absolute deadline (a server that did
+// not act on its own bounds) is start_timeout before readiness and
+// finish_timeout after, whatever exits the deadline's kills cause.
+func TestTheReapersDeadlineIsABound(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		ready bool
+		want  Code
+	}{
+		{"before readiness", false, CodeStartTimeout},
+		{"after readiness", true, CodeFinishTimeout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kills := 0
+			r := testRun(t, &kills)
+			r.spec.Launch = &LaunchSpec{Path: "/x/bench"}
+			r.work = instance{11, 11}
+			r.targetKnown, r.target = true, TargetState{PID: 11, StartTime: 11}
+			if tc.ready {
+				r.readyAt = time.Now().Add(-time.Second)
+				r.setPhase(PhaseProfiling)
+			}
+			evs := make(chan Event, 3)
+			evs <- Event{Op: EventDeadline}
+			evs <- Event{Op: EventExited, Who: WhoWorkload, PID: 11, Status: -1, Signal: "killed"}
+			evs <- Event{Op: EventExited, Who: WhoPerfAgent, PID: 1, Status: -1, Signal: "killed"}
+			close(evs)
+			r.evc = evs
+			r.drainPending()
+			if errCode(r.o.Err) != tc.want || !strings.Contains(r.o.Err.Message, "deadline") {
+				t.Fatalf("Err = %+v, want %s naming the deadline", r.o.Err, tc.want)
+			}
+			if r.o.StoppedBy == StoppedByCommandExit || r.o.StoppedBy == StoppedByTargetExit {
+				t.Errorf("stopped by %q", r.o.StoppedBy)
+			}
+		})
+	}
+}

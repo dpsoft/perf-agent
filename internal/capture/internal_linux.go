@@ -173,6 +173,8 @@ type reaper struct {
 	exits      chan exitNote
 	cmds       <-chan Command
 	deadline   <-chan time.Time
+	// deadlineSaid says the deadline event was published.
+	deadlineSaid bool
 	// term delivers SIGTERM, SIGINT and SIGHUP, which end the capture as
 	// EOF does instead of killing the reaper.
 	term <-chan os.Signal
@@ -411,6 +413,7 @@ func (r *reaper) serve() (aborted bool) {
 		case e := <-r.exits:
 			r.exited(e)
 		case <-r.deadline:
+			r.deadlinePassed()
 			return true
 		case <-r.term:
 			return true
@@ -691,6 +694,16 @@ func (r *reaper) endWorkload() bool {
 	return !aborted
 }
 
+// deadlinePassed tells the server, once, that the absolute deadline ended
+// the capture, before the kills and the exits they cause: a server that
+// did not act on its own bounds learns why its children died.
+func (r *reaper) deadlinePassed() {
+	if !r.deadlineSaid {
+		r.deadlineSaid = true
+		r.out.publish(Event{Op: EventDeadline})
+	}
+}
+
 // killAll is the end on EOF or at the deadline: SIGKILL to both groups and
 // cgroup.kill.
 func (r *reaper) killAll() {
@@ -731,6 +744,7 @@ func (r *reaper) waitUntil(end time.Time, abortable bool, cond func() bool) (ok,
 			}
 			r.fail(who, fmt.Sprintf("the capture is ending: %s ignored", c.Op))
 		case <-deadline:
+			r.deadlinePassed()
 			return false, true
 		case <-term:
 			return false, true

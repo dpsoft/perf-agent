@@ -684,7 +684,26 @@ func (r *Run) event(ev Event) {
 		r.workDone()
 	case ev.Op == EventError:
 		r.reaperError(ev)
+	case ev.Op == EventDeadline:
+		r.deadlinePassed()
 	}
+}
+
+// deadlinePassed is the reaper ending the capture at its absolute
+// deadline, which only a server that did not act on its own bounds (one
+// stopped or starved) lets come: a bound, start_timeout before readiness
+// and finish_timeout after, decided before the exits the kills cause.
+func (r *Run) deadlinePassed() {
+	const next = "capture again; if this repeats, check that perf-agent-mcp is not stopped or starved of CPU"
+	e := Errorf(CodeFinishTimeout, next,
+		"the capture's reaper ended it at its deadline, after FinishTimeout=%v: this server did not stop it in time", r.b.FinishTimeout)
+	if r.readyAt.IsZero() {
+		e = Errorf(CodeStartTimeout, next,
+			"the capture's reaper ended it at its deadline, after StartTimeout=%v: this server did not stop it in time", r.b.StartTimeout)
+	}
+	e.Retryable, e.RetryAfter = true, 0
+	r.markStopped("", time.Now())
+	r.fail(e)
 }
 
 // launched proves the command runs, then attaches. launched means only

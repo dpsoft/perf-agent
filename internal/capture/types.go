@@ -151,6 +151,9 @@ const (
 	EventAttached = "attached"
 	EventExited   = "exited"
 	EventReaped   = "reaped"
+	// EventDeadline says the reaper's absolute deadline passed and it is
+	// killing the capture, before the exits that causes.
+	EventDeadline = "deadline"
 	EventError    = "error"
 
 	WhoPerfAgent = "perf-agent"

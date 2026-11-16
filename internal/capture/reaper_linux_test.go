@@ -559,6 +559,17 @@ func TestReaperKillsAtTheAbsoluteDeadline(t *testing.T) {
 	if !groupGone(at.PGID) || !groupGone(wl.PGID) {
 		t.Error("a group survived the deadline")
 	}
+	// The deadline is said before the exits it causes, and before reaped.
+	evs := h.all()
+	dl := slices.IndexFunc(evs, func(e Event) bool { return e.Op == EventDeadline })
+	if dl < 0 {
+		t.Fatalf("no deadline event: %+v", evs)
+	}
+	for i, e := range evs {
+		if e.Op == EventExited && i < dl || e.Op == EventReaped && i < dl {
+			t.Errorf("%s at %d before the deadline event at %d: %+v", e.Op, i, dl, evs)
+		}
+	}
 	h.waitDone(10 * time.Second)
 }
 

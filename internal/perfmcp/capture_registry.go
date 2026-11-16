@@ -3,6 +3,8 @@ package perfmcp
 import (
 	"container/list"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"sync"
@@ -12,32 +14,59 @@ import (
 	"github.com/dpsoft/perf-agent/internal/capture"
 )
 
+// maxJobAliases bounds the finished job ids the registry remembers after
+// their entries have left the LRU. An alias is a job id, its capture id
+// and its final answer: a few dozen bytes.
+const maxJobAliases = 4096
+
+// Misuse of the registry by its callers. None reaches an agent as a capture
+// error: each means the caller is wrong.
+var (
+	errNoReservation = errors.New("the job holds no window reservation")
+	errNotAdmitted   = errors.New("the job was never admitted")
+	errNotFinished   = errors.New("the job has not finished")
+	errNegative      = errors.New("a negative size or duration")
+)
+
 // registry holds the capture jobs of this server (§4.0, CAP-R11): the one
 // active job, and the finished jobs and historical answers in an LRU
 // bounded by Capture.MaxJobs and Capture.MaxJobBytes. It is used from the
 // dispatcher, from the job goroutines and from the reader goroutine
-// (capture_cancel is a control message), so mu guards the LRU, the id maps
-// and the windows. mu is never held across I/O or a channel wait, and a
-// job's own mutex is never taken while it is held. active is read without
-// mu, and written only under it.
+// (capture_cancel is a control message), so mu guards the LRU, the id maps,
+// the aliases and the windows. mu is never held across I/O or a channel
+// wait, and a job's own mutex is never taken while it is held. active is
+// read without mu, and written only under it. Every method that reads the
+// time is given it, so the registry has one clock: its caller's.
 type registry struct {
 	lim   CaptureLimits
 	nonce string
 	seq   atomic.Uint64
-	// now is the clock reconcile reads; admit is given its time.
-	now func() time.Time
 
 	active atomic.Pointer[job]
 
 	mu  sync.Mutex
 	win window
-	// res is the window reservation of each admitted job until it finishes.
+	// res is the window reservation of the active job, until it finishes
+	// or a reconcile refuses it.
 	res map[*job]*reservation
 	// lru holds *registryEntry, the most recently used first.
 	lru       *list.List
 	byJob     map[string]*list.Element
 	byCapture map[string]*list.Element
 	bytes     int
+	// aliases outlive the LRU: a job id still resolves to its capture id
+	// and final answer after its entry is evicted. aliasRing holds their
+	// ids oldest first from aliasNext, to forget the oldest past
+	// maxJobAliases.
+	aliases   map[string]jobAlias
+	aliasRing []string
+	aliasNext int
+}
+
+// jobAlias is what is remembered of a finished job: its capture id, "" when
+// it ended before it had one, and what a cancel of it is told.
+type jobAlias struct {
+	captureID, answer string
 }
 
 // registryEntry is a finished job, or a historical answer read from a
@@ -58,11 +87,12 @@ func newRegistry(lim CaptureLimits, nonce string) *registry {
 	return &registry{
 		lim:       lim,
 		nonce:     nonce,
-		now:       time.Now,
 		res:       map[*job]*reservation{},
 		lru:       list.New(),
 		byJob:     map[string]*list.Element{},
 		byCapture: map[string]*list.Element{},
+		aliases:   map[string]jobAlias{},
+		aliasRing: make([]string, maxJobAliases),
 	}
 }
 
@@ -72,16 +102,23 @@ func (r *registry) newJobID() string {
 }
 
 // admit gives j the one active slot and reserves j.reserve in the windows.
-// A capture already active is busy; windows that cannot take j.reserve are
-// budget, and then the slot is left as it was and nothing is reserved
-// (PLAN-R3).
+// A capture already active is busy, with retry_after its reserved end (at
+// least 1 s); windows that cannot take j.reserve are budget, and then the
+// slot is left as it was and nothing is reserved (PLAN-R3).
 func (r *registry) admit(j *job, now time.Time) *capture.Error {
+	if j.reserve < 0 {
+		return capture.Errorf(capture.CodeInvalidArgument, "", "a capture cannot reserve %v", j.reserve)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if a := r.active.Load(); a != nil {
+		d := a.reserve
+		if res := r.res[a]; res != nil {
+			d = res.d
+		}
 		e := capture.Errorf(capture.CodeBusy, "capture_wait or capture_cancel "+a.id,
 			"capture job %s is running; one capture runs at a time", a.id)
-		e.RetryAfter = max(a.created.Add(a.reserve).Sub(now), 0)
+		e.RetryAfter = max(a.created.Add(d).Sub(now), time.Second)
 		return e
 	}
 	if e := r.win.allow(now, j.reserve, r.lim.WindowCaptures, r.lim.WindowDuration); e != nil {
@@ -92,16 +129,21 @@ func (r *registry) admit(j *job, now time.Time) *capture.Error {
 	return nil
 }
 
-// reconcile replaces j's reservation with its effective duration, once the
-// job has resolved its settings. A duration the windows no longer take is
-// budget, and j's reservation is then released: the capture will not run.
-func (r *registry) reconcile(j *job, effective time.Duration) *capture.Error {
-	now := r.now()
+// reconcile replaces the active job j's reservation with its effective
+// duration, once the job has resolved its settings. A duration the windows
+// no longer take is a *capture.Error with the code budget, and j's
+// reservation is then released: the capture will not run. A job without a
+// reservation (never admitted, finished, or already refused) is
+// errNoReservation.
+func (r *registry) reconcile(j *job, effective time.Duration, now time.Time) error {
+	if effective < 0 {
+		return errNegative
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	res := r.res[j]
 	if res == nil {
-		return nil
+		return fmt.Errorf("reconcile %s: %w", j.id, errNoReservation)
 	}
 	if e := r.win.allowReplacing(now, res, effective, r.lim.WindowDuration); e != nil {
 		r.win.release(res)
@@ -112,52 +154,114 @@ func (r *registry) reconcile(j *job, effective time.Duration) *capture.Error {
 	return nil
 }
 
-// finish moves j, which has ended, from the slot to the LRU with
-// resultBytes counted against MaxJobBytes, and evicts the least recently
-// used entries over the bounds. The newest entry is always kept, so the
-// wait that follows a job finds it even when its result alone is over
-// MaxJobBytes.
-func (r *registry) finish(j *job, resultBytes int) {
-	j.mu.Lock()
-	status, captureID := j.status, j.captureID
-	j.mu.Unlock()
-	answer := status.cancelAnswer()
-	if !status.terminal() {
-		// The job calls finish only once it has ended; one that has not is
-		// answered as ended, rather than left looking cancellable.
-		answer = cancelAnswerEnded
+// finish moves the active job j, which has ended, from the slot to the
+// LRU, with resultBytes counted against MaxJobBytes. In the same step it
+// charges the windows with what was profiled, at most the reservation:
+// a capture that never profiled charges no duration but still counts as
+// a capture started (CAP-R59). It never refuses for the windows.
+//
+// The newest entry is always kept, so the wait that follows a job finds it
+// even when its result alone is over MaxJobBytes. A second finish of j is
+// a no-op; a job that was never admitted, or negative sizes, are errors
+// that change nothing.
+func (r *registry) finish(j *job, resultBytes int, profiled time.Duration) error {
+	if resultBytes < 0 || profiled < 0 {
+		return fmt.Errorf("finish %s with %d bytes, %v profiled: %w", j.id, resultBytes, profiled, errNegative)
 	}
+	answer, captureID := finalAnswer(j)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.active.Load() == j {
-		r.active.Store(nil)
+	if r.active.Load() != j {
+		if r.finished(j.id) {
+			return nil
+		}
+		return fmt.Errorf("finish %s: %w", j.id, errNotAdmitted)
 	}
-	delete(r.res, j)
-	if _, ok := r.byJob[j.id]; ok {
-		return
+	if res := r.res[j]; res != nil {
+		r.win.replace(res, min(profiled, res.d))
+		delete(r.res, j)
 	}
+	r.active.Store(nil)
 	if el, ok := r.byCapture[captureID]; ok && captureID != "" {
 		r.remove(el)
 	}
-	r.push(&registryEntry{j: j, answer: answer, jobID: j.id, captureID: captureID, bytes: resultBytes})
+	el := r.lru.PushFront(&registryEntry{j: j, answer: answer, jobID: j.id, captureID: captureID, bytes: resultBytes})
+	r.index(el)
+	r.bytes += resultBytes
+	r.remember(j.id, jobAlias{captureID: captureID, answer: answer})
+	r.evict(el)
+	return nil
+}
+
+// update records a finished job's state again after it changed, as when a
+// commit that ended undecided is settled later: its answer, its capture id
+// and the bytes of its result. A job evicted since keeps only its alias,
+// which is corrected. The job must have ended.
+func (r *registry) update(j *job, resultBytes int) error {
+	if resultBytes < 0 {
+		return fmt.Errorf("update %s with %d bytes: %w", j.id, resultBytes, errNegative)
+	}
+	j.mu.Lock()
+	terminal := j.status.terminal()
+	j.mu.Unlock()
+	if !terminal {
+		return fmt.Errorf("update %s: %w", j.id, errNotFinished)
+	}
+	answer, captureID := finalAnswer(j)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.finished(j.id) {
+		return fmt.Errorf("update %s: %w", j.id, errNotAdmitted)
+	}
+	if _, ok := r.aliases[j.id]; ok {
+		r.aliases[j.id] = jobAlias{captureID: captureID, answer: answer}
+	}
+	el, ok := r.byJob[j.id]
+	if !ok {
+		return nil
+	}
+	e := el.Value.(*registryEntry)
+	if e.captureID != captureID {
+		if old, ok := r.byCapture[captureID]; ok && captureID != "" {
+			r.remove(old)
+		}
+		if r.byCapture[e.captureID] == el {
+			delete(r.byCapture, e.captureID)
+		}
+		e.captureID = captureID
+		r.index(el)
+	}
+	e.answer = answer
+	r.bytes += resultBytes - e.bytes
+	e.bytes = resultBytes
+	r.evict(el)
+	return nil
 }
 
 // put keeps the historical answer for captureID, read from its manifest,
-// unless a job of this server already answers for that id.
-func (r *registry) put(captureID string, h *historical) {
+// unless a job of this server already answers for that id; that is not an
+// error.
+func (r *registry) put(captureID string, h *historical) error {
+	if captureID == "" || h == nil {
+		return fmt.Errorf("put %q: no capture id or no answer", captureID)
+	}
 	n := historicalBytes(h)
 	if a := r.active.Load(); a != nil && a.captureIDIs(captureID) {
-		return
+		return nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if el, ok := r.byCapture[captureID]; ok {
 		if el.Value.(*registryEntry).j != nil {
-			return
+			return nil
 		}
 		r.remove(el)
 	}
-	r.push(&registryEntry{h: h, captureID: captureID, bytes: n})
+	el := r.lru.PushFront(&registryEntry{h: h, captureID: captureID, bytes: n})
+	r.index(el)
+	r.bytes += n
+	r.evict(el)
+	return nil
 }
 
 // get is the job with the job or capture id id, active or finished. A
@@ -177,6 +281,16 @@ func (r *registry) get(id string) (*job, bool) {
 	}
 	r.lru.MoveToFront(el)
 	return el.Value.(*registryEntry).j, true
+}
+
+// alias is the capture id of the finished job jobID, "" when it ended
+// before it had one, also after its entry has been evicted; ok is false for
+// a job id this registry does not remember.
+func (r *registry) alias(jobID string) (captureID string, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a, ok := r.aliases[jobID]
+	return a.captureID, ok
 }
 
 // historical is the historical answer kept for captureID, which becomes
@@ -211,46 +325,88 @@ func (r *registry) list() []*job {
 
 // cancel asks the job with the job or capture id id to stop, and says what
 // will happen; ok is false for an id this registry holds no job for. A
-// finished job is answered from the registry with its final state, and is
-// never touched. It runs on the control path: no I/O, never a wait.
+// finished job is answered from the registry with its final state, from
+// its entry or, once that is evicted, its alias, and is never touched. It
+// runs on the control path: no I/O, never a wait.
 func (r *registry) cancel(id string) (answer string, ok bool) {
 	if a := r.active.Load(); a != nil && (a.id == id || a.captureIDIs(id)) {
 		return a.requestCancel(), true
 	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	el, ok := r.byJob[id]
 	if !ok {
 		el, ok = r.byCapture[id]
 	}
-	var e *registryEntry
-	if ok {
-		e = el.Value.(*registryEntry)
+	if ok && el.Value.(*registryEntry).j != nil {
+		return el.Value.(*registryEntry).answer, true
 	}
-	r.mu.Unlock()
-	if e == nil || e.j == nil {
-		return "", false
+	if a, ok := r.aliases[id]; ok {
+		return a.answer, true
 	}
-	return e.answer, true
+	return "", false
 }
 
-// push adds e as the most recently used entry and evicts the least
-// recently used ones over MaxJobs or MaxJobBytes, never e itself. r.mu is
-// held.
-func (r *registry) push(e *registryEntry) {
-	el := r.lru.PushFront(e)
+// finalAnswer is what a cancel of the ended job j is told, and its capture
+// id. A job calls finish only once it has ended; one that has not is
+// answered as ended, rather than left looking cancellable.
+func finalAnswer(j *job) (answer, captureID string) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if !j.status.terminal() {
+		return cancelAnswerEnded, j.captureID
+	}
+	return j.status.cancelAnswer(), j.captureID
+}
+
+// finished reports whether the job jobID has finished here, by its entry
+// or its alias. r.mu is held.
+func (r *registry) finished(jobID string) bool {
+	_, inLRU := r.byJob[jobID]
+	_, aliased := r.aliases[jobID]
+	return inLRU || aliased
+}
+
+// index adds el to the id maps. r.mu is held.
+func (r *registry) index(el *list.Element) {
+	e := el.Value.(*registryEntry)
 	if e.jobID != "" {
 		r.byJob[e.jobID] = el
 	}
 	if e.captureID != "" {
 		r.byCapture[e.captureID] = el
 	}
-	r.bytes += e.bytes
+}
+
+// evict removes entries while the LRU is over MaxJobs or MaxJobBytes,
+// never keep. Historical answers go first, the least recently used first:
+// one can always be read from its manifest again, while a job's derived
+// result exists only here (CAP-R60). Then jobs, the least recently used
+// first. r.mu is held.
+func (r *registry) evict(keep *list.Element) {
 	for r.lru.Len() > 1 && (r.lru.Len() > r.lim.MaxJobs || r.bytes > r.lim.MaxJobBytes) {
-		r.remove(r.lru.Back())
+		var victim, oldestJob *list.Element
+		for el := r.lru.Back(); el != nil; el = el.Prev() {
+			if el == keep {
+				continue
+			}
+			if el.Value.(*registryEntry).j == nil {
+				victim = el
+				break
+			}
+			if oldestJob == nil {
+				oldestJob = el
+			}
+		}
+		if victim == nil {
+			victim = oldestJob
+		}
+		r.remove(victim)
 	}
 }
 
-// remove drops el from the LRU and the id maps. r.mu is held.
+// remove drops el from the LRU and the id maps; a job's alias stays. r.mu
+// is held.
 func (r *registry) remove(el *list.Element) {
 	e := r.lru.Remove(el).(*registryEntry)
 	if e.jobID != "" && r.byJob[e.jobID] == el {
@@ -260,6 +416,17 @@ func (r *registry) remove(el *list.Element) {
 		delete(r.byCapture, e.captureID)
 	}
 	r.bytes -= e.bytes
+}
+
+// remember records the alias of the finished job jobID, forgetting the
+// oldest past maxJobAliases. r.mu is held.
+func (r *registry) remember(jobID string, a jobAlias) {
+	if old := r.aliasRing[r.aliasNext]; old != "" {
+		delete(r.aliases, old)
+	}
+	r.aliasRing[r.aliasNext] = jobID
+	r.aliasNext = (r.aliasNext + 1) % len(r.aliasRing)
+	r.aliases[jobID] = a
 }
 
 // captureIDIs reports whether id is j's capture id, once it has one.

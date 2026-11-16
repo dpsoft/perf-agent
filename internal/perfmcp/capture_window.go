@@ -46,9 +46,15 @@ func (w *window) allow(now time.Time, d time.Duration, maxCaptures int, maxDurat
 		e = budgetError(fmt.Sprintf("%d captures were started in the last hour, the limit is %d (Capture.WindowCaptures)",
 			len(byAge), maxCaptures), byAge[n-1].at.Add(captureWindowSpan).Sub(now))
 	}
-	if t, ok := freedBy(byAge, used(byAge)+d-maxDuration); ok && (e == nil || t.Sub(now) > e.RetryAfter) {
-		e = budgetError(fmt.Sprintf("%v of capture time was requested in the last hour; %v more is over the limit of %v (Capture.WindowDuration)",
-			used(byAge), d, maxDuration), t.Sub(now))
+	if need := used(byAge) + d - maxDuration; need > 0 {
+		t, ok := freedBy(byAge, need)
+		if !ok {
+			return overWindow(d, maxDuration)
+		}
+		if e == nil || t.Sub(now) > e.RetryAfter {
+			e = budgetError(fmt.Sprintf("%v of capture time was requested in the last hour; %v more is over the limit of %v (Capture.WindowDuration)",
+				used(byAge), d, maxDuration), t.Sub(now))
+		}
 	}
 	return e
 }
@@ -61,7 +67,11 @@ func (w *window) allowReplacing(now time.Time, res *reservation, d, maxDuration 
 		return overWindow(d, maxDuration)
 	}
 	others := w.byAge(res)
-	if t, ok := freedBy(others, used(others)+d-maxDuration); ok {
+	if need := used(others) + d - maxDuration; need > 0 {
+		t, ok := freedBy(others, need)
+		if !ok {
+			return overWindow(d, maxDuration)
+		}
 		return budgetError(fmt.Sprintf("the effective duration %v, with %v requested by other captures in the last hour, is over the limit of %v (Capture.WindowDuration)",
 			d, used(others), maxDuration), max(t.Sub(now), 0))
 	}
@@ -103,19 +113,15 @@ func used(rs []*reservation) time.Duration {
 }
 
 // freedBy is when, as the oldest of rs leave the window, need of duration
-// will have left it; ok is false when need is not positive.
+// will have left it; ok is false when all of rs is less than need.
 func freedBy(rs []*reservation, need time.Duration) (time.Time, bool) {
-	if need <= 0 {
-		return time.Time{}, false
-	}
 	var freed time.Duration
 	for _, r := range rs {
 		if freed += r.d; freed >= need {
 			return r.at.Add(captureWindowSpan), true
 		}
 	}
-	// Unreachable while d ≤ maxDuration: freeing all of rs leaves room.
-	return rs[len(rs)-1].at.Add(captureWindowSpan), true
+	return time.Time{}, false
 }
 
 // budgetError is a window refusal that frees after wait.

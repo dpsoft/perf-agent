@@ -16,6 +16,13 @@ var errLookupClosed = errors.New("the lookup pool is closed")
 // workers with a bounded queue (CAP-R14). A lookup for a key already
 // queued or running is shared, and a caller waits on it only to its own
 // deadline: no goroutine is started per lookup or per wait.
+//
+// A load has no timeout of its own: a read that never returns holds its
+// worker for good, and with every worker held the queue fills and get
+// answers (nil, false), which callers report as "loading". The loads are
+// small bounded reads of manifests (readManifest reads at most 1 MiB), so
+// a stuck one means a stuck filesystem, which a timeout here could not
+// free: Go cannot interrupt a blocked read.
 type lookupPool struct {
 	queue     chan *lookup
 	quit      chan struct{}

@@ -305,11 +305,34 @@ func (e *jobEnv) finish(j *job) jobView {
 		v := j.wait(e.t.Context(), 5*time.Second)
 		if ended(v) {
 			e.noteRecord()
+			if e.s.registry.active.Load() == nil {
+				e.waitLockFree()
+			}
 			return v
 		}
 	}
 	e.t.Fatalf("job %s did not end: %+v", j.id, j.view())
 	return jobView{}
+}
+
+// waitLockFree waits, for a while, until the captures lock can be taken:
+// a capture's reaper keeps it until it has reaped its children and exits,
+// a little after the job ended, and a capture started at once would be
+// refused busy.
+func (e *jobEnv) waitLockFree() {
+	d, ok := e.dir()
+	if !ok {
+		return
+	}
+	defer d.close()
+	eventuallyTrue(15*time.Second, func() bool {
+		l, ce := capture.TryLock(d.root, capture.Holder{ServerPID: os.Getpid()})
+		if ce != nil {
+			return false
+		}
+		_ = l.Close()
+		return true
+	})
 }
 
 // run is a job of req, waited for.

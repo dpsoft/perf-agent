@@ -1,7 +1,8 @@
-// The live page. It reads the state the agent drives (the event stream, and
-// GET state when the stream is down), fetches the shown publication's model
-// and rejected history, and draws them with the shared panel. Every request
-// is a relative GET. The only received strings that become part of a request
+// The live page. It reads the state envelope (the event stream, and GET
+// state when the stream is down): the state the agent drives, and the count
+// of the user's asks, each at its own revision. It fetches the shown
+// publication's model and rejected history, and draws them with the shared
+// panel. Every request is a relative GET. The only received strings that become part of a request
 // path are publication and node IDs, and only when they have their fixed
 // shapes. Every figure comes from the server: this script formats no number.
 (() => {
@@ -14,7 +15,7 @@
       if (!r.ok) throw new Error('request refused: ' + path);
       return r.json();
     },
-    // subscribe opens the event stream. onState gets each state; onTrouble
+    // subscribe opens the event stream. onState gets each envelope; onTrouble
     // gets true when the browser gave the stream up for good (a refusal,
     // such as too many open tabs) and false while it reconnects; onOpen is
     // called when the stream is open.
@@ -35,11 +36,11 @@
     },
   };
 
-  const GONE = 'perf-agent-mcp is not running; this is the last state it sent. Ask your agent for a new page URL, or download a static copy while it runs.';
+  const GONE = 'The perf-agent server is not running; this is the last state it sent. Ask your agent for a new page URL, or download a static copy while it runs.';
   const PAUSED = 'Live updates are paused because too many tabs have this page open. The page checks for changes every few seconds.';
 
-  // A seq is a decimal string. newer compares two by length, then
-  // lexically, so "10" is newer than "9" and no seq is ever a number.
+  // A seq or a rev is a decimal string. newer compares two by length, then
+  // lexically, so "10" is newer than "9" and neither is ever a number.
   const digits = /^[0-9]+$/;
   const canonical = (s) => s.replace(/^0+(?=[0-9])/, '');
   const newer = (a, b) => {
@@ -72,6 +73,10 @@
   // is still loading is refused. renderedSeq is the seq whose work finished.
   let acceptedSeq = '';
   let renderedSeq = '';
+  // acceptedRev is the highest inbox rev accepted so far. The inbox is
+  // applied by its own rev, whatever the engine's seq, and touches neither
+  // the engine's state nor gen.
+  let acceptedRev = '';
   // retrySeq is an accepted seq whose work failed: the same state may be
   // accepted once more. failures counts its failed attempts, and failGen
   // is the generation when the last one failed.
@@ -690,12 +695,13 @@
   const retryDelays = [1000, 2000, 5000, 10000];
   const quickRetries = 3;
 
-  // onState accepts st if its seq is newer than any accepted so far, and
-  // records that before any of its work starts. A quiet state (no agent
-  // chain pending or cut short, and the same publication, selection and
-  // focus as the last accepted) only refreshes history and keeps the
-  // generation, so the user's own fetches in flight still land.
-  const onState = (st) => {
+  // onEngine accepts st, the engine's state, if its seq is newer than any
+  // accepted so far, and records that before any of its work starts. A
+  // quiet state (no agent chain pending or cut short, and the same
+  // publication, selection and focus as the last accepted) only refreshes
+  // history and keeps the generation, so the user's own fetches in flight
+  // still land.
+  const onEngine = (st) => {
     if (!st || typeof st !== 'object') return;
     const again = retrySeq !== '' && st.seq === retrySeq && st.seq === acceptedSeq;
     if (!again && !newer(st.seq, acceptedSeq)) return;
@@ -729,6 +735,45 @@
       if (failures >= quickRetries) loadNote('trying');
       setTimeout(checkState, retryDelays[Math.min(failures, retryDelays.length) - 1]);
     });
+  };
+
+  // --- The user's asks ---
+
+  const strOf = (v) => (typeof v === 'string' ? v : '');
+
+  // inboxCount is the header's count of the user's asks, made once.
+  const inboxCount = () => {
+    let e = $('inbox');
+    if (!e) {
+      e = make('span', 'readout');
+      e.id = 'inbox';
+      e.hidden = true;
+      $('pills').before(e);
+    }
+    return e;
+  };
+
+  // applyInbox shows ib, the inbox's state, if its rev is newer than any
+  // accepted so far. The reader's label is the client's own name: it is
+  // shown as text, never as markup.
+  const applyInbox = (ib) => {
+    if (!ib || typeof ib !== 'object' || !newer(ib.rev, acceptedRev)) return;
+    acceptedRev = ib.rev;
+    document.body.dataset.rev = acceptedRev;
+    const asks = strOf(ib.asks);
+    const e = inboxCount();
+    e.hidden = !asks || asks === '0';
+    e.textContent = asks + (asks === '1' ? ' ask' : ' asks') + ' · ' + strOf(ib.unread) + ' unread' +
+      (strOf(ib.read_by) ? ' · read by ' + ib.read_by : '');
+  };
+
+  // onState takes an envelope: the engine's state and the inbox's, each
+  // accepted by its own revision. Neither part's arrival resets the
+  // other's state or the generation.
+  const onState = (env) => {
+    if (!env || typeof env !== 'object') return;
+    applyInbox(env.inbox);
+    onEngine(env.engine);
   };
 
   // --- The connection ---
@@ -772,11 +817,13 @@
   // run is no longer pollRun stops, before and after each read.
   const poll = async (run) => {
     if (run !== pollRun) return;
-    const before = acceptedSeq;
+    const seqBefore = acceptedSeq;
+    const revBefore = acceptedRev;
     const r = await checkState();
     if (run !== pollRun) return;
     if (r === 'ok') banner('quiet', PAUSED);
-    pollStep = acceptedSeq !== before ? 0 : Math.min(pollStep + 1, pollDelays.length - 1);
+    const moved = acceptedSeq !== seqBefore || acceptedRev !== revBefore;
+    pollStep = moved ? 0 : Math.min(pollStep + 1, pollDelays.length - 1);
     polls++;
     if (polls % 3 === 0 && stream && stream.readyState === EventSource.CLOSED) connect();
     if (run === pollRun) setTimeout(() => poll(run), pollDelays[pollStep]);
@@ -808,9 +855,9 @@
     }
   };
 
-  const onStreamState = (st) => {
+  const onStreamState = (env) => {
     epoch++;
-    onState(st);
+    onState(env);
   };
 
   const connect = () => {

@@ -32,9 +32,11 @@ type routes struct {
 
 // Routes is the live page's routes, below the guard's /s/<token> prefix:
 // the shell and its assets, the state, the event stream from events, and
-// each publication's model, history, frame, focus and export. Every
-// handler reads the snapshot it takes first, and nothing else of srv, so
-// a request never changes server state. Only GET and HEAD reach it.
+// each publication's model, history, frame, focus and export. The state
+// is PageView.State, the envelope of the engine's state and the inbox's,
+// which every event carries too. Every handler reads the snapshot it
+// takes first, and nothing else of srv, so a request never changes server
+// state. Only GET and HEAD reach it; the page's reports go to Inbox.
 //
 // A server's page has one set of routes, so that their bounds, such as
 // heavySlots, hold for the server: Routes claims srv's page, and panics

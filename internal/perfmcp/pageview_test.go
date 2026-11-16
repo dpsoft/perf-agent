@@ -3,7 +3,6 @@ package perfmcp
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -73,7 +72,9 @@ func TestPageViewServesWhatTheRoutesDid(t *testing.T) {
 		name string
 		get  func() ([]byte, error)
 	}{
-		{"state", func() ([]byte, error) { return v.State(), nil }},
+		// The routes served the engine's state; the state is now its
+		// envelope, whose engine part is that state byte for byte.
+		{"state", func() ([]byte, error) { return envelopeOf(t, v.State()).raw, nil }},
 		{"explained-model", func() ([]byte, error) { return ok(v.Model("p1")) }},
 		{"explained-history", func() ([]byte, error) { return ok(v.History("p1")) }},
 		{"explained-frame", func() ([]byte, error) { return ok(v.Frame("p1", c)) }},
@@ -234,16 +235,19 @@ func TestNotifyGetsEveryCommittedState(t *testing.T) {
 		if want > 0 && !bytes.Equal(got[len(got)-1], s.PageSnapshot().State()) {
 			t.Errorf("step %d: the last state notified is not the snapshot's", i)
 		}
+		if want > 0 && !bytes.Equal(envelopeOf(t, got[len(got)-1]).raw, s.live.snapshot().state) {
+			t.Errorf("step %d: the last envelope notified does not carry the snapshot's state", i)
+		}
 	}
 	var prev int
 	for i, raw := range log.all() {
-		var st stateJSON
-		if err := json.Unmarshal(raw, &st); err != nil {
-			t.Fatal(err)
-		}
+		env := envelopeOf(t, raw)
 		var seq int
-		if _, err := fmt.Sscan(st.Seq, &seq); err != nil || seq <= prev {
-			t.Errorf("state %d has seq %q after %d", i, st.Seq, prev)
+		if _, err := fmt.Sscan(env.Engine.Seq, &seq); err != nil || seq <= prev {
+			t.Errorf("state %d has seq %q after %d", i, env.Engine.Seq, prev)
+		}
+		if env.Inbox.Rev != "0" {
+			t.Errorf("state %d: a commit moved the inbox to rev %s", i, env.Inbox.Rev)
 		}
 		prev = seq
 	}
@@ -329,7 +333,8 @@ func TestNoPageToolsWithoutPage(t *testing.T) {
 	if s.live == nil {
 		t.Error("a server with Page has no live state")
 	}
-	if st := s.PageSnapshot().State(); string(st) != `{"seq":"0","current":"","selected":"","focus":"","by":"","publications":[]}` {
+	if st := s.PageSnapshot().State(); string(st) != `{"engine":{"seq":"0","current":"","selected":"","focus":"","by":"","publications":[]},`+
+		`"inbox":{"rev":"0","asks":"0","unread":"0","read_by":""}}` {
 		t.Errorf("the zero state %s", st)
 	}
 }

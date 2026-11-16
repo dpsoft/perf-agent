@@ -149,15 +149,11 @@ func pageOpen(t *testing.T, c *testClient) pageOpenOut {
 	return out
 }
 
-// pageState is the page's state as c's PageView holds it.
+// pageState is the page's state as c's PageView holds it: its envelope's
+// engine part.
 func pageState(t *testing.T, c *testClient) stateJSON {
 	t.Helper()
-	body := c.srv.PageSnapshot().State()
-	var st stateJSON
-	if err := json.Unmarshal(body, &st); err != nil {
-		t.Fatalf("state %s: %v", body, err)
-	}
-	return st
+	return envelopeOf(t, c.srv.PageSnapshot().State()).Engine
 }
 
 // pageGet is what c's PageView answers for route, "pub/<id>/<what>" or
@@ -404,10 +400,7 @@ func TestLiveHistoryFollowsNewRejections(t *testing.T) {
 	// lists p1 alone at history version.
 	historyNotified := func(n int, version string) bool {
 		for _, raw := range log.all()[n:] {
-			var st stateJSON
-			if err := json.Unmarshal(raw, &st); err != nil {
-				t.Fatal(err)
-			}
+			st := envelopeOf(t, raw).Engine
 			if len(st.Publications) == 1 && st.Publications[0].History == version {
 				return true
 			}

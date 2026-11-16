@@ -368,16 +368,51 @@ type stateJSON struct {
 	} `json:"publications"`
 }
 
-// state is the page's state as a browser reads it.
-func (p *page) state() stateJSON {
+// inboxJSON is the inbox part of the state envelope.
+type inboxJSON struct {
+	Rev    string `json:"rev"`
+	Asks   string `json:"asks"`
+	Unread string `json:"unread"`
+	ReadBy string `json:"read_by"`
+}
+
+// envelopeJSON is the state envelope the state route and every event
+// carry: the engine's state and the inbox's, each at its own revision.
+type envelopeJSON struct {
+	Engine stateJSON `json:"engine"`
+	Inbox  inboxJSON `json:"inbox"`
+}
+
+// envelopeOf decodes an envelope, which must have exactly its two parts.
+func envelopeOf(body []byte) (envelopeJSON, error) {
+	var parts map[string]json.RawMessage
+	if err := json.Unmarshal(body, &parts); err != nil {
+		return envelopeJSON{}, err
+	}
+	if len(parts) != 2 || parts["engine"] == nil || parts["inbox"] == nil {
+		return envelopeJSON{}, fmt.Errorf("not an envelope of engine and inbox: %.200s", body)
+	}
+	var env envelopeJSON
+	err := json.Unmarshal(body, &env)
+	return env, err
+}
+
+// envelope is the page's state envelope as a browser reads it.
+func (p *page) envelope() envelopeJSON {
 	p.t.Helper()
 	res, body := httpGet(p.t, p.url+"state", nil)
 	wantStatus(p.t, "state", res, body, http.StatusOK)
-	var st stateJSON
-	if err := json.Unmarshal(body, &st); err != nil {
+	env, err := envelopeOf(body)
+	if err != nil {
 		p.t.Fatalf("state %s: %v", body, err)
 	}
-	return st
+	return env
+}
+
+// state is the engine part of the page's state as a browser reads it.
+func (p *page) state() stateJSON {
+	p.t.Helper()
+	return p.envelope().Engine
 }
 
 // get is a route of the page that must answer 200.

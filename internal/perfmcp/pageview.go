@@ -18,10 +18,13 @@ type PageConfig struct {
 	// URL is the page's address, what page_open and every page tool
 	// return.
 	URL string
-	// Notify receives every new state the engine commits, one line of
-	// JSON, in commit order. It runs under the engine and must never
-	// block; the state is the snapshot's own and must not be modified.
-	// Nil drops the states.
+	// Notify receives every new state envelope, one line of JSON,
+	// {"engine":<state>,"inbox":<inbox state>}, in the order they were
+	// built: one for each state the engine commits and one for each
+	// change of the inbox. Each part has its own revision, engine.seq and
+	// inbox.rev, and neither ever goes back. It runs under the state bus's
+	// lock, and under the engine or the inbox's lock, and must never block;
+	// the envelope is shared and must not be modified. Nil drops them.
 	Notify func(state []byte)
 	// Viewers counts the page streams open, for the page tools' viewers.
 	// Nil counts 0.
@@ -53,6 +56,8 @@ const maxPageID = 64
 // ErrPageNotFound.
 type PageView struct {
 	snap *liveSnapshot
+	// env is the state envelope when the view was taken.
+	env []byte
 	// cmd is the binary the server runs as, which a limit's advice names;
 	// "" means perf-agent-mcp.
 	cmd string
@@ -64,7 +69,7 @@ func (s *Server) PageSnapshot() PageView {
 	if s.live == nil {
 		return PageView{}
 	}
-	return PageView{snap: s.live.snapshot(), cmd: s.command()}
+	return PageView{snap: s.live.snapshot(), env: s.live.bus.envelope(), cmd: s.command()}
 }
 
 // ClaimPage marks s's live page as served. A page has one set of routes:
@@ -81,13 +86,18 @@ func (s *Server) ClaimPage() error {
 	return nil
 }
 
-// State is the snapshot's state JSON: what the page shows and the
-// publications it can switch to.
+// State is the page's state envelope when the view was taken,
+// {"engine":<state>,"inbox":<inbox state>}: engine is the committed state,
+// what the page shows and the publications it can switch to, at its seq;
+// inbox counts the user's asks, at its own rev. engine may be a commit
+// older than the view's other methods read: the page fetches from the
+// state it holds, and a publication that is gone since answers
+// ErrPageNotFound.
 func (v PageView) State() []byte {
 	if v.snap == nil {
 		return nil
 	}
-	return v.snap.state
+	return v.env
 }
 
 // Model is publication pub's page model.

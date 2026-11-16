@@ -257,8 +257,10 @@ type liveSnapshot struct {
 // The engine holder alone changes the publications, the steering and the
 // snapshot: every field below snap is its own, and commit, the only writer
 // of snap, runs under the engine. A PageView reads only what snap points
-// to. closed is the exception: Close may set it from another goroutine (a
-// forced exit), so it is behind mu.
+// to, and the bus's envelope. The exceptions: bus and inbox keep their
+// state under their own locks, which never wait for the engine; and Close
+// may set closed from another goroutine (a forced exit), so it is behind
+// mu.
 type live struct {
 	snap atomic.Pointer[liveSnapshot]
 
@@ -276,13 +278,16 @@ type live struct {
 	current, selected, focus string
 	by                       string
 
-	// url is the page's address; notify receives every committed state
-	// and viewers counts the open streams (see PageConfig). opened is set
-	// by the first ensureLive, which commits.
+	// url is the page's address, and viewers counts the open streams (see
+	// PageConfig). opened is set by the first ensureLive, which commits.
 	url     string
-	notify  func([]byte)
 	viewers func() int
 	opened  bool
+	// bus joins each committed state with the inbox's into the envelope
+	// the page is sent, and hands it to PageConfig.Notify. inbox is what
+	// the user reported from the page; it has its own lock.
+	bus   *stateBus
+	inbox *inbox
 	// claimed is set by ClaimPage, on whichever goroutine routes the page.
 	claimed atomic.Bool
 
@@ -298,14 +303,16 @@ func newLive(lim Limits, pins *pins, page PageConfig) *live {
 	l := &live{
 		history: map[string]*liveHistory{},
 		url:     page.URL,
-		notify:  page.Notify,
 		viewers: page.Viewers,
 		lim:     lim,
 		pins:    pins,
+		inbox:   newInbox(lim.Hub.MaxInboxEntries, randHex(askNonceBytes)),
 	}
 	snap := &liveSnapshot{pubs: map[string]*publication{}, history: map[string]*liveHistory{}}
 	snap.state = stateOf(snap)
 	l.snap.Store(snap)
+	l.bus = newStateBus(snap.state, l.inbox.state(), page.Notify)
+	l.inbox.bus = l.bus
 	return l
 }
 
@@ -642,8 +649,8 @@ func (l *live) heldByKept() int64 {
 }
 
 // commit stores a new snapshot of the live state, at the next seq, and
-// hands its state to notify. It is the only writer of the snapshot, and
-// runs under the engine.
+// hands its state to the state bus, which notifies the envelope. It is
+// the only writer of the snapshot, and runs under the engine.
 func (s *Server) commit() {
 	l := s.live
 	l.seq++
@@ -659,9 +666,7 @@ func (s *Server) commit() {
 	l.snap.Store(snap)
 	// The state is compact JSON from encoding/json: never empty and never
 	// more than one line.
-	if l.notify != nil {
-		l.notify(snap.state)
-	}
+	l.bus.setEngine(snap.seq, snap.state)
 }
 
 // liveStateEntry is a publication as the state lists it. history is its

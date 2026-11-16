@@ -13,10 +13,14 @@ import (
 var guideText string
 
 // instructions are sent to the client at initialize, naming the binary
-// the server runs as.
+// the server runs as; with the live page, they say when to read it.
 func (s *Server) instructions() string {
-	return s.command() + " answers questions about perf-agent profiles. " +
+	text := s.command() + " answers questions about perf-agent profiles. " +
 		"Read the perf-agent-guide prompt (or resource perf-agent://guide) before the first call."
+	if s.live != nil {
+		text += " " + pageStateInstruction
+	}
+	return text
 }
 
 // guidePrompts and guideResources serve the guide both ways, since clients

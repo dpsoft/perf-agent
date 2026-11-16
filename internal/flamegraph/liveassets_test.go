@@ -85,10 +85,14 @@ func TestLiveScriptRules(t *testing.T) {
 	for _, m := range fetchArgs.FindAllStringSubmatch(live, -1) {
 		assert.NotContains(t, m[1], "/", "%s: the transport names its paths only through its callers", m[1])
 	}
-	// seq is a decimal string compared by newer; it never becomes a number.
-	for _, s := range []string{"Number(", "parseInt", "BigInt", "+st.seq", "seq -", "seq +", "seq >", "seq <"} {
+	// seq and rev are decimal strings compared by newer; neither ever
+	// becomes a number.
+	for _, s := range []string{"Number(", "parseInt", "BigInt", "+st.seq", "seq -", "seq +", "seq >", "seq <",
+		"+ib.rev", "rev -", "rev +", "rev >", "rev <", "Rev >", "Rev <"} {
 		assert.NotContains(t, live, s)
 	}
+	assert.Contains(t, live, "newer(ib.rev, acceptedRev)", "the inbox is accepted by its own rev")
+	assert.NotContains(t, live, "innerText", "the reader's label is set as text")
 	assert.Contains(t, live, "cache: 'no-store'")
 	assert.Contains(t, live, "new EventSource('events')")
 	assert.Contains(t, live, "getJSON('state')")
@@ -341,6 +345,10 @@ type liveDOM struct {
 	Violations int      `json:"violations"`
 	FocusOff   bool     `json:"focus_disabled"`
 	WholeOff   bool     `json:"whole_disabled"`
+	Inbox      string   `json:"inbox"`
+	InboxHid   bool     `json:"inbox_hidden"`
+	Rev        string   `json:"rev"`
+	Images     int      `json:"images"`
 }
 
 const domProbe = `(() => {
@@ -378,6 +386,10 @@ const domProbe = `(() => {
     violations: window.livePageProbe ? window.livePageProbe.violations : -1,
     focus_disabled: $('focus-btn').disabled,
     whole_disabled: $('whole-btn').disabled,
+    inbox: $('inbox') ? $('inbox').textContent : '',
+    inbox_hidden: !$('inbox') || $('inbox').hidden,
+    rev: document.body.dataset.rev || '',
+    images: document.querySelectorAll('img').length,
   });
 })()`
 
@@ -742,8 +754,32 @@ type liveStateJSON struct {
 	Publications []livePubEntry `json:"publications"`
 }
 
-// state is a state JSON; pubs are "id" or "id@historyVersion".
+// noAsks is the inbox part of an envelope before the user asked anything.
+const noAsks = `{"rev":"0","asks":"0","unread":"0","read_by":""}`
+
+// liveInbox is the inbox part of an envelope.
+func liveInbox(rev, asks, unread, readBy string) string {
+	out, err := json.Marshal(map[string]string{"rev": rev, "asks": asks, "unread": unread, "read_by": readBy})
+	if err != nil {
+		panic(err)
+	}
+	return string(out)
+}
+
+// envelope is the state envelope of the engine's state and inbox, the
+// inbox part's JSON.
+func envelope(engine []byte, inbox string) []byte {
+	return []byte(`{"engine":` + string(engine) + `,"inbox":` + inbox + `}`)
+}
+
+// liveState is a state envelope with no asks; pubs are "id" or
+// "id@historyVersion".
 func liveState(seq, current string, selected, focus profilemodel.NodeID, pubs ...string) []byte {
+	return envelope(engineState(seq, current, selected, focus, pubs...), noAsks)
+}
+
+// engineState is the engine part of liveState.
+func engineState(seq, current string, selected, focus profilemodel.NodeID, pubs ...string) []byte {
 	st := liveStateJSON{Seq: seq, Current: current, Selected: string(selected), Focus: string(focus), Publications: []livePubEntry{}}
 	for _, p := range pubs {
 		id, version, _ := strings.Cut(p, "@")
@@ -805,7 +841,7 @@ func newLiveDiff(t *testing.T) *liveDiff {
 	return ld
 }
 
-// diffState is a state showing p4, the diff, with node selected.
+// diffState is a state envelope showing p4, the diff, with node selected.
 func diffState(seq string, selected profilemodel.UnionID) []byte {
 	st := liveStateJSON{Seq: seq, Current: "p4", Selected: string(selected), Publications: []livePubEntry{{
 		ID: "p4", Kind: "diff", Title: "b went down by 111",
@@ -815,7 +851,7 @@ func diffState(seq string, selected profilemodel.UnionID) []byte {
 	if err != nil {
 		panic(err)
 	}
-	return out
+	return envelope(out, noAsks)
 }
 
 const factsProbe = `[...document.querySelectorAll('#facts .v')].map((e) => e.textContent + '|' + e.title).join('\n')`
@@ -882,7 +918,8 @@ func TestLivePageInChrome(t *testing.T) {
 		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" })
 		s.close()
 		d := tab.waitFor("the banner", func(d liveDOM) bool { return !d.BannerHid })
-		assert.Equal(t, "perf-agent-mcp is not running; this is the last state it sent. Ask your agent for a new page URL, or download a static copy while it runs.", d.Banner)
+		assert.Equal(t, "The perf-agent server is not running; this is the last state it sent. Ask your agent for a new page URL, or download a static copy while it runs.", d.Banner)
+		assert.NotContains(t, d.Banner, "perf-agent-mcp", "the page may be served by either binary")
 		assert.Equal(t, "b", d.SelName)
 		assert.Equal(t, []string{"all", "main", "a", "✦b"}, d.Frames)
 		assert.Equal(t, "first look at 3 frames", d.Title)
@@ -1182,6 +1219,80 @@ func TestLivePageOrderingInChrome(t *testing.T) {
 		assert.Equal(t, "pub/p2/export", d.Export)
 		s.push(liveState("2", "p1", f.a, "", "p1", "p2"))
 		d = tab.waitFor("the agent's p1", func(d liveDOM) bool { return d.Title == "first look at 3 frames" && d.SelName == "a" })
+		assert.Empty(t, tab.errors())
+	})
+}
+
+// §D4 and SRV-R3: the page accepts the envelope's two parts each by its
+// own revision. An inbox update with an old seq moves only the count, and
+// keeps the generation, so the user's own fetch in flight still lands; an
+// engine state with an old rev leaves the count. The reader's label is
+// the client's own choice and is shown as text.
+func TestLivePageReadsTheEnvelopeInChrome(t *testing.T) {
+	c := startChrome(t)
+	f := newLiveFixture(t)
+	settle := func() { time.Sleep(1200 * time.Millisecond) }
+
+	t.Run("a new rev with an old seq updates only the count", func(t *testing.T) {
+		seq2 := engineState("2", "p1", f.b, "", "p1", "p2")
+		s, tab := newLivePage(t, c, f, envelope(seq2, noAsks), func(s *liveServer) {
+			s.setDelay("pub/p1/focus/"+string(f.a), 800*time.Millisecond)
+		})
+		d := tab.waitFor("seq 2", func(d liveDOM) bool { return d.SelName == "b" })
+		assert.True(t, d.InboxHid, "no asks, no count")
+		tab.eval(`[...document.querySelectorAll('#chart .frame')].find((e) => e.textContent === 'a').click(), ''`)
+		tab.waitFor("a clicked", func(d liveDOM) bool { return d.SelName == "a" && !d.FocusOff })
+		// The user's focus on a loads slowly.
+		tab.eval(`document.getElementById('focus-btn').click(), ''`)
+		time.Sleep(100 * time.Millisecond)
+		s.push(envelope(seq2, liveInbox("1", "1", "1", "")))
+		d = tab.waitFor("the count", func(d liveDOM) bool { return d.Inbox == "1 ask · 1 unread" && !d.InboxHid })
+		assert.NotContains(t, d.Axis, "relative to", "the focus is still loading")
+		settle()
+		d = tab.dom()
+		assert.Contains(t, d.Axis, "relative to a", "the user's own focus landed: the generation did not move")
+		assert.Equal(t, []string{"a", "✦b"}, d.Frames)
+		assert.Equal(t, "a", d.SelName)
+		assert.Equal(t, "first look at 3 frames", d.Title)
+		assert.Equal(t, "1", d.Rev)
+		s.mu.Lock()
+		assert.Equal(t, 1, countOf(s.served, "pub/p1/model"), "the shown publication was not loaded again")
+		s.mu.Unlock()
+		s.push(envelope(seq2, liveInbox("2", "2", "1", "codex")))
+		d = tab.waitFor("the second count", func(d liveDOM) bool { return d.Inbox == "2 asks · 1 unread · read by codex" })
+		assert.Contains(t, d.Axis, "relative to a")
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a new seq with an old rev leaves the count", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, envelope(engineState("1", "p1", f.b, "", "p1"), liveInbox("3", "2", "1", "codex")), nil)
+		const shown = "2 asks · 1 unread · read by codex"
+		tab.waitFor("seq 1 and its count", func(d liveDOM) bool { return d.SelName == "b" && d.Inbox == shown })
+		s.push(envelope(engineState("2", "p1", f.c, "", "p1"), liveInbox("2", "5", "5", "")))
+		d := tab.waitFor("seq 2", func(d liveDOM) bool { return d.SelName == "c" })
+		assert.Equal(t, shown, d.Inbox)
+		s.push(envelope(engineState("3", "p1", f.a, "", "p1"), liveInbox("3", "9", "9", "")))
+		d = tab.waitFor("seq 3", func(d liveDOM) bool { return d.SelName == "a" })
+		assert.Equal(t, shown, d.Inbox, "an equal rev is not newer")
+		assert.Equal(t, "3", d.Rev)
+		// rev 10 is newer than rev 3, whatever the seq.
+		s.push(envelope(engineState("1", "p1", f.b, "", "p1"), liveInbox("10", "4", "0", "codex")))
+		d = tab.waitFor("rev 10", func(d liveDOM) bool { return d.Inbox == "4 asks · 0 unread · read by codex" })
+		assert.Equal(t, "a", d.SelName, "seq 1 is old")
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("read_by is shown", func(t *testing.T) {
+		const label = `<img src=x onerror=alert(1)>`
+		seq1 := engineState("1", "p1", f.b, "", "p1")
+		s, tab := newLivePage(t, c, f, envelope(seq1, noAsks), nil)
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" })
+		s.push(envelope(seq1, liveInbox("1", "1", "0", label)))
+		d := tab.waitFor("read by", func(d liveDOM) bool { return strings.Contains(d.Inbox, "read by") })
+		assert.Equal(t, "1 ask · 0 unread · read by "+label, d.Inbox)
+		assert.Equal(t, 0, d.Images, "the label is text, not markup")
+		assert.Equal(t, 0, d.Violations)
+		assert.Equal(t, "b", d.SelName)
 		assert.Empty(t, tab.errors())
 	})
 }

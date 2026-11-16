@@ -966,7 +966,7 @@ func TestToolsListOrder(t *testing.T) {
 	}
 	want := []string{"open", "top", "path", "facts", "gpu_kernels_for", "sandwich", "diff", "source", "render_flamegraph",
 		"capture", "capture_wait", "capture_cancel", "capture_list",
-		"page_open", "page_explain", "page_show", "page_diff"}
+		"page_open", "page_explain", "page_show", "page_diff", "page_state"}
 	if !slices.Equal(names, want) {
 		t.Errorf("tools %v", names)
 	}

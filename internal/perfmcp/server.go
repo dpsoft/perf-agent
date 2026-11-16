@@ -36,7 +36,9 @@ import (
 // since a stdio client is the only one that can collect them; a session
 // answered through the per-message API ends no job. A PageView reads only
 // the snapshot the engine
-// holder last committed and the immutable publications it holds. Close
+// holder last committed and the immutable publications it holds; Report
+// and page_state read that snapshot and keep the page's inbox under its
+// own lock, so they never take the engine. Close
 // may run on another goroutine, even after Serve returned while a handler
 // still runs, and marks the live page closed under its lock.
 type Server struct {
@@ -278,7 +280,7 @@ func New(cfg Config) (_ *Server, err error) {
 		Instructions:    s.instructions(),
 		Tools:           s.tools(),
 		Prompts:         guidePrompts(),
-		Resources:       guideResources(),
+		Resources:       s.resources(),
 		MaxMessageBytes: lim.MaxMessageBytes,
 		// A tool error is a result too: no agent argument echoed in one
 		// can make it larger than a result may be. The floor keeps the
@@ -486,9 +488,23 @@ func (s *Server) tools() []mcpstdio.Tool {
 		}
 	}
 	// The capture tools never hold the engine: a wait would keep every
-	// other tool, and the jobs' own steps, from it.
+	// other tool, and the jobs' own steps, from it. Nor does page_state,
+	// which reads the snapshot and the inbox only.
 	ts = append(ts, s.captureTools()...)
+	if s.live != nil {
+		pages = append(pages, s.pageStateTool())
+	}
 	return append(ts, pages...)
+}
+
+// resources are the server's resources: the guide, and with the live page
+// its state.
+func (s *Server) resources() []mcpstdio.Resource {
+	rs := guideResources()
+	if s.live != nil {
+		rs = append(rs, s.pageStateResource())
+	}
+	return rs
 }
 
 // readOnly are the annotations of every tool that only reads.

@@ -24,10 +24,11 @@ type Config struct {
 	// OutputDir is the root rendered pages are written to; "" disables
 	// rendering.
 	OutputDir string
-	// Page enables the live page engine: the page_* tools, and the
-	// publications PageSnapshot reads. The server never serves the page
-	// itself; whoever sets Page does. The stdio command never sets it, so
-	// it registers no page_* tool.
+	// Page enables the live page engine: the page_* tools, the
+	// publications PageSnapshot reads, the inbox Report records in, and
+	// page_state and its resource, which read it. The server never serves
+	// the page itself; whoever sets Page does. The stdio command never sets
+	// it, so it registers no page_* tool.
 	Page *PageConfig
 	// Limits bound every input and response; they are fixed at New, which
 	// fills in defaults for a zero Limits or a zero Model.

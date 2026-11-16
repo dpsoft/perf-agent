@@ -143,12 +143,15 @@ func TestStateAndModelServeThePublication(t *testing.T) {
 	if got := res.Header.Get("Content-Type"); got != "application/json; charset=utf-8" {
 		t.Errorf("state Content-Type %q", got)
 	}
-	var st stateJSON
-	if err := json.Unmarshal(body, &st); err != nil {
+	env, err := envelopeOf(body)
+	if err != nil {
 		t.Fatalf("state %s: %v", body, err)
 	}
-	if st.Current != "p1" || st.Selected != o.nodeID("b") || len(st.Publications) != 1 {
+	if st := env.Engine; st.Current != "p1" || st.Selected != o.nodeID("b") || len(st.Publications) != 1 {
 		t.Errorf("state %+v", st)
+	}
+	if env.Inbox != (inboxJSON{Rev: "0", Asks: "0", Unread: "0"}) {
+		t.Errorf("the inbox part %+v", env.Inbox)
 	}
 	v := p.srv.PageSnapshot()
 	if !bytes.Equal(body, v.State()) {
@@ -399,27 +402,31 @@ func openEvents(t *testing.T, base string) *eventsClient {
 	return &eventsClient{conn: conn, br: bufio.NewReader(res.Body)}
 }
 
-// next is the next state the stream sends.
+// next is the engine part of the next state the stream sends.
 func (c *eventsClient) next(t *testing.T) stateJSON {
 	t.Helper()
-	st, err := c.read()
+	return c.nextEnvelope(t).Engine
+}
+
+// nextEnvelope is the next state envelope the stream sends.
+func (c *eventsClient) nextEnvelope(t *testing.T) envelopeJSON {
+	t.Helper()
+	env, err := c.read()
 	if err != nil {
 		t.Fatalf("events: %v", err)
 	}
-	return st
+	return env
 }
 
-func (c *eventsClient) read() (stateJSON, error) {
+func (c *eventsClient) read() (envelopeJSON, error) {
 	_ = c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	for {
 		line, err := c.br.ReadString('\n')
 		if err != nil {
-			return stateJSON{}, err
+			return envelopeJSON{}, err
 		}
 		if data, ok := strings.CutPrefix(line, "data: "); ok {
-			var st stateJSON
-			err := json.Unmarshal([]byte(data), &st)
-			return st, err
+			return envelopeOf([]byte(data))
 		}
 	}
 }
@@ -647,11 +654,12 @@ func TestLivePageRacesNothing(t *testing.T) {
 		wg.Go(func() {
 			for !stop.Load() {
 				_, body := httpGet(t, p.url+"state", nil)
-				var st stateJSON
-				if err := json.Unmarshal(body, &st); err != nil {
+				env, err := envelopeOf(body)
+				if err != nil {
 					t.Errorf("state %q: %v", body, err)
 					return
 				}
+				st := env.Engine
 				for _, route := range []string{"model", "history", "frame/" + b, "focus/" + a, "frame/" + a} {
 					res, _ := httpGet(t, p.url+"pub/"+st.Current+"/"+route, nil)
 					switch res.StatusCode {

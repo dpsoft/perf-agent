@@ -226,6 +226,7 @@ func TestEveryErrorCodeIsProducedOnce(t *testing.T) {
 			if w.Message == "" || strings.ContainsAny(w.Message, "\n") || strings.ContainsAny(w.Next, "\n") {
 				t.Errorf("message %q next %q", w.Message, w.Next)
 			}
+			cleanNext(t, text, w)
 			// The perf-agent binary is the one path a capture shows (§4.3):
 			// the setcap advice names it.
 			shown := perfAgentPath.ReplaceAllString(text, "")
@@ -233,5 +234,84 @@ func TestEveryErrorCodeIsProducedOnce(t *testing.T) {
 				t.Errorf("the error names a path of the server's or a nil: %s", text)
 			}
 		})
+	}
+}
+
+// cleanNext fails the test for a wire error without a next, or one that
+// names Go's types or a path of the server's (the perf-agent binary, the
+// one path an answer shows, aside).
+func cleanNext(t *testing.T, text string, w wireError) {
+	t.Helper()
+	if w.Next == "" {
+		t.Errorf("no next: %s", text)
+	}
+	if m := goTypeWord(w.Message + " " + w.Next); m != "" {
+		t.Errorf("the error says %q: %s", m, text)
+	}
+	shown := perfAgentPath.ReplaceAllString(text, "")
+	if strings.Contains(shown, os.TempDir()+string(filepath.Separator)) || strings.Contains(shown, "<nil>") {
+		t.Errorf("the error names a path of the server's or a nil: %s", text)
+	}
+}
+
+// Every error a capture tool answers at once carries a next, in an
+// agent's words: the refusals of each tool's arguments, unknown ids, and
+// a cancel of what is no job of this server.
+func TestEverySynchronousCaptureErrorHasANext(t *testing.T) {
+	_, c := newCapEnv(t, jobOpts{})
+	for _, tc := range []struct {
+		tool string
+		args map[string]any
+		code capture.Code
+	}{
+		{"capture", map[string]any{"bogus": 1}, capture.CodeInvalidArgument},
+		{"capture", map[string]any{"pid": "1"}, capture.CodeInvalidArgument},
+		{"capture", map[string]any{}, capture.CodeInvalidArgument},
+		{"capture", map[string]any{"command": workloadCmd(t), "kernel_stacks": true}, capture.CodeDisabled},
+		{"capture", map[string]any{"command": workloadCmd(t), "modes": []any{"gpu"}}, capture.CodeDisabled},
+		{"capture_wait", map[string]any{}, capture.CodeInvalidArgument},
+		{"capture_wait", map[string]any{"id": 1}, capture.CodeInvalidArgument},
+		{"capture_wait", map[string]any{"id": "001"}, capture.CodeInvalidArgument},
+		{"capture_wait", map[string]any{"id": "j1-x", "timeout": "1h"}, capture.CodeInvalidArgument},
+		{"capture_wait", map[string]any{"id": "j9-ffff", "timeout": "1s"}, capture.CodeUnknownCapture},
+		{"capture_wait", map[string]any{"id": "adhoc/009", "timeout": "1s"}, capture.CodeUnknownCapture},
+		{"capture_cancel", map[string]any{}, capture.CodeInvalidArgument},
+		{"capture_cancel", map[string]any{"id": "001"}, capture.CodeInvalidArgument},
+		{"capture_cancel", map[string]any{"id": "adhoc/009"}, capture.CodeUnknownCapture},
+		{"capture_list", map[string]any{"series": ".x"}, capture.CodeInvalidArgument},
+		{"capture_list", map[string]any{"limit": 0}, capture.CodeInvalidArgument},
+		{"capture_list", map[string]any{"limit": "5"}, capture.CodeInvalidArgument},
+		{"capture_list", map[string]any{"series": "adhoc", "cursor": "nope"}, capture.CodeInvalidArgument},
+	} {
+		text, isErr := c.call(tc.tool, tc.args)
+		w := toolErrorOf(t, text)
+		if !isErr || w.Code != string(tc.code) {
+			t.Errorf("%s %v: %s, want %s", tc.tool, tc.args, text, tc.code)
+			continue
+		}
+		cleanNext(t, text, w)
+	}
+	// A cancel of a capture that is no job of this server says that only
+	// this server's own running jobs can be cancelled.
+	text, _ := c.call("capture_cancel", map[string]any{"id": "adhoc/009"})
+	if w := toolErrorOf(t, text); !strings.Contains(w.Message+" "+w.Next, "only this server's") {
+		t.Errorf("cancel of no job: %s", text)
+	}
+	// An unknown id's message reads as a sentence.
+	text, _ = c.call("capture_wait", map[string]any{"id": "adhoc/009", "timeout": "1s"})
+	if w := toolErrorOf(t, text); strings.Contains(w.Message, " is no ") || strings.Contains(w.Message, " is its ") {
+		t.Errorf("unknown capture: %q", w.Message)
+	}
+}
+
+// Every code has a default next, so no wire error goes without one.
+func TestEveryCodeHasADefaultNext(t *testing.T) {
+	for code := range capture.DefaultRetryable {
+		if defaultNext[code] == "" {
+			t.Errorf("%s has no default next", code)
+		}
+		if w := toWireError(capture.Errorf(code, "", "x")); w.Next == "" {
+			t.Errorf("%s: a wire error without a next", code)
+		}
 	}
 }

@@ -167,7 +167,7 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 	}
 	limit, err := s.pageLimit(a.Limit)
 	if err != nil {
-		return toolError(invalidArgument("", "%s", err.Error()), nil), nil
+		return toolError(invalidArgument(fmt.Sprintf("pass limit from 1 to %d, or leave it out", s.lim.MaxRows), "%s", err.Error()), nil), nil
 	}
 
 	var out listAnswer
@@ -214,7 +214,7 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 		out.Captures = s.withHandles(out.Captures)
 	}
 	if err != nil {
-		return toolError(invalidArgument("", "%s", err.Error()), nil), nil
+		return toolError(invalidArgument("call capture_list again without cursor for the first page, then pass the next_cursor it answers", "%s", err.Error()), nil), nil
 	}
 	out.TotalRows, out.Skipped, out.OmittedCount = number(info.TotalRows), number(info.Skipped), number(info.OmittedCount)
 	out.NextCursor = info.NextCursor

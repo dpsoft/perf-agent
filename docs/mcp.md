@@ -174,7 +174,7 @@ A failure is an `isError` result whose text is one JSON object, so a loop can br
 {"error": {"code": "busy", "message": "capture job j3-3f9a is running; one capture runs at a time", "retryable": true, "retry_after": "5s", "next": "capture_wait or capture_cancel j3-3f9a; its reserved duration ends by 2026-11-15T10:42:07Z"}}
 ```
 
-`retryable` is always present, and a retryable failure always has `retry_after`, in whole seconds (`0s`: at once). A job's failure also names `job`, `capture_id` and `status`; perf-agent's exit and stderr tail come only on failure. Messages repeat agent input only cut, and name no absolute server path or temporary: the profiles root is `the profiles root` and the staging directory `staging`, in the programs' output tails too.
+`retryable` and `next` are always present, and a retryable failure always has `retry_after`, in whole seconds (`0s`: at once). A job's failure also names `job`, `capture_id` and `status`; perf-agent's exit and stderr tail come only on failure. Messages repeat agent input only cut, and name no absolute server path or temporary: the profiles root is `the profiles root` and the staging directory `staging`, in the programs' output tails too.
 
 | Code | Retryable | Meaning, and what `next` says |
 |---|---|---|
@@ -183,7 +183,7 @@ A failure is an `isError` result whose text is one JSON object, so a loop can br
 | `incomparable` | no | A setting differs from the `compare_with` baseline; names it and both values |
 | `unknown_baseline` | no | No usable baseline with that id in the series: none, a failed or interrupted one, one whose files no longer verify, or settings this server cannot read; lists the series' last ok ids |
 | `busy` | yes | Another capture holds the slot or the captures lock: this server, another server, or a reaper still ending one; names the holder. `retry_after` is the time to the holder's recorded end, rounded up to whole seconds and at most 5s (a holder records its worst case); `next` names that latest end |
-| `unknown_capture` | no | `capture_wait` or `capture_cancel` named an id this server has no job or manifest for, or whose manifest is gone |
+| `unknown_capture` | no | `capture_wait` named an id this server has no job or manifest for, or whose manifest is gone (a capture still being written is `in_progress`, not this); `capture_cancel` named no job of this server: only its own running jobs can be cancelled |
 | `target_changed` | yes | The target's credentials, dumpable flag, capabilities or start time changed during the capture; it was discarded |
 | `owner_mismatch` | no | The capture directory belongs to another kind of server |
 | `budget` | yes | `Capture.WindowCaptures` or `Capture.WindowDuration` is used up; `retry_after` is when the window frees, rounded up to whole seconds |

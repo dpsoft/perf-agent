@@ -502,7 +502,7 @@ because a loop branches on it:
 | `incomparable` | no | A setting differs from the `compare_with` baseline; it names the setting and both values. Drop the argument, or start a new series |
 | `unknown_baseline` | no | No such capture in the series; it lists the series' last ids |
 | `busy` | yes | Another capture holds the captures lock: this process, another stdio server, or an orphaned reaper (CAP-R6b). The message names the holder (server and reaper PIDs, capture id); `retry_after` is the time to its recorded end, rounded up to whole seconds, from 1s to at most 5s (a holder records its worst case), and `next` names that latest end (CAP-R89) |
-| `unknown_capture` | no | `capture_wait` or `capture_cancel` named an id this server never started; `capture_list` shows the ids |
+| `unknown_capture` | no | `capture_wait` named an id that is no job of this server (nor an alias of one) and no capture with a manifest, or one whose manifest is gone; `capture_cancel` named an id that is no job of this server: only this server's own running jobs can be cancelled, and `next` says that `capture_wait` answers the others. Never a capture whose intent is on disk (`in_progress`) or one asked before start-up recovery has run (`loading`). The message reads `"<id>": <why>` |
 | `target_changed` | yes | The target's credentials, dumpable flag, capabilities or start time changed during the capture; it was discarded (CAP-R1b) |
 | `owner_mismatch` | no | The capture directory belongs to the other server kind (SRV-R5, §6.2) |
 | `budget` | yes | A window limit; `retry_after` is when the window frees, rounded up to whole seconds |
@@ -522,10 +522,11 @@ because a loop branches on it:
 | `no_output` | yes | Exit 0 without the expected file |
 | `stuck_child` | no | Processes survived `StopGrace`; `survivors` lists their PID, `comm`, start time and state (CAP-R3b); do not retry; tell the user |
 | `closing` | no | The server is shutting down and starts no capture; start a new one |
-| `cancelled` | — | Only in `capture_list`; no response is sent for a cancelled request. `capture_wait` also answers it for a cancelled job, and with `status: "interrupted"`, `retryable: true` and `retry_after: "0s"` for a capture whose server ended under it (recovery wrote its manifest) |
+| `cancelled` | no; yes when interrupted | `capture_wait` answers it for a job cancelled by `capture_cancel` or by the end of the stdio session (`status: "cancelled"`), and with `status: "interrupted"`, `retryable: true` and `retry_after: "0s"` for a capture whose server ended under it (recovery wrote its manifest); `capture_list` shows it as the outcome. `notifications/cancelled` on a request sends no response at all |
 
-Every message is bounded, and repeats agent input only through `echo`, as
-M2 does. No message, failure manifest error or log line names an absolute
+Every failure carries `next`: the error's own advice, else its code's
+default. Every message is bounded, and repeats agent input only through
+`echo`, as M2 does. No message, failure manifest error or log line names an absolute
 path of the server's or a temporary (whose name carries the owner token's
 first 16 hex): it names the final file and the root by its kind
 (CAP-R63), each on one line, with advice that fits the error. The

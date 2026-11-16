@@ -95,12 +95,14 @@ func invalidArgument(next, format string, args ...any) *capture.Error {
 }
 
 // unknownCapture is the answer for an id this server has no job or
-// capture for.
-func unknownCapture(id, why string) *capture.Error {
-	return capture.Errorf(capture.CodeUnknownCapture,
-		"pass the job id capture answered, or a capture id as <series>/NNN; capture_list shows them",
-		"%q is %s", echo(id), why)
+// capture for: why it is unknown, and next what to do.
+func unknownCapture(id, why, next string) *capture.Error {
+	return capture.Errorf(capture.CodeUnknownCapture, next, "%q: %s", echo(id), why)
 }
+
+// unknownNext is what to do with an id that names nothing this server
+// knows.
+const unknownNext = "pass the job id capture answered, or a capture id <series>/NNN as capture_list's capture field shows it"
 
 // answer encodes v as a tool result: capture tool answers are small and
 // bounded, so they need no size check of their own.
@@ -451,7 +453,7 @@ func (s *Server) handleWait(ctx context.Context, raw json.RawMessage) (mcpstdio.
 		key, jobID = al.captureID, al.jobID
 	}
 	if _, _, ok := splitCaptureKey(key); !ok {
-		return toolError(unknownCapture(a.ID, "no capture job of this server, and no capture id as <series>/NNN"), nil), nil
+		return toolError(unknownCapture(a.ID, "no job of this server, and no capture id <series>/NNN", unknownNext), nil), nil
 	}
 	return s.waitHistorical(ctx, key, jobID, d, a.ID), nil
 }
@@ -566,7 +568,8 @@ func (s *Server) settledAnswer(ctx context.Context, j *job, deadline time.Time, 
 		return loadingAnswer(asked)
 	case gone:
 		s.registry.forget(key)
-		return toolError(unknownCapture(key, "its manifest is gone: another server's retention, or a person, removed it"), nil)
+		return toolError(unknownCapture(key, "its manifest is gone: another server's retention, or a person, removed it",
+			"capture again if you need it; capture_list shows what the series still holds"), nil)
 	}
 	return s.jobAnswer(j)
 }
@@ -731,9 +734,10 @@ func (s *Server) waitHistorical(ctx context.Context, key, jobID string, d time.D
 		// dead server left, which recovery is yet to record.
 		return loadingAnswerNext(asked, loadingRecoveryNext)
 	case errors.Is(err, errNoCapture):
-		return toolError(unknownCapture(key, "no capture of this server's capture directory"), nil)
+		return toolError(unknownCapture(key, "no capture of this server's capture directory", unknownNext), nil)
 	case err != nil:
-		return toolError(unknownCapture(key, "a capture whose manifest cannot be read: "+causeText(err)), nil)
+		return toolError(unknownCapture(key, "its manifest cannot be read: "+causeText(err),
+			"tell the user: the capture's manifest in the capture directory cannot be read; capture_list shows the series' other captures"), nil)
 	}
 	return s.historicalAnswer(key, jobID, v.(*historical))
 }
@@ -1113,7 +1117,8 @@ func (s *Server) handleCancel(_ context.Context, raw json.RawMessage) (mcpstdio.
 	}
 	status, ok := s.registry.cancel(a.ID)
 	if !ok {
-		return toolError(unknownCapture(a.ID, "no capture job of this server"), nil), nil
+		return toolError(unknownCapture(a.ID, "no job of this server: only this server's own running jobs can be cancelled",
+			"capture_wait answers a capture another server ran or this server no longer holds; capture_list shows the running job"), nil), nil
 	}
 	out.Status = status
 	return answer(out)

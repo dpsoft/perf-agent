@@ -13,6 +13,12 @@ import (
 // on: Go's own type and struct names.
 var goTypeWords = regexp.MustCompile(`\bGo\b|\bstruct\b|captureArgs|waitArgs|listArgs|\bint\b|\bint64\b|\bfloat64\b|unmarshal`)
 
+// goTypeWord is the first of goTypeWords in s, "" when there is none; "Go
+// duration", the name of the format durations are passed in, is no Go type.
+func goTypeWord(s string) string {
+	return goTypeWords.FindString(strings.ReplaceAll(s, "Go duration", ""))
+}
+
 // An argument of the wrong JSON type is invalid_argument naming the
 // argument and the type it takes, in JSON's words, with a next; never Go's
 // type or field names.
@@ -40,7 +46,7 @@ func TestAMistypedArgumentIsRefusedPlainly(t *testing.T) {
 		if !strings.Contains(w.Message, tc.arg) || !strings.Contains(w.Message, tc.want) || w.Next == "" {
 			t.Errorf("%s %v: message %q next %q, want %s named as taking %s, and a next", tc.tool, tc.args, w.Message, w.Next, tc.arg, tc.want)
 		}
-		if m := goTypeWords.FindString(w.Message + " " + w.Next); m != "" {
+		if m := goTypeWord(w.Message + " " + w.Next); m != "" {
 			t.Errorf("%s %v: %q says %q", tc.tool, tc.args, w.Message, m)
 		}
 	}

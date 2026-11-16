@@ -22,9 +22,12 @@ const defaultLabel = "client"
 // It is safe for concurrent use.
 type Session struct {
 	initialized atomic.Bool
-	mu          sync.Mutex
-	version     string
-	label       string
+	// claimed is held by the initialize Handle is answering, and kept once
+	// one succeeded, so a session's label and version never change.
+	claimed atomic.Bool
+	mu      sync.Mutex
+	version string
+	label   string
 }
 
 // NewSession is a session before initialize.
@@ -141,10 +144,27 @@ func (s *Server) Parse(msg []byte) (*Request, []byte) {
 // returns the compact JSON answer without a trailing newline; nil for a
 // notification. The handler's context carries ss, so ClientLabel works. It
 // installs no progress target, so Progress returns false, and it calls no
-// OnClose. Calls on one session need not be serialized.
+// OnClose. Calls on one session need not be serialized. Unlike stdio, it
+// refuses an initialize on a session that has one answered or running, so
+// a session's label and version never change; one that failed leaves the
+// session free for another.
 func (s *Server) Handle(ctx context.Context, ss *Session, r *Request) []byte {
 	if r.Notification() {
 		return nil
+	}
+	if r.Method == "initialize" {
+		if !ss.claimed.CompareAndSwap(false, true) {
+			b, err := marshal(errorResponse(r.ID, codeInvalidRequest, "initialize was already sent on this session"))
+			if err != nil {
+				s.warn("encode message", "", slog.LevelError, "err", err)
+			}
+			return b
+		}
+		defer func() {
+			if !ss.initialized.Load() {
+				ss.claimed.Store(false)
+			}
+		}()
 	}
 	env := &envelope{JSONRPC: "2.0", ID: r.ID, Method: r.Method, Params: r.Params}
 	out, initialized := s.answer(withSession(ctx, ss), ss, env)

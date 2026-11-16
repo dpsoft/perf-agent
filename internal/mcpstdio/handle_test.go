@@ -296,3 +296,61 @@ func TestFlushWarningsLogsTheCounts(t *testing.T) {
 		t.Fatalf("log: %s", out)
 	}
 }
+
+// TestHandleRefusesASecondInitialize keeps a session's label and version
+// for its whole life: an initialize on a session that has one, or has one
+// running, is refused; one that failed leaves the session free.
+func TestHandleRefusesASecondInitialize(t *testing.T) {
+	s := New(testOptions())
+	ss := NewSession()
+	out := handleLine(t, s, ss, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"x"},"protocolVersion":7}}`)
+	if !strings.Contains(string(out), `"code":-32602`) || ss.Initialized() {
+		t.Fatalf("a failed initialize: %s", out)
+	}
+	handleLine(t, s, ss, `{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"first"}}}`)
+	out = handleLine(t, s, ss, `{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"second"}}}`)
+	if !strings.Contains(string(out), `"id":3,"error":{"code":-32600,"message":"initialize was already sent on this session"}`) {
+		t.Fatalf("a second initialize: %s", out)
+	}
+	if ss.Label() != "first" || ss.Version() != "2025-06-18" {
+		t.Fatalf("label %q version %q after a second initialize", ss.Label(), ss.Version())
+	}
+}
+
+// TestConcurrentHandleOnOneSession runs initializes and calls on one
+// session at once: exactly one initialize wins, and every call answers.
+func TestConcurrentHandleOnOneSession(t *testing.T) {
+	o := testOptions()
+	o.Tools = append(o.Tools, Tool{Name: "who", Handler: func(ctx context.Context, _ json.RawMessage) (Result, error) {
+		return Result{Text: ClientLabel(ctx)}, nil
+	}})
+	s := New(o)
+	ss := NewSession()
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	won := 0
+	for i := range 8 {
+		wg.Go(func() {
+			out := handleLine(t, s, ss, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"initialize","params":{"clientInfo":{"name":"c%d"}}}`, i, i))
+			if strings.Contains(string(out), `"result"`) {
+				mu.Lock()
+				won++
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	if won != 1 || !ss.Initialized() {
+		t.Fatalf("%d initializes succeeded", won)
+	}
+	label := ss.Label()
+	for i := range 32 {
+		wg.Go(func() {
+			out := handleLine(t, s, ss, fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"who"}}`, 100+i))
+			if want := fmt.Sprintf(`"id":%d,"result":{"content":[{"type":"text","text":%q}]`, 100+i, label); !strings.Contains(string(out), want) {
+				t.Errorf("call %d: %s", i, out)
+			}
+		})
+	}
+	wg.Wait()
+}

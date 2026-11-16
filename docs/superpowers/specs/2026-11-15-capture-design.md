@@ -310,9 +310,17 @@ is released, against the snapshot.
 - **A capture id whose intent is on disk and whose manifest is not yet**
   (another server's running capture, or one a dead server left that
   recovery has yet to record) answers `status: "in_progress"` with
-  `capture`, `retry_after` (the captures lock's end for it, 1–5 s, else
-  5 s), `next` and `holder` (the server and reaper the intent records,
-  `, which is gone` when neither runs); never `unknown_capture`. A gone
+  `capture_id`, `retry_after` (the captures lock's end for it, 1–5 s,
+  else 5 s), `next` and `holder` (the server and reaper the intent
+  records; `, which is gone; its reaper pid N still runs` when only the
+  reaper runs; `, which is gone` when neither does); never
+  `unknown_capture`. Only a running server is said to be running the
+  capture. `next` always ends with when to stop asking: a minute past the
+  captures lock's deadline when it names the capture, else this server's
+  longest capture (`StartTimeout + MaxDuration + FinishTimeout +
+  StopGrace`) and a minute, then `capture_list` and tell the user, since
+  an intent recovery never records or a stopped owner could answer
+  `in_progress` forever. A gone
   holder asks maintenance for a recovery pass. A capture id with no
   manifest asked before this server's start-up recovery has run answers
   `loading`, since recovery may yet record it. A start-up pass that finds
@@ -380,8 +388,11 @@ without `--output`.
 Durations are strings and other integers are JSON integers, as in existing
 tool inputs (`limit`, `context`). The capture tools' answers carry their
 own integers (settings, a target's pid and start time, `capture_list`'s
-counts) as JSON integers too, so a setting read back is passed again as
-it is; the files keep them as decimal strings. An argument of the wrong
+counts, a survivor's pid and start time, a failure's `perf_agent_exit`)
+as JSON integers too, so a setting read back is passed again as it is; a
+perf-agent ended by a signal has `perf_agent_signal` instead of
+`perf_agent_exit`. The files, and the `open` and `diff` results a
+capture embeds, keep them as decimal strings. An argument of the wrong
 JSON type is `invalid_argument` naming the argument and the JSON type it
 takes, never Go's types (CAP-R90). There is no `env` argument (§6.4) and no
 `tags` argument.
@@ -499,7 +510,7 @@ because a loop branches on it:
 {"error": {"code": "target_exited", "message": "the launched command (pid 41234) ended before profiling began, 0.3s after the start",
            "retryable": false,
            "next": "the command ended before perf-agent attached; if it starts a daemon or a server and returns, start that yourself and capture it with pid; otherwise give it more work",
-           "job": "j3-3f9a", "capture_id": "parse-opt/003", "status": "failed", "perf_agent_exit": "1", "stderr_tail": "…"}}
+           "job": "j3-3f9a", "capture_id": "parse-opt/003", "status": "failed", "perf_agent_exit": 1, "stderr_tail": "…"}}
 ```
 
 | `code` | `retryable` | Meaning, and what `next` says |
@@ -798,9 +809,11 @@ the slot is a cross-process lock:
   reaper, which holds it until both children are reaped (CAP-R6b, §6.6);
 - the holder writes `{server pid, start_time, reaper pid, start_time,
   capture id, series, deadline}` into the file;
-- a second capture, from this process or any other, is refused at once
-  with `busy`, naming the holder ("capture parse-opt/004 by perf-agent-mcp
-  pid 5123, ends by 10:15:42Z") and `retry_after`.
+- a second capture is refused with `busy`, naming the holder ("capture
+  parse-opt/004 by perf-agent-mcp pid 5123, ends by 10:15:42Z") and
+  `retry_after`: at once by `capture` when this process runs one, and as
+  the job's failure, answered by `capture_wait`, when another process
+  holds the lock (the job finds it in its prepare phase).
 
 It is not queued: a queued capture would start at a moment nobody chose.
 The lock is per capture, not per server lifetime, so a second session can

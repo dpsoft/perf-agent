@@ -93,10 +93,25 @@ func toResultSurvivors(ws []wireSurvivor) []resultSurvivor {
 }
 
 // resultError is a wire error as an answer shows it: its survivors with
-// numbers.
+// numbers, and perf-agent's exit status as a number, or the signal that
+// ended it as perf_agent_signal.
 type resultError struct {
 	*wireError
-	Survivors []resultSurvivor `json:"survivors,omitzero"`
+	PerfAgentExit   *int             `json:"perf_agent_exit,omitzero"`
+	PerfAgentSignal string           `json:"perf_agent_signal,omitzero"`
+	Survivors       []resultSurvivor `json:"survivors,omitzero"`
+}
+
+func toResultError(w *wireError) resultError {
+	r := resultError{wireError: w, Survivors: toResultSurvivors(w.Survivors)}
+	if w.PerfAgentExit != "" {
+		if n, err := strconv.Atoi(w.PerfAgentExit); err == nil {
+			r.PerfAgentExit = new(n)
+		} else {
+			r.PerfAgentSignal = w.PerfAgentExit
+		}
+	}
+	return r
 }
 
 // defaultNext is what to do after a failure of each code, for an error

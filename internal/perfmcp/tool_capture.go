@@ -79,7 +79,7 @@ func toolError(e *capture.Error, j *job) mcpstdio.Result {
 func errorResult(w *wireError) mcpstdio.Result {
 	b, err := marshal(struct {
 		Error resultError `json:"error"`
-	}{resultError{wireError: w, Survivors: toResultSurvivors(w.Survivors)}})
+	}{toResultError(w)})
 	if err != nil {
 		b = []byte(`{"error":{"code":"` + w.Code + `","message":"the error could not be encoded","retryable":false}}`)
 	}

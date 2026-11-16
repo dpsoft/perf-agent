@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/dpsoft/perf-agent/internal/capture"
+	"github.com/dpsoft/perf-agent/internal/capture/capturetest"
 )
 
 // goTypeWords are what a Go decoding error says that an agent cannot act
@@ -113,5 +114,34 @@ func TestCaptureResultsCarryIntegersAsNumbers(t *testing.T) {
 		if _, ok := s.Series[0][k].(float64); !ok {
 			t.Errorf("capture_list series %s is %T (%v), want a JSON number", k, s.Series[0][k], s.Series[0][k])
 		}
+	}
+}
+
+// A failure carries perf-agent's exit status as a JSON number, 0 included,
+// and the signal that ended it as perf_agent_signal; the manifest keeps
+// both as one decimal string or signal name.
+func TestAFailureCarriesPerfAgentsExitAsANumber(t *testing.T) {
+	exitOf := func(text string) (exit any, hasExit bool, signal any) {
+		t.Helper()
+		var out struct {
+			Error map[string]any `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(text), &out); err != nil {
+			t.Fatal(err)
+		}
+		exit, hasExit = out.Error["perf_agent_exit"]
+		return exit, hasExit, out.Error["perf_agent_signal"]
+	}
+	text := failedCapture(t, jobOpts{fake: capturetest.FakeOptions{Mode: capturetest.FakeNoFile}}, map[string]any{"duration": "1s"}, nil)
+	if exit, ok, signal := exitOf(text); exit != float64(0) || !ok || signal != nil {
+		t.Errorf("perf-agent exited 0: perf_agent_exit %#v (present %v), perf_agent_signal %#v: %s", exit, ok, signal, text)
+	}
+	killed := errorResult(&wireError{Code: string(capture.CodePerfAgentFailed), PerfAgentExit: "killed"}).Text
+	if exit, ok, signal := exitOf(killed); ok || signal != "killed" {
+		t.Errorf("perf-agent killed: perf_agent_exit %#v (present %v), perf_agent_signal %#v: %s", exit, ok, signal, killed)
+	}
+	none := errorResult(&wireError{Code: string(capture.CodeBusy)}).Text
+	if exit, ok, signal := exitOf(none); ok || signal != nil {
+		t.Errorf("no perf-agent exit: perf_agent_exit %#v, perf_agent_signal %#v: %s", exit, signal, none)
 	}
 }

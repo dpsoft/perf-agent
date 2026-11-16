@@ -52,14 +52,19 @@ func startCapture(t *testing.T, c *testClient, args map[string]any) string {
 func toolErrorOf(t *testing.T, text string) wireError {
 	t.Helper()
 	var out struct {
-		Error *wireError `json:"error"`
+		Error *struct {
+			wireError
+			PerfAgentExit   *int             `json:"perf_agent_exit"`
+			PerfAgentSignal string           `json:"perf_agent_signal"`
+			Survivors       []resultSurvivor `json:"survivors"`
+		} `json:"error"`
 	}
 	dec := json.NewDecoder(strings.NewReader(text))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&out); err != nil || out.Error == nil || dec.More() {
 		t.Fatalf("not one {\"error\": …} object: %s (%v)", text, err)
 	}
-	return *out.Error
+	return out.Error.wireError
 }
 
 // isResult reports whether a capture_wait answer is a done capture's

@@ -26,6 +26,7 @@ var skillArgs = []string{
 	"command", "pid", "series", "label", "keep", "job", "timeout", "compare_with", "compare", "next",
 	"error", "code", "retryable", "retry_after", "recompute", "handles", "reopen",
 	"comparability", "status", "done", "interrupted", "derived", "capture_id",
+	"sample_rate", "start_time", "perf_agent_exit",
 }
 
 // captureCodes are the capture failure codes, which the skill may cite.

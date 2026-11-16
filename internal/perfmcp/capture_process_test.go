@@ -476,3 +476,82 @@ func TestStdioAndServeRefuseEachOthersDir(t *testing.T) {
 
 // groupGone reports that no process is left in the process group pgid.
 func groupGone(pgid int) bool { return syscall.Kill(-pgid, 0) == syscall.ESRCH }
+
+// inProgress is capture_wait's answer for a capture whose intent is on
+// disk and whose manifest is not yet.
+type inProgress struct {
+	ID         string `json:"id"`
+	Capture    string `json:"capture"`
+	Status     string `json:"status"`
+	RetryAfter string `json:"retry_after"`
+	Next       string `json:"next"`
+	Holder     string `json:"holder"`
+}
+
+// A server SIGKILLed while it profiles, and another started at once: the
+// dead server's reaper still holds the captures lock, so the new server's
+// start-up recovery cannot run. A wait by capture id answers in_progress,
+// naming the dead server, never unknown_capture. Once the reaper lets go,
+// the new server's start-up pass, re-armed while the lock was held, runs
+// on its own, with no capture to trigger it, and the wait answers
+// interrupted, retryable.
+func TestARestartRightAfterAKillAnswersTheCaptureInProgress(t *testing.T) {
+	e := newProcEnv(t, capturetest.FakeOptions{})
+	hold := filepath.Join(t.TempDir(), "hold")
+	if err := os.WriteFile(hold, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := e.config()
+	cfg.ReaperPause = capture.PauseBeforeExit + hold
+	a := startServerProcess(t, cfg)
+	t.Cleanup(func() { _ = os.Remove(hold) })
+
+	job := a.startCapture(e.args("60s"))
+	a.waitProfiling(job)
+	a.awaitGrandchild()
+	h := e.holder(func(h capture.Holder) bool { return h.ReaperPID > 0 })
+	reaper, ok := procOf(h.ReaperPID)
+	if !ok || reaper.start != h.ReaperStart {
+		t.Fatalf("the lock names reaper %d (start %d), and /proc has %+v", h.ReaperPID, h.ReaperStart, reaper)
+	}
+	a.kill9()
+	b := startServerProcess(t, e.config())
+
+	for range 2 {
+		text, isErr := b.call("capture_wait", map[string]any{"id": "adhoc/001", "timeout": "1s"})
+		var ip inProgress
+		if isErr || json.Unmarshal([]byte(text), &ip) != nil || ip.Status != "in_progress" {
+			t.Fatalf("capture_wait adhoc/001 while the dead server's reaper holds the lock: %s", text)
+		}
+		if d, err := time.ParseDuration(ip.RetryAfter); err != nil || d < time.Second || d > 5*time.Second || d%time.Second != 0 {
+			t.Errorf("retry_after %q, want whole seconds from 1s to 5s", ip.RetryAfter)
+		}
+		if ip.Capture != "adhoc/001" || ip.Next == "" || !strings.Contains(ip.Holder, fmt.Sprintf("pid %d", a.pid())) {
+			t.Errorf("the answer does not name the capture, what to do, or the dead server pid %d: %s", a.pid(), text)
+		}
+		if reaper.gone() {
+			t.Fatal("the reaper exited while its barrier file exists")
+		}
+	}
+
+	if err := os.Remove(hold); err != nil {
+		t.Fatal(err)
+	}
+	waitGone(t, "the reaper", reaper.gone)
+	var last string
+	if !eventuallyTrue(time.Minute, func() bool {
+		text, isErr := b.call("capture_wait", map[string]any{"id": "adhoc/001", "timeout": "1s"})
+		last = text
+		if !isErr {
+			return false
+		}
+		w := toolErrorOf(t, text)
+		return w.Status == captureInterrupted && w.Retryable && w.Code == string(capture.CodeCancelled)
+	}) {
+		t.Fatalf("capture_wait adhoc/001 never answered interrupted: %s", last)
+	}
+	if m, ok := e.manifest(1, "run"); !ok || m.Outcome != captureInterrupted {
+		t.Errorf("capture 001: %+v (found %v), want interrupted", m, ok)
+	}
+	e.invariant()
+}

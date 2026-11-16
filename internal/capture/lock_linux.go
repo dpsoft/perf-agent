@@ -73,16 +73,37 @@ func TryLock(dir *os.Root, h Holder) (*Lease, *Error) {
 	return l, nil
 }
 
+// holderOf reads the holder record from f; ok is false when it is
+// missing, torn or garbled.
+func holderOf(f *os.File) (h Holder, ok bool) {
+	buf := make([]byte, 64<<10)
+	n, _ := f.ReadAt(buf, 0)
+	// The first JSON value is the record; a stale tail from a crash between
+	// the write and the truncate is ignored.
+	if n == 0 || json.NewDecoder(bytes.NewReader(buf[:n])).Decode(&h) != nil || h.ServerPID == 0 && h.ReaperPID == 0 {
+		return Holder{}, false
+	}
+	return h, true
+}
+
+// ReadHolder is the holder record in dir's lock file, without taking the
+// lock; ok is false when there is none or it cannot be read. The record
+// says who last took the lock, not that it still holds it.
+func ReadHolder(dir *os.Root) (Holder, bool) {
+	f, err := dir.OpenFile(lockName, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return Holder{}, false
+	}
+	defer func() { _ = f.Close() }()
+	return holderOf(f)
+}
+
 // busyError reads the holder record from f and describes it.
 func busyError(f *os.File) *Error {
 	e := &Error{Code: CodeBusy, Retryable: true, RetryAfter: minRetryAfter,
 		Next: "retry after retry_after; the holder's end is unknown"}
-	buf := make([]byte, 64<<10)
-	n, _ := f.ReadAt(buf, 0)
-	var h Holder
-	// The first JSON value is the record; a stale tail from a crash between
-	// the write and the truncate is ignored.
-	if n == 0 || json.NewDecoder(bytes.NewReader(buf[:n])).Decode(&h) != nil || h.ServerPID == 0 && h.ReaperPID == 0 {
+	h, ok := holderOf(f)
+	if !ok {
 		e.Message = "another capture holds the captures directory (its holder record is unreadable)"
 		return e
 	}

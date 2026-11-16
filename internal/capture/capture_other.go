@@ -60,6 +60,9 @@ func executableHere() func(fs.FileInfo) bool {
 // Lease is the captures lock, which needs Linux.
 type Lease struct{}
 
+// ReadHolder reads nothing: capture needs Linux.
+func ReadHolder(*os.Root) (Holder, bool) { return Holder{}, false }
+
 // TryLock is disabled: capture needs Linux.
 func TryLock(*os.Root, Holder) (*Lease, *Error) { return nil, notLinux() }
 

@@ -693,9 +693,19 @@ func (s *Server) waitHistorical(ctx context.Context, key, jobID string, d time.D
 		return loadingAnswer(asked)
 	}
 	v, ready, err := l.wait(ctx, d)
+	if ip, ok := errors.AsType[*inProgressError](err); ok {
+		if !ip.live {
+			s.wantRecovery()
+		}
+		return ip.answer(asked, key)
+	}
 	switch {
 	case !ready:
 		return loadingAnswer(asked)
+	case errors.Is(err, errNoCapture) && !s.recovered.Load():
+		// The start-up recovery has not run yet: the capture may be one a
+		// dead server left, which recovery is yet to record.
+		return loadingAnswerNext(asked, loadingRecoveryNext)
 	case errors.Is(err, errNoCapture):
 		return toolError(unknownCapture(key, "no capture of this server's capture directory"), nil)
 	case err != nil:
@@ -752,14 +762,99 @@ func (s *Server) manifestGone(key, label string) bool {
 	return errors.Is(err, fs.ErrNotExist)
 }
 
+// The next of a loading answer: a read not done in time, and a capture id
+// asked before this server's start-up recovery has run.
+const (
+	loadingNext = "call again after retry_after; a capture that still answers loading after a minute is on a filesystem " +
+		"that does not answer: stop waiting and tell the user"
+	loadingRecoveryNext = "this server has not recovered the capture directory yet (another process holds its lock, " +
+		"at most until that capture's deadline); call again after retry_after, and if it still answers loading after a minute, " +
+		"capture_list shows the series' history"
+)
+
 // loadingAnswer is an answer that is still being read, for the id the
 // client asked by.
-func loadingAnswer(id string) mcpstdio.Result {
+func loadingAnswer(id string) mcpstdio.Result { return loadingAnswerNext(id, loadingNext) }
+
+func loadingAnswerNext(id, next string) mcpstdio.Result {
 	r, _ := answer(struct {
 		ID         string `json:"id"`
 		Status     string `json:"status"`
 		RetryAfter string `json:"retry_after"`
-	}{id, statusLoading, loadingRetry.String()})
+		Next       string `json:"next"`
+	}{id, statusLoading, loadingRetry.String(), next})
+	return r
+}
+
+// statusInProgress is the status of a capture whose intent is on disk and
+// whose manifest is not yet.
+const statusInProgress = "in_progress"
+
+// inProgressRetry is the retry_after of an in_progress answer when the
+// captures lock names no end for it.
+const inProgressRetry = 5 * time.Second
+
+// inProgressError is a capture id whose intent is on disk and whose
+// manifest is not: its owner, another process, is writing it, or recovery
+// has yet to record it. It is never kept: the next wait reads the disk
+// again.
+type inProgressError struct {
+	in    intent
+	live  bool
+	retry time.Duration
+}
+
+func (e *inProgressError) Error() string { return "the capture is in progress" }
+
+// inProgress is capture key's (id's) in-progress state in ser, when its
+// intent is there: whether its owner (by its recorded server and reaper)
+// is alive, and when to ask again, from the captures lock's record when it
+// names this capture.
+func (s *Server) inProgress(d *captureDir, ser *os.Root, key string, id int) (*inProgressError, bool) {
+	names, err := readDirNames(ser, ".")
+	if err != nil {
+		return nil, false
+	}
+	for _, n := range names {
+		got, _, kind, ok := parseName(n)
+		if !ok || got != id || kind != kindIntent {
+			continue
+		}
+		in, _, err := readIntent(ser, n)
+		if err != nil {
+			return nil, false
+		}
+		ip := &inProgressError{in: in, live: s.ownerIsAlive(in), retry: inProgressRetry}
+		if h, ok := capture.ReadHolder(d.root); ok && h.CaptureID == key && time.Until(h.Deadline) > 0 {
+			ip.retry = capture.BusyRetry(time.Until(h.Deadline))
+		}
+		return ip, true
+	}
+	return nil, false
+}
+
+// answer is the in_progress answer for key, asked by asked: the server
+// (and reaper) writing it, and what to do.
+func (e *inProgressError) answer(asked, key string) mcpstdio.Result {
+	holder := fmt.Sprintf("perf-agent-mcp pid %d", e.in.ServerPID)
+	if e.in.ReaperPID > 0 {
+		holder += fmt.Sprintf(" (reaper pid %d)", e.in.ReaperPID)
+	}
+	next := "another perf-agent-mcp is running this capture; call capture_wait again after retry_after: " +
+		"once it is committed or has failed, the answer comes from its manifest"
+	if !e.live {
+		holder += ", which is gone"
+		next = "the server that ran this capture is gone; this server's recovery records it as interrupted once the captures lock is free " +
+			"(a reaper of that server holds it at most until the capture's deadline); call capture_wait again after retry_after"
+	}
+	r, _ := answer(struct {
+		ID         string `json:"id"`
+		Capture    string `json:"capture"`
+		Status     string `json:"status"`
+		RetryAfter string `json:"retry_after"`
+		Next       string `json:"next"`
+		Holder     string `json:"holder"`
+	}{asked, key, statusInProgress, capture.CeilSecond(e.retry).String(), next, holder})
 	return r
 }
 
@@ -895,6 +990,11 @@ func (s *Server) readHistorical(key string) (*historical, error) {
 	}
 	defer func() { _ = ser.Close() }()
 	m, err := manifestByID(ser, id)
+	if errors.Is(err, errNoCapture) {
+		if ip, ok := s.inProgress(d, ser, key, id); ok {
+			return nil, ip
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -304,6 +304,18 @@ is released, against the snapshot.
   ```
 
   It is never `pending`. `pending` exists only for a live job in `done`.
+- **A capture id whose intent is on disk and whose manifest is not yet**
+  (another server's running capture, or one a dead server left that
+  recovery has yet to record) answers `status: "in_progress"` with
+  `capture`, `retry_after` (the captures lock's end for it, 1–5 s, else
+  5 s), `next` and `holder` (the server and reaper the intent records,
+  `, which is gone` when neither runs); never `unknown_capture`. A gone
+  holder asks maintenance for a recovery pass. A capture id with no
+  manifest asked before this server's start-up recovery has run answers
+  `loading`, since recovery may yet record it. A start-up pass that finds
+  the captures lock held runs again at the holder's busy `retry_after`
+  (at most 10 s), and again 10 s after a recovery that left an owner it
+  could not judge, until it runs (CAP-R84, CAP-R87).
 - **Historical lookups (CAP-R14):**
   - manifest reads run on a bounded worker pool of **2 workers** with a
     queue of 16;

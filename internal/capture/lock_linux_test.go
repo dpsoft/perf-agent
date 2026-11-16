@@ -245,3 +245,22 @@ func TestBusyRetryAfterIsCappedAndRounded(t *testing.T) {
 		}
 	}
 }
+
+// ReadHolder reads the record without taking the lock, held or not.
+func TestReadHolderReadsTheRecord(t *testing.T) {
+	_, root := openDir(t)
+	if _, ok := ReadHolder(root); ok {
+		t.Fatal("a record with no lock file")
+	}
+	l, e := TryLock(root, Holder{ServerPID: 7, CaptureID: "d/002"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	if h, ok := ReadHolder(root); !ok || h.ServerPID != 7 || h.CaptureID != "d/002" {
+		t.Errorf("held: %+v %v", h, ok)
+	}
+	_ = l.Close()
+	if h, ok := ReadHolder(root); !ok || h.CaptureID != "d/002" {
+		t.Errorf("released: %+v %v", h, ok)
+	}
+}

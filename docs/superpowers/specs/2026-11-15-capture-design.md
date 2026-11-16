@@ -262,7 +262,7 @@ is released, against the snapshot.
 |---|---|---|
 | `capture` (arguments §4.2) | microseconds: no I/O, no lock, no engine | `{job, status: "accepted", eta}`, or a synchronous `invalid_argument` or `busy` (in-process slot) error. Cross-process `busy` and every later error arrive as the job's `failed` state |
 | `capture_wait {id, timeout?}` (a job id or a capture id) | at most `timeout`, default 30 s, **capped at 45 s**, and never past its own deadline. It reads the job registry; a historical id goes to the lookup pool (CAP-R14). Never the engine | the current state. When `done` with `derived: ready`, the §4.3 result. Otherwise `{job, id?, status, phase, elapsed, eta, derived?}`, or `status: "loading"` when a historical lookup has not finished by the deadline |
-| `capture_cancel {id}` | the **control path** (CAP-R10): no request queue, no engine | `{job, status: "cancelling"}`. It does one CAS on the job's decision word and no file I/O; the job does the cleanup. **The terminal decision rule is in §7.4 (CAP-R16):** a cancel wins against everything except a manifest link already in flight, and `too late: committed` is said only once the manifest link has succeeded. A job that has already ended is answered from the registry with its final state, and its word is not touched (CAP-R61): `too late: committed` (done), `cancelled` (cancelled) or `too late: failed` (failed), also after its entry has left the registry, through its job id's alias. A job whose commit is undecided (CAP-R50) answers `cancelling (decision pending)`, from the job, the registry and the alias; the cancel is recorded and reported when the commit is settled: `too late: committed` if the link was made, `cancelled` if it was not (CAP-R64) |
+| `capture_cancel {id}` | the **control path** (CAP-R10): no request queue, no engine | `{job, status: "cancelling"}`. It does one CAS on the job's decision word and no file I/O; the job does the cleanup. **The terminal decision rule is in §7.4 (CAP-R16):** a cancel wins against everything except a manifest link already in flight, and `too late: committed` is said only once the manifest link has succeeded. A job that has already ended is answered from the registry with its final state, and its word is not touched (CAP-R61): `too late: committed` (done), `cancelled` (cancelled) or `too late: failed` (failed), also after its entry has left the registry, through its job id's alias. A job whose commit is undecided (CAP-R50) answers `cancelling (decision pending)`, from the job, the registry and the alias; the cancel is recorded and reported when the commit is settled: `too late: committed` if the link was made, `cancelled` if it was not (CAP-R64). Such a job is never evicted from the registry until it is settled (CAP-R65), and the decision word is settled in the same step as its final status, so a cancel at any point before that status is honoured (CAP-R66). A job's slot is freed before its end is visible, so a client that sees the end can start the next capture at once (CAP-R67) |
 | `capture_list` (§4.6) | the in-memory jobs at once; the history through the lookup pool, to the call's deadline | active and recent jobs first, then the history from the manifests, with `"loading": true` for pages not read in time |
 
 **Ownership (SRV-R7).** Jobs belong to the server, not to sessions:
@@ -506,7 +506,14 @@ Every message is bounded, and repeats agent input only through `echo`, as
 M2 does. No message, failure manifest error or log line names an absolute
 path of the server's or a temporary (whose name carries the owner token's
 first 16 hex): it names the final file and the root by its kind
-(CAP-R63). The result's `perf_agent.path` is the one path a result shows. A failed capture keeps no profile. Its manifest is kept, with
+(CAP-R63), each on one line, with advice that fits the error. The
+result's `perf_agent.path` is the one path a result shows. What the
+capture's programs print (`stderr_tail`, `workload_output_tail`, and a
+message quoting perf-agent's stderr) is their own text, but the server's
+paths in it are replaced before it leaves the server: the staging
+directory by `staging` and the profiles root by `the profiles root`, as
+given and with links resolved; a tail stays within `MaxOutputTail`
+(CAP-R68). A failed capture keeps no profile. Its manifest is kept, with
 `outcome: "failed"` and the code, so `capture_list` shows the failure in
 the series' history. It is subject to retention like any capture.
 

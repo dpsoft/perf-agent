@@ -27,6 +27,13 @@ func (s *Server) recoverCaptures(d *captureDir) (notes []string, err error) {
 	slices.Sort(names)
 	for _, n := range names {
 		if !validSeries(n) {
+			// A temporary the capture directory's own writes left (.owner's)
+			// is reported like a series' and stays.
+			if strings.HasPrefix(n, ".") && n != ownerFile && n != lockFile {
+				note := fmt.Sprintf("orphan_temp %s: a file this server cannot prove it made, so it is never removed automatically; remove it by hand", n)
+				s.log.Warn("capture recovery", "note", note)
+				notes = append(notes, note)
+			}
 			continue
 		}
 		if fi, err := d.root.Lstat(n); err != nil || !fi.IsDir() {
@@ -193,6 +200,9 @@ func (s *Server) recoverSeries(d *captureDir, series string) (notes []string, er
 	}
 	return notes, nil
 }
+
+// lockFile is the captures lock's file, which the lock owns.
+const lockFile = ".lock"
 
 // interruptedNote is the note of a manifest recovery writes.
 const interruptedNote = "the server running this capture ended before it finished; recovery removed what it had written"

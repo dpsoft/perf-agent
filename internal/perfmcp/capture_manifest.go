@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -234,6 +235,16 @@ func readManifest(ser *os.Root, name string) (manifest, error) {
 		return manifest{}, fmt.Errorf("manifest %s was not written by %s", name, writtenBy)
 	case !ok || kind != kindManifest || m.ID != formatID(id) || m.Label != label:
 		return manifest{}, fmt.Errorf("manifest %s names capture %s-%s", name, echo(m.ID), echo(m.Label))
+	case m.Outcome != captureOK && m.Outcome != captureFailed && m.Outcome != captureInterrupted:
+		return manifest{}, fmt.Errorf("manifest %s has outcome %q", name, echo(m.Outcome))
+	case (m.Outcome == captureOK) != (len(m.Files) > 0):
+		return manifest{}, fmt.Errorf("manifest %s is %s with %d files", name, m.Outcome, len(m.Files))
+	}
+	for _, f := range m.Files {
+		out, ok := strings.CutPrefix(f.Name, formatID(id)+"-"+label+"-")
+		if !ok || !validName(out, maxFileName) || !isHex(f.SHA256, 64) {
+			return manifest{}, fmt.Errorf("manifest %s lists file %s", name, echo(f.Name))
+		}
 	}
 	return m, nil
 }

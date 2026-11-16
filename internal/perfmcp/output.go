@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 )
 
 // errRenderDisabled is every render call's answer on a server without an
@@ -101,9 +102,46 @@ func (s *Server) linkNoReplace(root *os.Root, kind, tmp, name string) error {
 			"perf-agent-mcp publishes a page only with a hard link, which never replaces a file, so it wrote no page. "+
 			"Start perf-agent-mcp with --output on a filesystem that supports hard links", echo(name), root.Name(), pathless(err))
 	}
-	return fmt.Errorf("cannot publish %s under the %s root %s with a hard link: %v; "+
+	return wrapped{fmt.Sprintf("cannot publish %s under the %s root %s with a hard link: %s; "+
 		"perf-agent-mcp publishes a capture's files only with a hard link, which never replaces a file, so it wrote nothing. "+
-		"Start perf-agent-mcp with --captures on a filesystem that supports hard links", echo(name), kind, root.Name(), pathless(err))
+		"Start perf-agent-mcp with --captures on a filesystem that supports hard links", echo(name), kind, root.Name(), errnoText(err)), err}
+}
+
+// wrapped is an error with its own text that still unwraps to its cause,
+// so a caller can tell an errno from it.
+type wrapped struct {
+	text string
+	err  error
+}
+
+func (w wrapped) Error() string { return w.text }
+func (w wrapped) Unwrap() error { return w.err }
+
+// errnoNames name the errors a file operation in the capture directory
+// commonly fails with. A slice, since some are one value on one system
+// and two on another.
+var errnoNames = []struct {
+	errno syscall.Errno
+	name  string
+}{
+	{syscall.EPERM, "EPERM"}, {syscall.EOPNOTSUPP, "EOPNOTSUPP"}, {syscall.ENOTSUP, "ENOTSUP"},
+	{syscall.EXDEV, "EXDEV"}, {syscall.ENOSPC, "ENOSPC"}, {syscall.EDQUOT, "EDQUOT"},
+	{syscall.EMLINK, "EMLINK"}, {syscall.EACCES, "EACCES"}, {syscall.EROFS, "EROFS"},
+	{syscall.EIO, "EIO"}, {syscall.EEXIST, "EEXIST"}, {syscall.ENOENT, "ENOENT"},
+}
+
+// errnoText is err without its path names, followed by its errno's name
+// when it has one: "operation not permitted (EPERM)".
+func errnoText(err error) string {
+	text := pathless(err).Error()
+	if errno, ok := errors.AsType[syscall.Errno](err); ok {
+		for _, e := range errnoNames {
+			if e.errno == errno {
+				return text + " (" + e.name + ")"
+			}
+		}
+	}
+	return text
 }
 
 // pageName is out as a name inside the output root, refusing one that

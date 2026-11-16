@@ -570,6 +570,8 @@ func checkFaultRun(t *testing.T, s *Server, d *captureDir, clk *testClock, r cap
 		}
 		notes = recoverNow(t, s, d)
 	}
+	// A fault at a protocol boundary leaves nothing that cannot be proven.
+	noOrphans(t, notes)
 	invariant(t, d, notes)
 	if r.id == 0 || (crash && !postLink && !r.intent) {
 		// No id, or a crash before the intent: there is nothing to record.

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/dpsoft/perf-agent/internal/capture"
@@ -144,6 +145,10 @@ func (s *Server) ownerIsAlive(in intent) bool {
 	return in.ServerPID > 0 && capture.Alive(p, in.ServerPID, in.ServerStart) ||
 		in.ReaperPID > 0 && capture.Alive(p, in.ReaperPID, in.ReaperStart)
 }
+
+// captureEUID is the user a capture's outputs must belong to; a seam for
+// tests.
+var captureEUID = os.Geteuid
 
 // The intent's states.
 const (
@@ -522,12 +527,26 @@ func (t *captureTxn) probe() error {
 	lerr := t.s.linkNoReplace(t.ser, rootCaptures, p, q)
 	_, _, _ = removeByIdentity(t.ser, q, id)
 	_, _, _ = removeByIdentity(t.ser, p, id)
-	if lerr != nil {
+	if lerr == nil {
+		return nil
+	}
+	where := fmt.Sprintf("the capture directory %s is inside the profiles root %s", t.d.rel, t.d.profiles)
+	errno, _ := errors.AsType[syscall.Errno](lerr)
+	switch {
+	case errno == syscall.EPERM || errno == syscall.ENOTSUP || errno == syscall.EOPNOTSUPP || errno == syscall.EXDEV:
 		return capture.Errorf(capture.CodeDisabled,
 			"start perf-agent-mcp with --captures naming a directory inside the profiles root on a filesystem that supports hard links",
-			"%v (the capture directory %s is inside the profiles root %s)", lerr, t.d.rel, t.d.profiles)
+			"%v (%s)", lerr, where)
+	case errno == syscall.ENOSPC || errno == syscall.EDQUOT:
+		return capture.Errorf(capture.CodeDisk,
+			"free space there, or start perf-agent-mcp with --captures naming another directory inside the profiles root",
+			"there is no room to make a hard link in the capture directory: %s (%s)", errnoText(lerr), where)
+	case errno == syscall.EMLINK:
+		return capture.Errorf(capture.CodeDisk,
+			"start perf-agent-mcp with --captures naming a directory inside the profiles root on another filesystem",
+			"the filesystem refused a second link to a new file, too many links: %s (%s)", errnoText(lerr), where)
 	}
-	return nil
+	return t.d.writeError(lerr)
 }
 
 // setReaper records the reaper's PID and start time once it is known, so
@@ -609,7 +628,7 @@ func (t *captureTxn) validateOne(out, final string) (fileIdentity, error) {
 	switch {
 	case st.nlink != 1:
 		return fileIdentity{}, notOne
-	case st.uid != uint64(os.Geteuid()):
+	case st.uid != uint64(captureEUID()):
 		return fileIdentity{}, capture.Errorf(capture.CodePerfAgentFailed, "", "output %s is not owned by this server's user", out)
 	case fi.Size() == 0:
 		return fileIdentity{}, capture.Errorf(capture.CodeNoOutput, "", "perf-agent wrote an empty %s", out)
@@ -1207,11 +1226,34 @@ func (in intent) check(name string) error {
 			return fmt.Errorf("records file %s", echo(f.Name))
 		}
 	}
-	tok := ".tmp-" + in.Token[:16]
+	for _, f := range in.Files {
+		if !validName(f.Staged, maxFileName) {
+			return fmt.Errorf("records staged file %s", echo(f.Staged))
+		}
+	}
 	for _, tmp := range in.Temps {
-		if !strings.HasPrefix(tmp.Name, "."+manifestName(id, in.Label)+tok) && !strings.HasPrefix(tmp.Name, "."+intentName(id, in.Label)+tok) {
+		if !in.isTemp(id, tmp.Name) {
 			return fmt.Errorf("records temporary %s", echo(tmp.Name))
 		}
 	}
 	return nil
+}
+
+// isTemp reports whether name is one of the intent's own temporaries:
+// ".<intent or manifest>.tmp-<token[:16]>", or that with "-<n>" after it
+// (see writeTemp).
+func (in intent) isTemp(id int, name string) bool {
+	for _, final := range []string{intentName(id, in.Label), manifestName(id, in.Label)} {
+		rest, ok := strings.CutPrefix(name, "."+final+".tmp-"+in.Token[:16])
+		if !ok {
+			continue
+		}
+		if rest == "" {
+			return true
+		}
+		if n, err := strconv.Atoi(strings.TrimPrefix(rest, "-")); err == nil && strings.HasPrefix(rest, "-") && n >= 1 && n < maxTempTries && "-"+strconv.Itoa(n) == rest {
+			return true
+		}
+	}
+	return false
 }

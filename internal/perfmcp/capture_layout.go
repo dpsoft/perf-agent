@@ -357,7 +357,8 @@ func readSeq(ser *os.Root) (int, error) {
 	return next, nil
 }
 
-// highestID is the highest id among the series' manifests and intents.
+// highestID is the highest id any name in the series carries: a
+// manifest, an intent, a heartbeat, a capture file or a temporary of one.
 func highestID(ser *os.Root) (int, error) {
 	names, err := readDirNames(ser, ".")
 	if err != nil {
@@ -365,7 +366,7 @@ func highestID(ser *os.Root) (int, error) {
 	}
 	high := 0
 	for _, n := range names {
-		if id, _, kind, ok := parseName(n); ok && (kind == kindManifest || kind == kindIntent) {
+		if id, _, _, ok := parseName(strings.TrimPrefix(n, ".")); ok {
 			high = max(high, id)
 		}
 	}

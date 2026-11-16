@@ -354,7 +354,10 @@ func TestRealCrashesAtCommitBoundaries(t *testing.T) {
 			if code := a.exitCode(); code != crashExit {
 				t.Fatalf("the server exited %d, not at the crash", code)
 			}
-			a.waitWatchedGone()
+			// The crash comes too soon after the request to watch the
+			// server's children first. The proof that none is left is the
+			// lock (a reaper holds it until its children are reaped) and,
+			// at cleanup, the delegated cgroup subtree.
 			waitGone(t, "the lock", e.lockFree)
 			hadIntent := e.exists(intentName(1, "run"))
 			e.waitStale()

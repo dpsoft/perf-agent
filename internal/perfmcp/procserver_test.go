@@ -437,17 +437,6 @@ func (p *procClient) watch() []procRef {
 	return now
 }
 
-// waitWatchedGone waits for every watched process to be gone.
-func (p *procClient) waitWatchedGone() {
-	p.t.Helper()
-	p.mu.Lock()
-	watched := slices.Clone(p.watched)
-	p.mu.Unlock()
-	for _, r := range watched {
-		waitGone(p.t, r.comm, r.gone)
-	}
-}
-
 // kill9 SIGKILLs the server, after watching what runs under it, and reaps
 // it.
 func (p *procClient) kill9() {

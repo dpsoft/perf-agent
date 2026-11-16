@@ -1053,6 +1053,35 @@ func TestRunInternalIgnoresAnUnsetMode(t *testing.T) {
 	}
 }
 
+// RunInternal enters a mode only when fd 3 is the pipe the server passes
+// its reaper and launcher: with InternalEnv set by mistake, a process whose
+// fd 3 is a file, or nothing the server gave it, stays the program it is.
+func TestRunInternalNeedsAPipeOnFd3(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(filepath.Join(t.TempDir(), "spec"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	for _, c := range []struct {
+		name  string
+		extra []*os.File
+	}{{"a file", []*os.File{f}}, {"no fd 3", nil}} {
+		for _, mode := range []string{modeReaper, modeLauncher} {
+			cmd := exec.Command(self, "-test.run=^$")
+			cmd.Env = append(os.Environ(), InternalEnv+"="+mode)
+			cmd.ExtraFiles = c.extra
+			out, err := cmd.CombinedOutput()
+			if err != nil || !strings.Contains(string(out), "PASS") {
+				t.Errorf("%s as %s: %v, output %q; want the test binary to run its (no) tests", c.name, mode, err, out)
+			}
+		}
+	}
+}
+
 func TestStartReaperRefusesABadSpec(t *testing.T) {
 	self, err := os.Executable()
 	if err != nil {

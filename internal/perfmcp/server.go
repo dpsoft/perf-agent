@@ -277,7 +277,7 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 	}
 	bin, err := verify(c.PerfAgent)
 	if err != nil {
-		return fmt.Errorf("perfmcp: cannot use perf-agent %s: %w", c.PerfAgent, err)
+		return fmt.Errorf("perfmcp: cannot use perf-agent %s: %w", c.PerfAgent, uncoded{err})
 	}
 	s.perfAgent = bin
 	for _, w := range bin.Warnings {
@@ -285,7 +285,7 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 	}
 	if c.GPUShim != "" {
 		if s.shim, err = capture.VerifyShim(c.GPUShim); err != nil {
-			return fmt.Errorf("perfmcp: cannot use the GPU shim %s: %w", c.GPUShim, err)
+			return fmt.Errorf("perfmcp: cannot use the GPU shim %s: %w", c.GPUShim, uncoded{err})
 		}
 	}
 	for _, cmd := range c.Commands {
@@ -293,7 +293,7 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 			return fmt.Errorf("perfmcp: capture command %q is not an absolute path; name each allowed program by its absolute path", cmd)
 		}
 		if e := capture.CheckCommandFile(cmd); e != nil {
-			return fmt.Errorf("perfmcp: cannot allow capture command %s: %w", cmd, e)
+			return fmt.Errorf("perfmcp: cannot allow capture command %s: %w", cmd, uncoded{e})
 		}
 	}
 	status, err := readSelfStatus()
@@ -315,13 +315,30 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 		}
 	}
 	if err != nil {
-		s.captureDisabled = err.Error()
-		s.log.Warn("capture disabled", "reason", err)
+		s.captureDisabled = uncoded{err}.Error()
+		s.log.Warn("capture disabled", "reason", s.captureDisabled)
 		return nil
 	}
 	s.log.Info("capture enabled", "perf_agent", bin.Path, "version", bin.Version, "revision", bin.Revision)
 	return nil
 }
+
+// uncoded is a capture error as text that already says what failed: its
+// message and advice without the code ("disabled: ..."), which would only
+// repeat it. It unwraps to the error.
+type uncoded struct{ err error }
+
+func (u uncoded) Error() string {
+	if e, ok := errors.AsType[*capture.Error](u.err); ok {
+		if e.Next == "" {
+			return e.Message
+		}
+		return e.Message + "; " + e.Next
+	}
+	return u.err.Error()
+}
+
+func (u uncoded) Unwrap() error { return u.err }
 
 // Serve answers MCP requests read from r on w until r ends or ctx is done.
 func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {

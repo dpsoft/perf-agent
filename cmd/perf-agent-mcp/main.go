@@ -15,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -86,7 +87,8 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	fs.Var(&manifests, "source-manifest", "source manifest `FILE` (repeatable)")
 	fs.Var(&limits, "limit", "override a limit, `Name=Value` (repeatable), e.g. Model.MaxRawBytes=1073741824")
 	fs.Var(&commands, "capture-command", "absolute `PATH` of the only programs a capture may launch (repeatable); without it any program may be")
-	fs.Func("capture-ttl", "`AGE` an unkept capture may reach before retention deletes it, a Go duration; 0 keeps captures of any age; it wins over --limit Capture.TTL (default 168h)", func(v string) error {
+	ttlUsage := fmt.Sprintf("`AGE` an unkept capture may reach before retention deletes it, a Go duration; 0 keeps captures of any age; it wins over --limit Capture.TTL (default %v)", perfmcp.DefaultLimits().Capture.TTL)
+	fs.Func("capture-ttl", ttlUsage, func(v string) error {
 		d, err := time.ParseDuration(v)
 		if err != nil {
 			return err
@@ -127,6 +129,29 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 			return 2
 		}
 	}
+	captureDir := *captures
+	if captureDir != "" {
+		var err error
+		if captureDir, err = checkCapturesDir(*profiles, captureDir); err != nil {
+			_, _ = fmt.Fprintf(stderr, "perf-agent-mcp: --captures %s: %v\n", *captures, err)
+			return 2
+		}
+	}
+	if *perfAgent == "" {
+		var unused []string
+		fs.Visit(func(f *flag.Flag) {
+			if slices.Contains(captureFlags, f.Name) {
+				unused = append(unused, "--"+f.Name)
+			}
+		})
+		if len(unused) > 0 {
+			verb := "have"
+			if len(unused) == 1 {
+				verb = "has"
+			}
+			_, _ = fmt.Fprintf(stderr, "perf-agent-mcp: %s %s no effect without --perf-agent: capture is disabled\n", strings.Join(unused, ", "), verb)
+		}
+	}
 	lim := perfmcp.DefaultLimits()
 	for _, kv := range limits {
 		if err := setLimit(&lim, kv); err != nil {
@@ -155,7 +180,7 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		Log:             log,
 		Capture: perfmcp.CaptureConfig{
 			PerfAgent: *perfAgent,
-			Dir:       *captures,
+			Dir:       captureDir,
 			GPUShim:   *gpuShim,
 			Owner:     "stdio",
 			Commands:  commands,
@@ -172,14 +197,21 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- srv.Serve(ctx, stdin, stdout) }()
 	var serveErr error
+	served := false
 	select {
 	case serveErr = <-serveDone:
+		served = true
 	case <-ctx.Done():
+	}
+	signalled := ctx.Err() != nil
+	if signalled {
 		// The capture dies first, whatever happens to the output: its
 		// reaper kills the children and cleans up on its own, and Close
 		// then does not wait for the job to roll back; the next server's
 		// recovery records it as interrupted.
-		srv.KillCaptures()
+		killCaptures(srv)
+	}
+	if !served {
 		// Serve writes the answers already queued, for a bounded time. A
 		// client that stopped reading stdout makes that drain fail; this
 		// wait is the backstop should Serve not return at all.
@@ -191,31 +223,114 @@ func runContext(ctx context.Context, args []string, stdin io.Reader, stdout, std
 		}
 	}
 	// A failed drain on a signal is both a gone client and ctx's error, so
-	// the gone client is tested first.
+	// the gone client is tested first. Serve finds a client that stopped
+	// reading when its output queue overflows, or after mcpstdio's
+	// StallTimeout (30 s) without a finished write; the captures run until
+	// then, since a shorter wait would end slow but live clients.
 	if errors.Is(serveErr, mcpstdio.ErrClientGone) {
-		srv.KillCaptures()
+		killCaptures(srv)
 		exitBlocked(srv, log, "the client is not reading its output; captures killed, exiting")
 		return 0
 	}
-	closeErr := srv.Close()
+	// At EOF Close waits for the capture jobs to roll back; a signal then
+	// ends the wait. After a signal Close waits for no job.
+	closed := make(chan error, 1)
+	go func() { closed <- closeServer(srv) }()
+	var interrupt <-chan struct{}
+	if !signalled {
+		interrupt = ctx.Done()
+	}
+	var closeErr error
+	select {
+	case closeErr = <-closed:
+	case <-interrupt:
+		killCaptures(srv)
+		exitBlocked(srv, log, "signalled while closing: captures killed, exiting")
+		return 0
+	}
 	if serveErr != nil && !errors.Is(serveErr, context.Canceled) {
-		log.Error("serve", "err", serveErr)
+		logBounded(log, "serve", "err", serveErr)
 		return 1
 	}
 	if closeErr != nil {
-		log.Error("close", "err", closeErr)
+		logBounded(log, "close", "err", closeErr)
 		return 1
 	}
 	return 0
+}
+
+// captureFlags are the flags that only matter with --perf-agent.
+var captureFlags = []string{"captures", "capture-command", "capture-ttl", "gpu-shim"}
+
+// checkCapturesDir checks --captures against the profiles root and returns
+// it relative to the root. An absolute dir must lie inside the root, as
+// given or with its symlinks resolved; a relative one is relative to the
+// root and must stay inside it. What of it exists is followed through the
+// root, as the server opens it, so no symlink leads outside, and must be a
+// directory. A root that cannot be opened is left for the server to refuse.
+func checkCapturesDir(profiles, dir string) (string, error) {
+	rel := dir
+	if filepath.IsAbs(dir) {
+		rel = ""
+		var bases []string
+		if abs, err := filepath.Abs(profiles); err == nil {
+			bases = append(bases, abs)
+			if real, err := filepath.EvalSymlinks(abs); err == nil && real != abs {
+				bases = append(bases, real)
+			}
+		}
+		for _, b := range bases {
+			if r, err := filepath.Rel(b, dir); err == nil && filepath.IsLocal(r) {
+				rel = r
+				break
+			}
+		}
+	}
+	if rel == "" || !filepath.IsLocal(rel) {
+		return "", fmt.Errorf("it is outside the profiles root %s; name a directory inside it", profiles)
+	}
+	root, err := os.OpenRoot(profiles)
+	if err != nil {
+		return rel, nil
+	}
+	defer func() { _ = root.Close() }()
+	fi, err := root.Stat(rel)
+	switch {
+	case err == nil && !fi.IsDir():
+		return "", errors.New("it is not a directory; name a directory inside the profiles root")
+	case err == nil, errors.Is(err, fs.ErrNotExist):
+		return rel, nil
+	case errors.Is(err, fs.ErrPermission):
+		return "", fmt.Errorf("it cannot be checked: %v", err)
+	}
+	return "", fmt.Errorf("it leads outside the profiles root %s through a symlink (%v); name a directory inside it", profiles, err)
 }
 
 // shutdownGrace is how long Serve gets to finish after a signal before the
 // server exits anyway.
 const shutdownGrace = time.Second
 
+// killCaptures and closeServer are the server's KillCaptures and Close; a
+// seam for tests, which record the order they run in.
+var (
+	killCaptures = (*perfmcp.Server).KillCaptures
+	closeServer  = (*perfmcp.Server).Close
+)
+
 // blockedCloseWait bounds how long a server whose output is blocked waits
 // for Close and its last log line before it exits.
 const blockedCloseWait = 100 * time.Millisecond
+
+// logBounded logs msg as an error without waiting on stderr for more than
+// blockedCloseWait: a client may have stopped reading it.
+func logBounded(log *slog.Logger, msg string, args ...any) {
+	logged := make(chan struct{})
+	go func() { log.Error(msg, args...); close(logged) }()
+	select {
+	case <-logged:
+	case <-time.After(blockedCloseWait):
+	}
+}
 
 // exitBlocked logs msg and closes srv without waiting on either for more
 // than blockedCloseWait: stdout is blocked, and stderr may be too. The
@@ -223,7 +338,7 @@ const blockedCloseWait = 100 * time.Millisecond
 func exitBlocked(srv *perfmcp.Server, log *slog.Logger, msg string) {
 	logged, closed := make(chan struct{}), make(chan struct{})
 	go func() { log.Error(msg); close(logged) }()
-	go func() { _ = srv.Close(); close(closed) }()
+	go func() { _ = closeServer(srv); close(closed) }()
 	timeout := time.After(blockedCloseWait)
 	for range 2 {
 		select {

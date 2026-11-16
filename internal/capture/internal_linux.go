@@ -52,16 +52,18 @@ const (
 )
 
 // RunInternal runs an internal mode when this process was started as one:
-// InternalEnv is reaper or launcher and fd 3 is open. It returns handled
-// false otherwise, and the caller carries on as the server; when handled,
-// the caller exits with code.
+// InternalEnv is reaper or launcher and fd 3 is a pipe, as the server's
+// starter passes the spec. fd 3 being open is not enough: in any Go
+// process the runtime may have opened something there itself. It returns
+// handled false otherwise, and the caller carries on as the server; when
+// handled, the caller exits with code.
 func RunInternal() (code int, handled bool) {
 	mode := os.Getenv(InternalEnv)
 	if mode != modeReaper && mode != modeLauncher {
 		return 0, false
 	}
 	var st syscall.Stat_t
-	if err := syscall.Fstat(specFD, &st); err != nil {
+	if err := syscall.Fstat(specFD, &st); err != nil || st.Mode&syscall.S_IFMT != syscall.S_IFIFO {
 		return 0, false
 	}
 	spec := os.NewFile(specFD, "spec")

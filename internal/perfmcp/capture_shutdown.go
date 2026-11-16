@@ -1,6 +1,8 @@
 package perfmcp
 
 import (
+	"context"
+	"log/slog"
 	"os"
 	"time"
 
@@ -64,6 +66,27 @@ func (s *Server) KillCaptures() {
 	}
 }
 
+// shutdownLogWait bounds how long a job's last log line, or Close's, waits
+// for the log: stderr may be full, its client gone.
+const shutdownLogWait = 100 * time.Millisecond
+
+// logBounded logs one line at level without waiting for the log more than
+// shutdownLogWait, so a blocked stderr never keeps a job from ending or the
+// server from closing. The line may then be written later, or never.
+func (s *Server) logBounded(level slog.Level, msg string, args ...any) {
+	logged := make(chan struct{})
+	go func() {
+		s.log.Log(context.Background(), level, msg, args...)
+		close(logged)
+	}()
+	t := time.NewTimer(shutdownLogWait)
+	defer t.Stop()
+	select {
+	case <-logged:
+	case <-t.C:
+	}
+}
+
 // waitJobs waits up to d for the job goroutines to end.
 func (s *Server) waitJobs(d time.Duration) {
 	done := make(chan struct{})
@@ -74,7 +97,7 @@ func (s *Server) waitJobs(d time.Duration) {
 	select {
 	case <-done:
 	case <-time.After(d):
-		s.log.Warn("capture jobs still running at close", "waited", d)
+		s.logBounded(slog.LevelWarn, "capture jobs still running at close", "waited", d)
 	}
 }
 

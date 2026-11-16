@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -998,7 +999,7 @@ func (r *jobRun) end(status jobStatus, e *capture.Error) {
 		r.s.log.Error("capture registry", "job", j.id, "err", err)
 	}
 	j.set(func() { j.status, j.phase, j.err = status, "", e })
-	r.s.log.Info("capture ended", "job", j.id, "capture", j.captureIDNow(), "status", status, "code", e.Code, "message", e.Message)
+	r.s.logBounded(slog.LevelInfo, "capture ended", "job", j.id, "capture", j.captureIDNow(), "status", status, "code", e.Code, "message", e.Message)
 }
 
 // done is a committed capture: it derives the open and compare results
@@ -1034,5 +1035,5 @@ func (r *jobRun) done() {
 	}
 	rc := s.recomputeFor(m, r.base, "")
 	j.set(func() { j.phase, j.derived, j.result, j.recipe = "", derived, b, &rc })
-	s.log.Info("capture done", "job", j.id, "capture", j.captureIDNow(), "derived", derived)
+	s.logBounded(slog.LevelInfo, "capture done", "job", j.id, "capture", j.captureIDNow(), "derived", derived)
 }

@@ -31,6 +31,10 @@ import (
 // stopGrace is the Capture.StopGrace the process tests run the server with.
 const stopGrace = time.Second
 
+// killBound is how soon after a signal the capture's fake perf-agent must
+// be gone: far less than the 800 ms the server spends draining its output.
+const killBound = 300 * time.Millisecond
+
 func TestRunRefusesABadPerfAgent(t *testing.T) {
 	var out, errb bytes.Buffer
 	if code := run([]string{"--profiles", t.TempDir(), "--perf-agent", "bin/perf-agent"}, strings.NewReader(""), &out, &errb); code != 2 ||
@@ -53,9 +57,9 @@ func TestRunRefusesABadPerfAgent(t *testing.T) {
 }
 
 // plainBinary is a 0755 file in a directory where VerifyBinary gets as
-// far as the capability check: t.TempDir() is usually under a nosuid
-// /tmp, so it also tries a dot-directory beside the package and one in
-// the user's cache directory, each removed at the end of the test.
+// far as the capability check. /tmp is usually nosuid, so it tries a
+// dot-directory in the user's cache directory first, then in the temporary
+// directory and beside the package, each removed at the end of the test.
 func plainBinary(t *testing.T) string {
 	t.Helper()
 	var tried []string
@@ -74,13 +78,11 @@ func plainBinary(t *testing.T) string {
 		tried = append(tried, fmt.Sprint(err))
 		return ""
 	}
-	if p := try(t.TempDir()); p != "" {
-		return p
-	}
-	parents := []string{"."}
+	var parents []string
 	if cache, err := os.UserCacheDir(); err == nil {
 		parents = append(parents, cache)
 	}
+	parents = append(parents, os.TempDir(), ".")
 	for _, parent := range parents {
 		d, err := os.MkdirTemp(parent, ".verify-test-")
 		if err != nil {
@@ -127,9 +129,10 @@ func TestStdoutStaysJSONRPCWhileCapturing(t *testing.T) {
 
 // A signal kills the running capture on every path: with stdout read, the
 // response in flight is still written; with stdout blocked, the capture is
-// gone before the server gives up on its output, and it exits all the same. Either way it exits 0 within shutdownGrace + 300 ms,
-// and the fake perf-agent, which ignores SIGINT, and the setsid
-// grandchild of the workload are gone within StopGrace + 500 ms.
+// gone within killBound of the signal, long before the server gives up on
+// its output. Either way the server exits 0 within shutdownGrace + 300 ms,
+// and the fake perf-agent, which ignores SIGINT, and the setsid grandchild
+// of the workload are gone within StopGrace + 500 ms.
 func TestSignalKillsCapturesOnEveryPath(t *testing.T) {
 	for _, c := range []struct {
 		name    string
@@ -162,19 +165,10 @@ func TestSignalKillsCapturesOnEveryPath(t *testing.T) {
 			if !c.blocked {
 				go func() { rest <- p.readAll() }()
 			}
-			if c.blocked {
-				// The capture is killed before the server waits on its
-				// output: the fake's group is gone while the server still
-				// tries to drain the answers nobody reads.
-				for !groupGone(rec.PGID) {
-					select {
-					case <-p.exited:
-						t.Fatal("the fake perf-agent outlived the drain: the signal did not kill the capture first")
-					case <-time.After(5 * time.Millisecond):
-					}
-				}
-				t.Logf("the fake's group was gone %v after the signal", time.Since(sent).Round(time.Millisecond))
-			}
+			// The capture is killed before the server waits on its output:
+			// with stdout blocked, the fake's group is gone long before the
+			// drain of the answers nobody reads gives up.
+			p.goneBy(sent.Add(killBound), "the fake perf-agent's group, right after the signal,", func() bool { return groupGone(rec.PGID) })
 			select {
 			case <-p.exited:
 				t.Logf("exited %v after the signal", time.Since(sent).Round(time.Millisecond))
@@ -257,18 +251,101 @@ func TestEOFCancelsTheCapture(t *testing.T) {
 	}
 }
 
+// A client that stopped reading while stderr is full too: no log write
+// keeps the server alive, and the capture is killed.
+func TestADeadClientWithStderrBlockedEndsCaptures(t *testing.T) {
+	p := startCaptureServer(t, capturetest.FakeIgnoreSIGINT, []string{outqEnv + "=2"})
+	job := p.startCapture(map[string]any{"command": []any{capturetest.Workload(t), "double-fork-setsid", "2m"}, "duration": "1m"})
+	p.waitProfiling(job)
+	gc := p.awaitGrandchild()
+	rec := p.fakeRecord()
+	p.blockStderr()
+	var flood bytes.Buffer
+	for i := range 200 {
+		fmt.Fprintf(&flood, `{"jsonrpc":"2.0","id":%d,"method":"ping"}`+"\n", 100000+i)
+	}
+	go func() { _, _ = p.in.Write(flood.Bytes()) }()
+	select {
+	case <-p.exited:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the server still runs 20 s after the flood, with stdout and stderr blocked")
+	}
+	if p.waitErr != nil {
+		t.Errorf("exit: %v", p.waitErr)
+	}
+	deadline := time.Now().Add(stopGrace)
+	p.goneBy(deadline, "the fake perf-agent's group", func() bool { return groupGone(rec.PGID) })
+	p.goneBy(deadline, "the workload's setsid grandchild", func() bool { return !gc.alive() })
+}
+
+// With stderr full and never read, no log line keeps the server from
+// ending: not on a signal, not at EOF, where Close waits for the killed
+// job to roll back, and not on a signal while it closes.
+func TestABlockedStderrNeverHoldsTheExit(t *testing.T) {
+	for _, how := range []string{"SIGTERM", "EOF", "EOF then SIGTERM"} {
+		t.Run(how, func(t *testing.T) {
+			p := startCaptureServer(t, capturetest.FakeIgnoreSIGINT, nil)
+			job := p.startCapture(map[string]any{"command": []any{capturetest.Workload(t), "double-fork-setsid", "2m"}, "duration": "1m"})
+			p.waitProfiling(job)
+			gc := p.awaitGrandchild()
+			rec := p.fakeRecord()
+			p.blockStderr()
+			go func() { _ = p.readAll() }()
+			bound := shutdownGrace + 300*time.Millisecond
+			switch how {
+			case "EOF":
+				// The killed job ends long before Close's limit on its
+				// wait, StopGrace + 1 s: past StopGrace, its last log line
+				// held it.
+				bound = stopGrace
+				_ = p.in.Close()
+			case "EOF then SIGTERM":
+				_ = p.in.Close()
+				// Close is under way: the job is killed, and its end is
+				// logged to the full stderr.
+				time.Sleep(100 * time.Millisecond)
+			}
+			if how != "EOF" {
+				if err := p.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+					t.Fatal(err)
+				}
+			}
+			sent := time.Now()
+			select {
+			case <-p.exited:
+				t.Logf("exited %v after the %s", time.Since(sent).Round(time.Millisecond), how)
+			case <-time.After(bound):
+				// Let the server write again, so the test can end.
+				go func() { _, _ = io.Copy(io.Discard, p.errR) }()
+				_ = p.errR.SetReadDeadline(time.Time{})
+				t.Fatalf("the server still runs %v after the %s with stderr blocked", bound, how)
+			}
+			if p.waitErr != nil {
+				t.Errorf("exit: %v", p.waitErr)
+			}
+			deadline := sent.Add(stopGrace + 500*time.Millisecond)
+			p.goneBy(deadline, "the fake perf-agent's group", func() bool { return groupGone(rec.PGID) })
+			p.goneBy(deadline, "the workload's setsid grandchild", func() bool { return !gc.alive() })
+		})
+	}
+}
+
 // serverProc is the server run as a subprocess over pipes, its stdout a
 // 4 KiB pipe so a test can block it by not reading.
 type serverProc struct {
-	t        *testing.T
-	cmd      *exec.Cmd
-	in       *os.File
-	outR     *os.File
-	out      *bufio.Reader
-	stderr   *lockedBuffer
-	profiles string
-	record   string
-	nextID   int
+	t      *testing.T
+	cmd    *exec.Cmd
+	in     *os.File
+	outR   *os.File
+	out    *bufio.Reader
+	stderr *lockedBuffer
+	// errR and errW are the ends of the server's stderr pipe; copied is
+	// closed once the copy of errR into stderr stops.
+	errR, errW *os.File
+	copied     chan struct{}
+	profiles   string
+	record     string
+	nextID     int
 	// lines are the stdout lines read so far.
 	lines [][]byte
 	// exited is closed once the process has been waited for; waitErr is
@@ -310,7 +387,11 @@ func startCaptureServer(t *testing.T, mode capturetest.FakeMode, env []string) *
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := unix.FcntlInt(errW.Fd(), unix.F_SETPIPE_SZ, 4096); err != nil {
+		t.Skipf("cannot shrink the pipe: %v", err)
+	}
 	p := &serverProc{t: t, cmd: cmd, in: inW, outR: outR, out: bufio.NewReaderSize(outR, 1<<20), stderr: &lockedBuffer{},
+		errR: errR, errW: errW, copied: make(chan struct{}),
 		profiles: profiles, record: record, nextID: 1, exited: make(chan struct{})}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = inR, outW, errW
 	if err := cmd.Start(); err != nil {
@@ -318,8 +399,11 @@ func startCaptureServer(t *testing.T, mode capturetest.FakeMode, env []string) *
 	}
 	_ = inR.Close()
 	_ = outW.Close()
-	_ = errW.Close()
-	go func() { _, _ = io.Copy(p.stderr, errR) }()
+	// errW stays open here, so blockStderr can fill the pipe.
+	go func() {
+		_, _ = io.Copy(p.stderr, errR)
+		close(p.copied)
+	}()
 	go func() {
 		p.waitErr = cmd.Wait()
 		close(p.exited)
@@ -334,6 +418,8 @@ func startCaptureServer(t *testing.T, mode capturetest.FakeMode, env []string) *
 			<-p.exited
 		}
 		_ = outR.Close()
+		_ = errR.Close()
+		_ = errW.Close()
 		p.noLeftovers()
 		if t.Failed() {
 			t.Logf("server stderr:\n%s", p.stderr.String())
@@ -521,6 +607,27 @@ func (p *serverProc) goneBy(deadline time.Time, what string, gone func() bool) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// blockStderr stops reading the server's stderr and fills the pipe, so
+// the server's next log write blocks.
+func (p *serverProc) blockStderr() {
+	p.t.Helper()
+	_ = p.errR.SetReadDeadline(time.Now())
+	<-p.copied
+	go func() {
+		for {
+			if _, err := p.errW.Write([]byte{'x'}); err != nil {
+				return
+			}
+		}
+	}()
+	for end := time.Now().Add(5 * time.Second); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
+		if n, err := unix.IoctlGetInt(int(p.errR.Fd()), unix.TIOCINQ); err == nil && n >= 4096 {
+			return
+		}
+	}
+	p.t.Fatal("stderr never filled")
 }
 
 // noLeftovers fails the test for any watched process still alive after a

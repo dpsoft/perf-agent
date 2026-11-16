@@ -687,17 +687,25 @@ func loadingAnswer(key string) mcpstdio.Result {
 func (s *Server) historicalAnswer(key, jobID string, h *historical) mcpstdio.Result {
 	m := h.m
 	if m.Outcome != captureOK {
-		e := errorFromWire(m.Error)
+		var e *capture.Error
 		status := string(jobFailed)
-		if e == nil {
+		switch {
+		case m.Outcome == captureInterrupted:
 			// The server ended under the capture: nothing about the
 			// capture itself failed, so it may be run again at once.
 			e = capture.Errorf(capture.CodeCancelled, "capture again",
 				"the server running capture %s ended before it finished; recovery removed what it had written", key)
 			e.Retryable, e.RetryAfter = true, 0
 			status = captureInterrupted
-		} else if e.Code == capture.CodeCancelled {
-			status = string(jobCancelled)
+		case m.Error == nil:
+			e = capture.Errorf(capture.CodePerfAgentFailed, "capture again; capture_list shows the series' history",
+				"capture %s failed, and its manifest records no error", key)
+			e.Retryable, e.RetryAfter = true, 0
+		default:
+			e = errorFromWire(m.Error)
+			if e.Code == capture.CodeCancelled {
+				status = string(jobCancelled)
+			}
 		}
 		w := toWireError(e)
 		w.Job, w.CaptureID, w.Status = jobID, key, status

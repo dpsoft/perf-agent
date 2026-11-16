@@ -1267,6 +1267,39 @@ func TestAQueuedListKeepsItsBudgetFromReceipt(t *testing.T) {
 	waitEnd(t, c, job)
 }
 
+// A capture read back from its manifest is answered by its outcome: an
+// interrupted one is the retryable cancelled answer with status
+// interrupted, whatever error it records; a failed one is its own code,
+// or a fallback when it records none, never interrupted.
+func TestAHistoricalFailureIsAnsweredByItsOutcome(t *testing.T) {
+	e := newJobEnv(t, jobOpts{})
+	disk := &wireError{Code: string(capture.CodeDisk), Message: "no space", Retryable: true, RetryAfter: "0s"}
+	for _, tc := range []struct {
+		name      string
+		m         manifest
+		code      capture.Code
+		status    string
+		retryable bool
+	}{
+		{"interrupted", manifest{Outcome: captureInterrupted}, capture.CodeCancelled, captureInterrupted, true},
+		{"interrupted with an error", manifest{Outcome: captureInterrupted, Error: disk}, capture.CodeCancelled, captureInterrupted, true},
+		{"failed", manifest{Outcome: captureFailed, Error: disk}, capture.CodeDisk, string(jobFailed), true},
+		{"failed without an error", manifest{Outcome: captureFailed}, capture.CodePerfAgentFailed, string(jobFailed), true},
+		{"cancelled", manifest{Outcome: captureFailed, Error: &wireError{Code: string(capture.CodeCancelled), Message: "cancelled"}}, capture.CodeCancelled, string(jobCancelled), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := e.s.historicalAnswer("s/001", "", &historical{m: tc.m})
+			if !res.IsError {
+				t.Fatalf("answered %s", res.Text)
+			}
+			w := toolErrorOf(t, res.Text)
+			if w.Code != string(tc.code) || w.Status != tc.status || w.Retryable != tc.retryable || w.CaptureID != "s/001" {
+				t.Errorf("%+v", w)
+			}
+		})
+	}
+}
+
 // Ids whose jobs have left the registry still answer, by job id and by
 // capture id: a cancel with the final state and both ids, a wait with
 // the job id, and a job that failed before it had a capture id with its

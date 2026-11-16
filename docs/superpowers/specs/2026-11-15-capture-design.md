@@ -1090,15 +1090,21 @@ the user to look.
 | `capture_cancel` | the reaper: SIGINT, then SIGKILL after `StopGrace`; live rollback (§7.4) | as normal end |
 | EOF on stdin, or the output backlog exhausted (standalone stdio: the client is gone, CAP-R7b) | as cancel | as normal end |
 | Session disconnect in serve | nothing: the capture finishes and is listed (§9) | runs to the capture's end |
-| Server shutdown (SIGINT/SIGTERM, `serve` stop, the forced-exit path) | SIGKILL to the group, synchronously; the reaper's pipe closes too | the reaper kills on EOF |
+| Server shutdown (SIGINT/SIGTERM, `serve` stop, the forced-exit path) | the server closes the reaper's command pipe; the reaper reads EOF and SIGKILLs the group | the reaper kills on EOF |
 | Server SIGKILLed or crashed | the reaper kills on EOF | the reaper kills on EOF |
 | Server alive but hung | the reaper kills at the absolute deadline | the same |
 | Server **and** reaper SIGKILLed | unbounded (documented); the lock is freed | unbounded beyond the cgroup or session |
 | Anything left after `StopGrace` | reported in `survivors`, with `cleanup: incomplete` (CAP-R3b) | the same |
 
-The shutdown kill is a single `kill(2)` per recorded pgid and never
-blocks. The forced-exit path in `cmd/perf-agent-mcp/main.go` calls it
-before returning (§11).
+The server signals no process itself (CAP-R20): a process group number
+it heard of may already have been reaped and reused, and only the reaper,
+which reaps, knows when a number is still its child's. The shutdown kill
+(`KillCaptures`) only closes each running capture's reaper command pipe,
+never blocks, and is safe more than once; the reaper reads the EOF and
+does the cleanup: SIGKILL to the perf-agent group while its leader is
+an unreaped child, `cgroup.kill` or the sweep, and the survivor report.
+The forced-exit path in `cmd/perf-agent-mcp/main.go` calls it before
+returning (§11).
 
 ## 7. Writing the files **[mine]**
 
@@ -2046,7 +2052,7 @@ Each change is kept small and has a reason:
 
 | File | Change | Why |
 |---|---|---|
-| `cmd/perf-agent-mcp/main.go` | Register `--perf-agent`, `--captures` (default `<profiles>/captures`), `--capture-command`, `--capture-ttl` and `--gpu-shim`, and pass them into `Config`. In the forced-exit branch, call `srv.KillCaptures()` before `return 0`. Before flag parsing, dispatch the two internal modes (reaper, launcher) to `internal/capture` when fd 3 carries a spec and `PERF_AGENT_MCP_INTERNAL` names the mode | Flags are parsed only here. The forced path returns without waiting on `Close` (100 ms), so the kill must be synchronous there. The reaper and launcher are this binary re-exec'd (CAP-R2), so `main` must route to them |
+| `cmd/perf-agent-mcp/main.go` | Register `--perf-agent`, `--captures` (default `<profiles>/captures`), `--capture-command`, `--capture-ttl` and `--gpu-shim`, and pass them into `Config`. On a signal, and in the forced-exit branch, call `srv.KillCaptures()` before `return 0`. Before flag parsing, dispatch the two internal modes (reaper, launcher) to `internal/capture` when fd 3 carries a spec and `PERF_AGENT_MCP_INTERNAL` names the mode | Flags are parsed only here. The forced path returns without waiting on `Close` (100 ms), so the kill must be issued before it returns. `KillCaptures` signals nothing: it closes each reaper's command pipe at once, and the reaper, which outlives the server, kills the children. The reaper and launcher are this binary re-exec'd (CAP-R2), so `main` must route to them |
 | `internal/perfmcp/config.go` | Add `Capture CaptureConfig` | `Config` is the only way into `New` |
 | `internal/perfmcp/limits.go` | Add `Capture CaptureLimits`, with defaults and compiled ceilings in `validate` | `--limit` reflects over `Limits` |
 | `internal/perfmcp/server.go` | `New` builds the job runner and the registry; `tools()` appends `capture`, `capture_wait`, `capture_cancel` and `capture_list`; `Close` cancels jobs and kills children. An **engine lock** wraps every tool handler **except** `capture` (pure admission), `capture_wait`, `capture_cancel` and `capture_list` (CAP-R13). The job takes it only for `preparing`'s shared inputs and for derivations and pin release (§4.0) | The tool list and the lifecycle live here. M2's "request goroutine owns all state" becomes "the engine lock's holder owns it", because job derivations run off the request goroutine. In stdio, handlers are sequential, so the lock contends only with a job |

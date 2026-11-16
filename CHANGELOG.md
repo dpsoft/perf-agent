@@ -18,9 +18,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cmd/perf-agent-mcp`, an MCP server over stdio that lets an AI agent
   investigate profiles with `open`, `top`, `path`, `sandwich`,
   `gpu_kernels_for`, `facts`, `diff`, `source` and `render_flamegraph`. It is
-  read-only, offline, needs no capabilities, checks every figure an agent
-  states against the engine, and is built from source only. See
-  [docs/mcp.md](docs/mcp.md).
+  offline, holds no capabilities, checks every figure an agent states against
+  the engine, and is built from source only. Without `--perf-agent` it is
+  read-only. See [docs/mcp.md](docs/mcp.md).
+- `perf-agent-mcp --perf-agent PATH` lets an agent capture profiles and run a
+  capture, analyse, change, re-capture loop. `capture` profiles a process of
+  the user's or a command it launches by running the user's setcap'd
+  `perf-agent` for a bounded time, and answers a job id at once;
+  `capture_wait` waits at most 45 s per call and returns each profile's
+  handle and, with `compare_with`, the diff against the baseline with its
+  comparability; `capture_cancel` and `capture_list` complete the set.
+  Captures are grouped in series under `<profiles>/captures` (`--captures`),
+  recorded in manifests so a restarted server finds them, and kept within a
+  TTL (`--capture-ttl`, default 7 days) and a byte budget by retention, the
+  one place the server deletes files, and only files it can prove it wrote.
+  Failures are one JSON error with a code, whether to retry and when, and
+  the next step. Launched commands run with `no_new_privs`, a scrubbed
+  environment, no shell and, where the user's cgroup tree is delegated, a
+  cgroup of their own; `--capture-command` limits which programs may run. A
+  detached reaper ends every capture's processes when the server or its
+  client goes away. The server refuses to capture as root, with
+  capabilities, or under `no_new_privs`. The new limits are
+  `--limit Capture.*`. `--gpu-shim` enables GPU captures.
 - The live page (`page_open`, `page_explain`, `page_diff`, `page_show`) is
   not exposed by the stdio `perf-agent-mcp`, which has no `--live` flag and
   opens no listener; it will ship with a separate serve binary. Limits

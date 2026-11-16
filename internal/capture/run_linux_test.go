@@ -1498,8 +1498,9 @@ func TestRunAnUnresponsiveReaperNamesTheCgroup(t *testing.T) {
 	if errCode(o.Err) != CodeStuckChild {
 		t.Fatalf("Err = %v", o.Err)
 	}
-	if !strings.Contains(strings.Join(o.Notes, "\n"), filepath.Join(parent, CgroupPrefix)) {
-		t.Errorf("notes %q do not name the cgroup", o.Notes)
+	// The cgroup is named, under the delegated cgroup, never by its path.
+	if notes := strings.Join(o.Notes, "\n"); !strings.Contains(notes, CgroupPrefix) || strings.Contains(notes, parent) {
+		t.Errorf("notes %q do not name the cgroup, or name it by its path", o.Notes)
 	}
 	listed := false
 	for _, s := range o.Survivors {
@@ -1662,5 +1663,15 @@ func TestStartFailuresNameNoServerPath(t *testing.T) {
 	notes := strings.Join(o.Notes, "\n")
 	if !strings.Contains(notes, "no cgroup") || strings.Contains(notes, parent) {
 		t.Errorf("notes %q: no cgroup note, or one naming %s", notes, parent)
+	}
+}
+
+// What the reaper says of its cgroup names it under the delegated cgroup,
+// never by its path.
+func TestCgroupTextNamesNoPath(t *testing.T) {
+	cg := "/sys/fs/cgroup/user.slice/app.scope/perf-agent-mcp-s-001-1-x"
+	got := cgroupText("remove cgroup: unlinkat "+cg+"/sub: device or resource busy", cg)
+	if strings.Contains(got, "/sys/fs/cgroup") || !strings.Contains(got, "perf-agent-mcp-s-001-1-x/sub") {
+		t.Errorf("got %q", got)
 	}
 }

@@ -537,7 +537,7 @@ func (r *reaper) startWorkload() {
 	}
 	var cg *os.File
 	fallback := func(why error) {
-		r.notes = append(r.notes, fmt.Sprintf("no cgroup: %v; the subreaper sweep was used", why))
+		r.notes = append(r.notes, cgroupText(fmt.Sprintf("no cgroup: %v; the subreaper sweep was used", why), r.spec.Cgroup))
 	}
 	switch {
 	case r.spec.Cgroup == "":
@@ -921,6 +921,15 @@ func sweep(children func() (pids []int, quiet bool), kill func(pid int, sig sysc
 	}
 }
 
+// cgroupText is s, a note about the cgroup cg, with cg's parent named as
+// the delegated cgroup: a note never shows the server's paths.
+func cgroupText(s, cg string) string {
+	if cg == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, filepath.Dir(cg)+"/", "the delegated cgroup's ")
+}
+
 // removeCgroup removes the capture's cgroup and any cgroup the workload
 // made below it, depth first, before reaped is published, retrying
 // briefly while the kernel still counts an exiting process. A failure is
@@ -929,7 +938,7 @@ func sweep(children func() (pids []int, quiet bool), kill func(pid int, sig sysc
 func (r *reaper) removeCgroup() {
 	cg := r.spec.Cgroup
 	if !strings.HasPrefix(filepath.Base(cg), CgroupPrefix) {
-		r.notes = append(r.notes, fmt.Sprintf("cgroup %s left in place: not a %s cgroup", cg, CgroupPrefix))
+		r.notes = append(r.notes, cgroupText(fmt.Sprintf("cgroup %s left in place: not a %s cgroup", cg, CgroupPrefix), cg))
 		return
 	}
 	var err error
@@ -940,7 +949,7 @@ func (r *reaper) removeCgroup() {
 		time.Sleep(sweepTick)
 	}
 	if err != nil {
-		r.reason("remove cgroup: " + err.Error())
+		r.reason(cgroupText("remove cgroup: "+err.Error(), cg))
 	}
 }
 

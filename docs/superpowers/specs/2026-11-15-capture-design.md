@@ -1149,7 +1149,12 @@ before each capture, and only inside the capture directory.
     `incomplete`;
   - anything at all, when a manifest cannot be read (an I/O error or a
     permission, not merely a file this server did not write): it may be
-    kept or name the newest baseline.
+    kept or name the newest baseline;
+  - anything in a series directory that cannot be opened or listed. It is
+    noted, and retention goes on in the other series;
+  - a capture whose manifest has a name besides its own (and the
+    marker's), for example a hard link the user made: its files are not
+    removed either.
 - **Order:**
   1. every eviction an earlier pass began, which its marker shows, is
      finished;
@@ -1174,7 +1179,11 @@ before each capture, and only inside the capture directory.
      retention may remove would still leave no room (the kept captures,
      the baselines, or a foreign file take it), or the directory cannot be
      measured, this step removes nothing and notes why; the capture then
-     fails with `disk`. `MaxStoredBytes` must be at least the largest
+     fails with `disk`. Only captures that are, by their stat, wholly
+     their own count toward that room. A capture found not to be its own
+     only during its removal (a file rewritten in place, which only its
+     contents show) frees nothing, and the step stops as soon as the rest
+     can no longer make the room. `MaxStoredBytes` must be at least the largest
      capture plus 1 MiB for the directory's own small files (`.owner`,
      `.lock`, `.seq`, manifests); start-up refuses less, and the default
      grows to that.
@@ -1202,7 +1211,14 @@ before each capture, and only inside the capture directory.
   the user rewrote while it was aside keeps its capture. Only a crash
   between moving the marker (the manifest's last name) aside and
   unlinking it leaves a `.del-*` name nothing records, which recovery
-  reports. A failure
+  reports. The marker stands for the manifest only when the manifest's
+  name is gone; a name that holds anything else leaves both.
+
+  A marked capture that becomes protected before the next pass (the
+  newest `compare_with` names it, say) stays half-evicted until the
+  protection lapses, since protection wins. Its files may be partly
+  gone, so a baseline on it fails loudly (its files do not verify) rather
+  than comparing against part of a capture. A failure
   manifest has no files, so it gets no marker; only its manifest is
   removed. Every eviction is logged to stderr and listed in the result's
   `evicted`.

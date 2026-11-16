@@ -19,7 +19,7 @@ type pin struct {
 // and each holds the objects it keeps alive. Objects are keyed by pointer,
 // so an object held by several holders (a profile both open and
 // published, or published twice) counts once. It belongs to one Server
-// and is used from its request goroutine only.
+// and is used by its engine holder only.
 type pins struct {
 	objs map[retained]*pin
 	// held lists what each holder holds, each object once.

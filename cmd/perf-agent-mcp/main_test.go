@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,14 +16,14 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
-	"golang.org/x/sys/unix"
-
+	"github.com/dpsoft/perf-agent/internal/capture"
+	"github.com/dpsoft/perf-agent/internal/capture/capturetest"
 	"github.com/dpsoft/perf-agent/internal/perfmcp"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
 )
@@ -32,17 +33,79 @@ import (
 // the same run function, and a subprocess is this package's test binary, built without -race.
 const liveEnv = "PERF_AGENT_MCP_TEST_LIVE"
 
+// fakeVerifyEnv makes a test binary run as the server and accept any
+// --perf-agent, such as the fake perf-agent, which cannot be setcap'd.
+const fakeVerifyEnv = "PERF_AGENT_MCP_TEST_FAKE_VERIFY"
+
+// outqEnv makes a test binary run as the server with an output queue of
+// that many messages, so a test can fill it with a pipe of a few KiB.
+const outqEnv = "PERF_AGENT_MCP_TEST_OUTQ"
+
+// TestMain lets this test binary serve as a capture's reaper and launcher,
+// as the command's own binary does, and as the server itself when a test
+// runs it with one of the environment variables above.
 func TestMain(m *testing.M) {
-	if os.Getenv(liveEnv) == "1" {
-		configHook = func(c *perfmcp.Config) { c.Live = true }
+	if code, handled := capture.RunInternal(); handled {
+		os.Exit(code)
+	}
+	if hook := envConfigHook(); hook != nil {
+		configHook = hook
 		main()
 		return
 	}
-	code := m.Run()
+	code := capturetest.Main(m)
 	if liveBinDir != "" {
 		_ = os.RemoveAll(liveBinDir)
 	}
 	os.Exit(code)
+}
+
+// envConfigHook is the configHook the environment asks for, composed of
+// every test variable set, or nil when none is.
+func envConfigHook() func(*perfmcp.Config) {
+	var steps []func(*perfmcp.Config)
+	if os.Getenv(liveEnv) == "1" {
+		steps = append(steps, func(c *perfmcp.Config) { c.Live = true })
+	}
+	if os.Getenv(fakeVerifyEnv) == "1" {
+		steps = append(steps, func(c *perfmcp.Config) { c.Capture.Verify = fakeVerify })
+	}
+	if v := os.Getenv(outqEnv); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			fmt.Fprintf(os.Stderr, "%s=%q is not a positive integer\n", outqEnv, v)
+			os.Exit(2)
+		}
+		steps = append(steps, func(c *perfmcp.Config) { c.OutputQueueMessages = n })
+	}
+	if len(steps) == 0 {
+		return nil
+	}
+	return func(c *perfmcp.Config) {
+		for _, step := range steps {
+			step(c)
+		}
+	}
+}
+
+// fakeVerify accepts any file as a perf-agent without capabilities; its
+// identity is still read, so the check before each run holds.
+func fakeVerify(p string) (capture.Binary, error) {
+	id, err := capture.IdentityOf(p)
+	return capture.Binary{Path: p, ID: id, Version: "v0.0.0-test"}, err
+}
+
+// fakeCommand is a subprocess running the server, this package's test
+// binary built without -race, with env added to the test's environment.
+func fakeCommand(t *testing.T, env []string, args ...string) *exec.Cmd {
+	t.Helper()
+	exe, err := liveTestBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, args...)
+	cmd.Env = append(os.Environ(), env...)
+	return cmd
 }
 
 // liveBinDir holds the test binary liveCommand builds.
@@ -73,13 +136,7 @@ func withLive(t *testing.T) {
 // liveCommand is a subprocess running the server with the live page engine.
 func liveCommand(t *testing.T, args ...string) *exec.Cmd {
 	t.Helper()
-	exe, err := liveTestBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command(exe, args...)
-	cmd.Env = append(os.Environ(), liveEnv+"=1")
-	return cmd
+	return fakeCommand(t, []string{liveEnv + "=1"}, args...)
 }
 
 func TestRunNeedsAProfilesRoot(t *testing.T) {
@@ -112,6 +169,304 @@ func TestRunAppliesLimits(t *testing.T) {
 	if code := run([]string{"--profiles", t.TempDir(), "--limit", "MaxRows=x"}, strings.NewReader(""), &out, &errb); code != 2 {
 		t.Errorf("non-integer limit: exit %d, want 2", code)
 	}
+}
+
+// The capture flags reach the server's configuration as given, and
+// --capture-ttl wins over --limit Capture.TTL wherever it stands.
+func TestRunCaptureFlagsReachTheConfig(t *testing.T) {
+	var got perfmcp.Config
+	// The hook keeps what the flags made and turns capture off, so the
+	// made-up paths are never verified.
+	configHook = func(c *perfmcp.Config) {
+		got = *c
+		c.Capture = perfmcp.CaptureConfig{}
+	}
+	t.Cleanup(func() { configHook = nil })
+	runOK := func(args ...string) perfmcp.Config {
+		t.Helper()
+		got = perfmcp.Config{}
+		var out, errb bytes.Buffer
+		if code := run(append([]string{"--profiles", t.TempDir()}, args...), strings.NewReader(""), &out, &errb); code != 0 {
+			t.Fatalf("%v: exit %d, stderr %q", args, code, errb.String())
+		}
+		return got
+	}
+
+	c := runOK("--perf-agent", "/opt/pa/perf-agent", "--captures", "runs",
+		"--capture-command", "/usr/bin/true", "--capture-command", "/usr/bin/false",
+		"--gpu-shim", "/opt/pa/libshim.so", "--capture-ttl", "48h", "--limit", "Capture.TTL=1h")
+	want := perfmcp.CaptureConfig{PerfAgent: "/opt/pa/perf-agent", Dir: "runs", GPUShim: "/opt/pa/libshim.so", Owner: "stdio",
+		Commands: []string{"/usr/bin/true", "/usr/bin/false"}}
+	if c.Capture.Verify != nil {
+		t.Error("the command set a Verify seam")
+	}
+	c.Capture.Verify = nil
+	if !reflect.DeepEqual(c.Capture, want) {
+		t.Errorf("Capture = %+v, want %+v", c.Capture, want)
+	}
+	if c.Limits.Capture.TTL != 48*time.Hour {
+		t.Errorf("--capture-ttl 48h after --limit: TTL %v", c.Limits.Capture.TTL)
+	}
+	if c := runOK("--capture-ttl", "48h", "--limit", "Capture.TTL=1h"); c.Limits.Capture.TTL != 48*time.Hour {
+		t.Errorf("--capture-ttl 48h before --limit: TTL %v", c.Limits.Capture.TTL)
+	}
+	if c := runOK("--limit", "Capture.TTL=1h"); c.Limits.Capture.TTL != time.Hour {
+		t.Errorf("--limit Capture.TTL=1h alone: TTL %v", c.Limits.Capture.TTL)
+	}
+	if c := runOK("--capture-ttl", "0s"); c.Limits.Capture.TTL != 0 {
+		t.Errorf("--capture-ttl 0s: TTL %v, want 0 (no age limit)", c.Limits.Capture.TTL)
+	}
+	c = runOK()
+	if c.Limits.Capture.TTL != perfmcp.DefaultLimits().Capture.TTL || c.Capture.PerfAgent != "" || c.Capture.Dir != "" {
+		t.Errorf("defaults: TTL %v, Capture %+v", c.Limits.Capture.TTL, c.Capture)
+	}
+
+	for _, args := range [][]string{
+		{"--capture-ttl", "-1h"},
+		{"--capture-ttl", "soon"},
+		{"--gpu-shim", "lib/shim.so"},
+		{"--capture-command", "bin/bench"},
+	} {
+		var out, errb bytes.Buffer
+		if code := run(append([]string{"--profiles", t.TempDir()}, args...), strings.NewReader(""), &out, &errb); code != 2 || !strings.Contains(errb.String(), strings.TrimLeft(args[0], "-")) {
+			t.Errorf("%v: exit %d, stderr %q; want 2 naming %s", args, code, errb.String(), args[0])
+		}
+	}
+}
+
+// --captures names a directory inside the profiles root; one outside it,
+// through .. or a symlink, or a file, is a usage error. An absolute one
+// inside reaches the server relative to the root.
+func TestRunValidatesTheCapturesDir(t *testing.T) {
+	profiles, outside := t.TempDir(), t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(profiles, "away")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(profiles, "inside"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("inside", filepath.Join(profiles, "near")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profiles, "file"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Links that lead back to the profiles root itself.
+	if err := os.Symlink(".", filepath.Join(profiles, "self")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("..", filepath.Join(profiles, "inside", "up")); err != nil {
+		t.Fatal(err)
+	}
+	var got perfmcp.Config
+	configHook = func(c *perfmcp.Config) {
+		got = *c
+		c.Capture = perfmcp.CaptureConfig{}
+	}
+	t.Cleanup(func() { configHook = nil })
+	for _, c := range []struct {
+		dir, want string
+		code      int
+	}{
+		{"runs", "runs", 0},
+		{"inside/runs", "inside/runs", 0},
+		{filepath.Join(profiles, "inside", "runs"), "inside/runs", 0},
+		{"near/runs", "near/runs", 0},
+		{"../runs", "outside the profiles root", 2},
+		{filepath.Join(outside, "runs"), "outside the profiles root", 2},
+		{"away/runs", "outside the profiles root", 2},
+		{"away", "outside the profiles root", 2},
+		{"file", "not a directory", 2},
+		{".", "the profiles root itself", 2},
+		{"inside/..", "the profiles root itself", 2},
+		{profiles, "the profiles root itself", 2},
+		{profiles + "/", "the profiles root itself", 2},
+		{"self", "the profiles root itself", 2},
+		{"inside/up", "the profiles root itself", 2},
+		{filepath.Join(profiles, "self"), "the profiles root itself", 2},
+	} {
+		got = perfmcp.Config{}
+		var out, errb bytes.Buffer
+		code := run([]string{"--profiles", profiles, "--perf-agent", "/opt/perf-agent/perf-agent", "--captures", c.dir}, strings.NewReader(""), &out, &errb)
+		if code != c.code {
+			t.Errorf("--captures %s: exit %d, want %d; stderr %q", c.dir, code, c.code, errb.String())
+			continue
+		}
+		if code == 0 && got.Capture.Dir != c.want {
+			t.Errorf("--captures %s reached the server as %q, want %q", c.dir, got.Capture.Dir, c.want)
+		}
+		if code != 0 && (!strings.Contains(errb.String(), "--captures") || !strings.Contains(errb.String(), c.want)) {
+			t.Errorf("--captures %s: stderr %q, want it to name --captures and %q", c.dir, errb.String(), c.want)
+		}
+	}
+}
+
+// Without --perf-agent, --captures is not checked: it has no effect, and
+// the one line saying so is all the server says of it.
+func TestRunLeavesCapturesUncheckedWithoutPerfAgent(t *testing.T) {
+	for _, dir := range []string{"../runs", "."} {
+		var out, errb bytes.Buffer
+		if code := run([]string{"--profiles", t.TempDir(), "--captures", dir}, strings.NewReader(""), &out, &errb); code != 0 {
+			t.Errorf("--captures %s without --perf-agent: exit %d, stderr %q", dir, code, errb.String())
+		}
+		if !strings.Contains(errb.String(), "without --perf-agent") || strings.Contains(errb.String(), "profiles root") {
+			t.Errorf("--captures %s without --perf-agent: stderr %q", dir, errb.String())
+		}
+	}
+}
+
+// The capture flags do nothing without --perf-agent; one line on stderr
+// says so, naming the flags given.
+func TestRunWarnsOfCaptureFlagsWithoutPerfAgent(t *testing.T) {
+	var out, errb bytes.Buffer
+	args := []string{"--profiles", t.TempDir(), "--gpu-shim", "/opt/libshim.so", "--captures", "runs", "--capture-command", "/usr/bin/true", "--capture-ttl", "1h"}
+	if code := run(args, strings.NewReader(""), &out, &errb); code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, errb.String())
+	}
+	var warned []string
+	for line := range strings.Lines(errb.String()) {
+		if strings.Contains(line, "without --perf-agent") {
+			warned = append(warned, line)
+		}
+	}
+	if len(warned) != 1 {
+		t.Fatalf("stderr %q: want one warning", errb.String())
+	}
+	for _, f := range []string{"--gpu-shim", "--captures", "--capture-command", "--capture-ttl"} {
+		if !strings.Contains(warned[0], f) {
+			t.Errorf("the warning %q does not name %s", warned[0], f)
+		}
+	}
+	errb.Reset()
+	if code := run([]string{"--profiles", t.TempDir()}, strings.NewReader(""), &out, &errb); code != 0 || strings.Contains(errb.String(), "without --perf-agent") {
+		t.Errorf("no capture flag: exit %d, stderr %q", code, errb.String())
+	}
+}
+
+// On the paths that do not wait for Close, a signal and a client that
+// stopped reading, the command kills the captures itself before it
+// starts closing the server.
+func TestTheCapturesAreKilledBeforeClose(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		calls []string
+	)
+	note := func(c string) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, c)
+	}
+	seen := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(calls)
+	}
+	kill, closeSrv := killCaptures, closeServer
+	killCaptures = func(s *perfmcp.Server) { note("kill"); kill(s) }
+	closeServer = func(s *perfmcp.Server) error { note("close"); return closeSrv(s) }
+	t.Cleanup(func() { killCaptures, closeServer = kill, closeSrv })
+	// order waits for Close to start and returns the calls until then.
+	order := func(t *testing.T) []string {
+		t.Helper()
+		for end := time.Now().Add(5 * time.Second); time.Now().Before(end); time.Sleep(5 * time.Millisecond) {
+			if c := seen(); slices.Contains(c, "close") {
+				return c[:slices.Index(c, "close")+1]
+			}
+		}
+		t.Fatalf("Close never ran: %v", seen())
+		return nil
+	}
+
+	t.Run("signal", func(t *testing.T) {
+		mu.Lock()
+		calls = nil
+		mu.Unlock()
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		in, inW := io.Pipe()
+		defer func() { _ = inW.Close() }()
+		var out, errb bytes.Buffer
+		if code := runContext(ctx, []string{"--profiles", t.TempDir()}, in, &out, &errb); code != 0 {
+			t.Errorf("exit %d, stderr %q", code, errb.String())
+		}
+		if c := order(t); c[0] != "kill" {
+			t.Errorf("calls %v: Close ran before the captures were killed", c)
+		}
+	})
+
+	// At EOF Close may wait for a job to roll back; a signal then ends the
+	// wait, and the captures are killed.
+	t.Run("signal while closing", func(t *testing.T) {
+		mu.Lock()
+		calls = nil
+		mu.Unlock()
+		release := make(chan struct{})
+		closeServer = func(s *perfmcp.Server) error {
+			note("close")
+			<-release
+			return closeSrv(s)
+		}
+		t.Cleanup(func() {
+			close(release)
+			closeServer = func(s *perfmcp.Server) error { note("close"); return closeSrv(s) }
+		})
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		done := make(chan int, 1)
+		go func() {
+			done <- runContext(ctx, []string{"--profiles", t.TempDir()}, strings.NewReader(""), io.Discard, &lockedBuffer{})
+		}()
+		order(t)
+		cancel()
+		select {
+		case code := <-done:
+			if code != 0 {
+				t.Errorf("exit %d", code)
+			}
+		case <-time.After(shutdownGrace):
+			t.Fatal("a signal while Close waits did not end the run")
+		}
+		if c := seen(); len(c) < 2 || !slices.Equal(c[:2], []string{"close", "kill"}) {
+			t.Errorf("calls %v: want Close under way, then the kill", c)
+		}
+	})
+
+	t.Run("client gone", func(t *testing.T) {
+		mu.Lock()
+		calls = nil
+		mu.Unlock()
+		configHook = func(c *perfmcp.Config) { c.OutputQueueMessages = 2 }
+		t.Cleanup(func() { configHook = nil })
+		in, inW := io.Pipe()
+		// Nothing ever reads the answers.
+		outR, outW := io.Pipe()
+		t.Cleanup(func() { _ = inW.Close(); _ = outR.Close() })
+		go func() {
+			_, _ = io.WriteString(inW, `{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`+"\n")
+			for i := range 200 {
+				if _, err := fmt.Fprintf(inW, `{"jsonrpc":"2.0","id":%d,"method":"ping"}`+"\n", i+1); err != nil {
+					return
+				}
+			}
+		}()
+		errb := &lockedBuffer{}
+		done := make(chan int, 1)
+		go func() { done <- run([]string{"--profiles", t.TempDir()}, in, outW, errb) }()
+		select {
+		case code := <-done:
+			if code != 0 {
+				t.Errorf("exit %d, stderr %q", code, errb.String())
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatal("run did not end with the client not reading")
+		}
+		if !strings.Contains(errb.String(), "client is not reading") {
+			t.Errorf("stderr %q does not say the client is not reading", errb.String())
+		}
+		if c := order(t); c[0] != "kill" {
+			t.Errorf("calls %v: Close ran before the captures were killed", c)
+		}
+	})
 }
 
 // session runs initialize, tools/list, open and render against a profiles
@@ -159,7 +514,8 @@ func TestRunServesOverStdio(t *testing.T) {
 	for _, tl := range list.Result.Tools {
 		names = append(names, tl.Name)
 	}
-	want := []string{"open", "top", "path", "sandwich", "gpu_kernels_for", "facts", "diff", "source", "render_flamegraph"}
+	want := []string{"open", "top", "path", "sandwich", "gpu_kernels_for", "facts", "diff", "source", "render_flamegraph",
+		"capture", "capture_wait", "capture_cancel", "capture_list"}
 	slices.Sort(names)
 	slices.Sort(want)
 	if !slices.Equal(names, want) {
@@ -314,7 +670,7 @@ func TestRunHasNoLiveFlags(t *testing.T) {
 
 // The stdio server registers no page tool: tools/list is the nine tools
 // of the profile and render surface, and a page tool call is unknown.
-func TestRunRegistersNoPageTools(t *testing.T) {
+func TestRunRegistersTheProfileAndCaptureTools(t *testing.T) {
 	c := startRun(t, "--profiles", t.TempDir())
 	var list struct {
 		Tools []struct {
@@ -324,10 +680,14 @@ func TestRunRegistersNoPageTools(t *testing.T) {
 	if err := json.Unmarshal(c.call("tools/list", map[string]any{}), &list); err != nil {
 		t.Fatal(err)
 	}
+	var names []string
 	for _, tl := range list.Tools {
-		if strings.HasPrefix(tl.Name, "page_") {
-			t.Errorf("tools/list has %s", tl.Name)
-		}
+		names = append(names, tl.Name)
+	}
+	want := []string{"open", "top", "path", "facts", "gpu_kernels_for", "sandwich", "diff", "source", "render_flamegraph",
+		"capture", "capture_wait", "capture_cancel", "capture_list"}
+	if !slices.Equal(names, want) {
+		t.Errorf("tools/list has %v, want %v", names, want)
 	}
 	if raw := c.call("tools/call", map[string]any{"name": "page_open", "arguments": map[string]any{}}); len(raw) != 0 {
 		t.Errorf("page_open answered with a result: %s", raw)
@@ -524,6 +884,52 @@ func TestRunValidatesResolvedLimits(t *testing.T) {
 	var out, errb bytes.Buffer
 	if code := run([]string{"--profiles", t.TempDir(), "--limit", "Source.MaxContext=0"}, strings.NewReader(""), &out, &errb); code != 0 {
 		t.Errorf("Source.MaxContext=0: exit %d, stderr %q", code, errb.String())
+	}
+}
+
+// Capture.TTL 0 means no age limit, so --limit takes it; the other
+// capture limits must be positive, and a ceiling is the server's to refuse.
+func TestRunAcceptsAZeroCaptureTTL(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := run([]string{"--profiles", t.TempDir(), "--limit", "Capture.TTL=0s"}, strings.NewReader(""), &out, &errb); code != 0 {
+		t.Errorf("Capture.TTL=0s: exit %d, stderr %q", code, errb.String())
+	}
+	for _, c := range []struct {
+		limit, want string
+		code        int
+	}{
+		{"Capture.TTL=-1s", "must not be negative", 2},
+		{"Capture.StopGrace=0s", "Capture.StopGrace", 2},
+		{"Capture.MaxStoredBytes=0", "Capture.MaxStoredBytes", 2},
+		{"Capture.MaxDuration=6m", "5m0s", 1},
+	} {
+		errb.Reset()
+		if code := run([]string{"--profiles", t.TempDir(), "--limit", c.limit}, strings.NewReader(""), &out, &errb); code != c.code || !strings.Contains(errb.String(), c.want) {
+			t.Errorf("%s: exit %d, stderr %q", c.limit, code, errb.String())
+		}
+	}
+}
+
+// Lowering an M2 limit alone still starts the server: the capture limits
+// left at their defaults follow it.
+func TestRunAcceptsLoweredM2LimitsAlone(t *testing.T) {
+	for _, limit := range []string{"MaxDiffRows=10", "Model.MaxRawBytes=1048576", "Model.MaxSidecarBytes=1048576", "MaxResponseBytes=4096"} {
+		var out, errb bytes.Buffer
+		if code := run([]string{"--profiles", t.TempDir(), "--limit", limit}, strings.NewReader(""), &out, &errb); code != 0 {
+			t.Errorf("%s: exit %d, stderr %q", limit, code, errb.String())
+		}
+	}
+}
+
+// A tiny MaxResponseBytes alone still starts the server, and the tail it
+// lowered is named on stderr.
+func TestRunAcceptsATinyResponseLimit(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := run([]string{"--profiles", t.TempDir(), "--limit", "MaxResponseBytes=8"}, strings.NewReader(""), &out, &errb); code != 0 {
+		t.Fatalf("exit %d, stderr %q", code, errb.String())
+	}
+	if !strings.Contains(errb.String(), "limit=Capture.MaxOutputTail default=2048 now=1") {
+		t.Errorf("stderr %q does not name the lowered tail", errb.String())
 	}
 }
 
@@ -742,253 +1148,4 @@ func TestSourceGitIsOnByDefault(t *testing.T) {
 	if status != "source_unverified" || reason != "git probe disabled" {
 		t.Errorf("--source-git=false: status %q reason %q", status, reason)
 	}
-}
-
-// buildServer builds the binary into a temporary directory.
-func buildServer(t *testing.T) string {
-	t.Helper()
-	bin := filepath.Join(t.TempDir(), "perf-agent-mcp")
-	if out, err := exec.Command("go", "build", "-buildvcs=false", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
-	return bin
-}
-
-// A signal ends the server with status 0 even when the client has stopped
-// reading its output and the server is blocked writing a response. With
-// the live page listening, a browser holding a stream open and another
-// not reading a model delay it by no more than the page's bounded close.
-func TestSignalEndsAServerBlockedOnOutput(t *testing.T) {
-	bin := buildServer(t)
-	for _, c := range []struct {
-		name    string
-		sig     syscall.Signal
-		blocked bool
-		// errBlocked also leaves stderr full and unread.
-		errBlocked bool
-		// live starts the page first, with a stream and a stuck download.
-		live bool
-	}{
-		{"SIGTERM blocked", syscall.SIGTERM, true, false, false},
-		{"SIGINT blocked", syscall.SIGINT, true, false, false},
-		{"SIGTERM drained", syscall.SIGTERM, false, false, false},
-		{"SIGTERM stdout and stderr blocked", syscall.SIGTERM, true, true, false},
-		{"SIGINT stdout and stderr blocked", syscall.SIGINT, true, true, false},
-		{"live SIGTERM drained", syscall.SIGTERM, false, false, true},
-		{"live SIGTERM stdout and stderr blocked", syscall.SIGTERM, true, true, true},
-		{"live SIGINT stdout and stderr blocked", syscall.SIGINT, true, true, true},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			outR, outW, err := os.Pipe()
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = outR.Close() }()
-			if _, err := unix.FcntlInt(outW.Fd(), unix.F_SETPIPE_SZ, 4096); err != nil {
-				t.Skipf("cannot shrink the pipe: %v", err)
-			}
-			inR, inW, err := os.Pipe()
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = inW.Close() }()
-			profiles := t.TempDir()
-			args := []string{"--profiles", profiles}
-			if c.live {
-				if err := os.WriteFile(filepath.Join(profiles, "long.pb.gz"), longNames(8000, 1000), 0o644); err != nil {
-					t.Fatal(err)
-				}
-				// Pages large enough for the 8 MiB model of long.pb.gz.
-				args = append(args, "--limit", "MaxPageBytes=67108864", "--limit", "MaxPageNodes=1048576")
-			}
-			cmd := exec.Command(bin, args...)
-			if c.live {
-				cmd = liveCommand(t, args...)
-			}
-			cmd.Stdin, cmd.Stdout = inR, outW
-			// blockStderr fills stderr and stops reading it.
-			blockStderr := func() {}
-			if c.errBlocked {
-				errR, errW, err := os.Pipe()
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer func() { _ = errR.Close() }()
-				if _, err := unix.FcntlInt(errW.Fd(), unix.F_SETPIPE_SZ, 4096); err != nil {
-					t.Skipf("cannot shrink the pipe: %v", err)
-				}
-				cmd.Stderr = errW
-				defer func() { _ = errW.Close() }()
-				// Until the page is set up, stderr is read: the server logs
-				// while it opens the profile and starts the page.
-				drained := make(chan struct{})
-				go func() {
-					defer close(drained)
-					_, _ = io.Copy(io.Discard, errR)
-				}()
-				// errW is in blocking mode once exec has taken its descriptor,
-				// so the write that fills the pipe runs on its own: it returns
-				// when the pipe has room for all of it, or when errR closes.
-				blockStderr = func() {
-					_ = errR.SetReadDeadline(time.Now())
-					<-drained
-					go func() { _, _ = errW.Write(make([]byte, 4096)) }()
-				}
-			}
-			if err := cmd.Start(); err != nil {
-				t.Fatal(err)
-			}
-			_ = inR.Close()
-			_ = outW.Close()
-			t.Cleanup(func() { _ = cmd.Process.Kill() })
-
-			r := bufio.NewReader(outR)
-			id := 0
-			send := func(method string, params any) {
-				t.Helper()
-				id++
-				b, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
-				if err != nil {
-					t.Fatal(err)
-				}
-				if _, err := inW.Write(append(b, '\n')); err != nil {
-					t.Fatal(err)
-				}
-			}
-			// tool calls a tool and returns its text.
-			tool := func(name string, args any) string {
-				t.Helper()
-				send("tools/call", map[string]any{"name": name, "arguments": args})
-				line, err := r.ReadBytes('\n')
-				if err != nil {
-					t.Fatal(err)
-				}
-				var res struct {
-					Result struct {
-						Content []struct {
-							Text string `json:"text"`
-						} `json:"content"`
-						IsError bool `json:"isError"`
-					} `json:"result"`
-				}
-				if err := json.Unmarshal(line, &res); err != nil || res.Result.IsError || len(res.Result.Content) != 1 {
-					t.Fatalf("%s: %s (%v)", name, line, err)
-				}
-				return res.Result.Content[0].Text
-			}
-			send("initialize", map[string]any{"protocolVersion": "2025-11-25"})
-			if _, err := r.ReadBytes('\n'); err != nil {
-				t.Fatal(err)
-			}
-			if c.live {
-				startPage(t, tool)
-			}
-			blockStderr()
-			send("tools/list", map[string]any{})
-			if !c.blocked {
-				go func() { _, _ = io.Copy(io.Discard, r) }()
-			}
-			time.Sleep(500 * time.Millisecond)
-			if err := cmd.Process.Signal(c.sig); err != nil {
-				t.Fatal(err)
-			}
-			start := time.Now()
-			done := make(chan error, 1)
-			go func() { done <- cmd.Wait() }()
-			budget := 3 * time.Second
-			if c.live {
-				budget = 2 * time.Second
-			}
-			select {
-			case err := <-done:
-				took := time.Since(start)
-				if err != nil {
-					t.Errorf("exit: %v", err)
-				}
-				// Drained, the server closes the page in full, and its
-				// bounded wait for the stuck download shows the download
-				// really was stuck.
-				if c.live && !c.blocked && took < 400*time.Millisecond {
-					t.Errorf("exited %v after the signal: the download was not stuck", took)
-				}
-				t.Logf("exited %v after the signal", took.Round(time.Millisecond))
-			case <-time.After(budget):
-				t.Fatalf("the server is still running %v after the signal", budget)
-			}
-		})
-	}
-}
-
-// longNames is cpu/nanoseconds with one stack of depth frames, each a
-// function with its own name of about nameLen bytes: every frame is as
-// wide as the view, so a page draws them all.
-func longNames(depth, nameLen int) []byte {
-	frames := make([]pmfixture.Frame, depth)
-	for i := range frames {
-		frames[i] = pmfixture.Fn(fmt.Sprintf("f%05d_", i) + strings.Repeat("x", nameLen))
-	}
-	return pmfixture.Build("cpu", "nanoseconds", nil, pmfixture.Sample{Frames: frames, Value: 1})
-}
-
-// startPage opens long.pb.gz through tool, publishes its default view's
-// facts on the live page, and leaves two browser connections open: a
-// stream read up to its first state, and a download of the model, far
-// larger than the socket buffers, that is never read.
-func startPage(t *testing.T, tool func(name string, args any) string) {
-	t.Helper()
-	var o struct {
-		Handle      string `json:"handle"`
-		DefaultView string `json:"default_view"`
-	}
-	if err := json.Unmarshal([]byte(tool("open", map[string]any{"path": "long.pb.gz"})), &o); err != nil {
-		t.Fatal(err)
-	}
-	var pub struct {
-		Publication string `json:"publication"`
-		URL         string `json:"url"`
-	}
-	text := tool("page_explain", map[string]any{"handle": o.Handle, "view": o.DefaultView, "explanations": []any{}})
-	if err := json.Unmarshal([]byte(text), &pub); err != nil || pub.URL == "" {
-		t.Fatalf("page_explain: %s (%v)", text, err)
-	}
-	u, err := url.Parse(pub.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// A small receive buffer keeps the unread download from ending inside
-	// the kernel.
-	d := net.Dialer{Control: func(_, _ string, c syscall.RawConn) error {
-		var serr error
-		if err := c.Control(func(fd uintptr) {
-			serr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, 4096)
-		}); err != nil {
-			return err
-		}
-		return serr
-	}}
-	request := func(route string) net.Conn {
-		t.Helper()
-		conn, err := d.Dial("tcp", u.Host)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = conn.Close() })
-		if _, err := fmt.Fprintf(conn, "GET %s%s HTTP/1.1\r\nHost: %s\r\n\r\n", u.Path, route, u.Host); err != nil {
-			t.Fatal(err)
-		}
-		return conn
-	}
-	stream := request("events")
-	_ = stream.SetReadDeadline(time.Now().Add(5 * time.Second))
-	br := bufio.NewReader(stream)
-	for {
-		line, err := br.ReadString('\n')
-		if err != nil {
-			t.Fatalf("stream: %v", err)
-		}
-		if line == "event: state\n" {
-			break
-		}
-	}
-	request("pub/" + pub.Publication + "/model")
 }

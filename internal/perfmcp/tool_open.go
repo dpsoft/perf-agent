@@ -90,22 +90,33 @@ func (s *Server) handleOpen(_ context.Context, raw json.RawMessage) (mcpstdio.Re
 			return mcpstdio.Result{}, err
 		}
 	}
-	e, err := s.store.open(name, logName)
+	out, err := s.openResultFor(name, logName)
 	if err != nil {
-		s.log.Warn("open refused", "path", a.Path, "execlog", a.Execlog, "err", err)
 		return mcpstdio.Result{}, err
+	}
+	return s.respond("open", shrinkOpen, out)
+}
+
+// openResultFor opens name, and execlog when not "", both relative to the
+// profiles root, and returns what open answers for them. It runs under the
+// engine.
+func (s *Server) openResultFor(name, execlog string) (openResult, error) {
+	e, err := s.store.open(name, execlog)
+	if err != nil {
+		s.log.Warn("open refused", "path", name, "execlog", execlog, "err", err)
+		return openResult{}, err
 	}
 	p := e.prof
 	def := defaultView(p)
 	_, v, err := s.store.view(p.Handle, def)
 	if err != nil {
-		return mcpstdio.Result{}, err
+		return openResult{}, err
 	}
 	notes, err := v.Notes()
 	if err != nil {
-		return mcpstdio.Result{}, fmt.Errorf("cannot compute the sampling notes of %s: %v", def, err)
+		return openResult{}, fmt.Errorf("cannot compute the sampling notes of %s: %v", def, err)
 	}
-	s.log.Info("opened", "path", name, "execlog", logName, "handle", p.Handle)
+	s.log.Info("opened", "path", name, "execlog", execlog, "handle", p.Handle)
 
 	out := openResult{
 		Handle:        p.Handle,
@@ -129,7 +140,7 @@ func (s *Server) handleOpen(_ context.Context, raw json.RawMessage) (mcpstdio.Re
 	if s.output != nil {
 		out.Capabilities.Render = renderCapability{Enabled: true, OutputRoot: s.output.Name()}
 	}
-	return s.respond("open", shrinkOpen, out)
+	return out, nil
 }
 
 // pcSampling reports whether any sample carries GPU PC sampling labels.

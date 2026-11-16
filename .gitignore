@@ -131,3 +131,6 @@ test/debuginfod/sample/hello.debug
 # Local Go workspace (see BUILDING.md); never committed.
 go.work
 go.work.sum
+
+# Scratch directories internal/capture tests create beside the package.
+.verify-test-*

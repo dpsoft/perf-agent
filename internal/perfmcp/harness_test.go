@@ -16,9 +16,11 @@ import (
 type testClient struct {
 	t      *testing.T
 	srv    *Server
-	w      *io.PipeWriter
+	w      io.WriteCloser
 	r      *bufio.Reader
 	nextID int
+	// held are answers recv read while it looked for another id.
+	held map[int]rpcResponse
 }
 
 // newTestServer starts cfg's server, completes the initialize handshake and
@@ -55,6 +57,9 @@ func newTestServer(t *testing.T, cfg Config) *testClient {
 }
 
 type rpcResponse struct {
+	ID     *int            `json:"id"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
 	Result json.RawMessage `json:"result"`
 	Error  *struct {
 		Code    int    `json:"code"`
@@ -64,7 +69,16 @@ type rpcResponse struct {
 
 func (c *testClient) rpc(method string, params any) rpcResponse {
 	c.t.Helper()
-	req, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": c.nextID, "method": method, "params": params})
+	res, _ := c.recv(c.send(method, params))
+	return res
+}
+
+// send writes a request without waiting for its answer and returns its
+// id; recv reads it.
+func (c *testClient) send(method string, params any) int {
+	c.t.Helper()
+	id := c.nextID
+	req, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
 	if err != nil {
 		c.t.Fatal(err)
 	}
@@ -72,23 +86,58 @@ func (c *testClient) rpc(method string, params any) rpcResponse {
 	if _, err := c.w.Write(append(req, '\n')); err != nil {
 		c.t.Fatalf("write: %v", err)
 	}
-	line, err := c.r.ReadBytes('\n')
-	if err != nil {
-		c.t.Fatalf("read: %v", err)
-	}
-	var res rpcResponse
-	if err := json.Unmarshal(line, &res); err != nil {
-		c.t.Fatalf("decode %s: %v", line, err)
-	}
-	return res
+	return id
 }
 
-// call runs a tool and returns its text and isError.
-func (c *testClient) call(tool string, args any) (text string, isError bool) {
+// sendTool sends a tools/call of tool with args; meta, when not nil, is
+// its _meta.
+func (c *testClient) sendTool(tool string, args, meta any) int {
 	c.t.Helper()
-	res := c.rpc("tools/call", map[string]any{"name": tool, "arguments": args})
+	params := map[string]any{"name": tool, "arguments": args}
+	if meta != nil {
+		params["_meta"] = meta
+	}
+	return c.send("tools/call", params)
+}
+
+// recv reads lines until the answer to id, and returns it with the
+// notifications read on the way. Each line must be one JSON-RPC message;
+// answers to other ids are held for their own recv.
+func (c *testClient) recv(id int) (rpcResponse, []rpcResponse) {
+	c.t.Helper()
+	if res, ok := c.held[id]; ok {
+		delete(c.held, id)
+		return res, nil
+	}
+	var notes []rpcResponse
+	for {
+		line, err := c.r.ReadBytes('\n')
+		if err != nil {
+			c.t.Fatalf("read: %v", err)
+		}
+		var res rpcResponse
+		if err := json.Unmarshal(line, &res); err != nil {
+			c.t.Fatalf("a line that is not one JSON-RPC message: %s: %v", line, err)
+		}
+		switch {
+		case res.ID == nil:
+			notes = append(notes, res)
+		case *res.ID == id:
+			return res, notes
+		default:
+			if c.held == nil {
+				c.held = map[int]rpcResponse{}
+			}
+			c.held[*res.ID] = res
+		}
+	}
+}
+
+// toolText is a tools/call answer's text and isError.
+func (c *testClient) toolText(res rpcResponse) (text string, isError bool) {
+	c.t.Helper()
 	if res.Error != nil {
-		c.t.Fatalf("tools/call %s: protocol error %+v", tool, res.Error)
+		c.t.Fatalf("tools/call: protocol error %+v", res.Error)
 	}
 	var out struct {
 		Content []struct {
@@ -104,6 +153,12 @@ func (c *testClient) call(tool string, args any) (text string, isError bool) {
 		c.t.Fatalf("want one text block, got %s", res.Result)
 	}
 	return out.Content[0].Text, out.IsError
+}
+
+// call runs a tool and returns its text and isError.
+func (c *testClient) call(tool string, args any) (text string, isError bool) {
+	c.t.Helper()
+	return c.toolText(c.rpc("tools/call", map[string]any{"name": tool, "arguments": args}))
 }
 
 // callOK runs a tool that must succeed and decodes its JSON text into v.

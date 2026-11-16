@@ -1,7 +1,6 @@
 package mcpstdio
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -11,14 +10,59 @@ import (
 	"log/slog"
 	"slices"
 	"strconv"
+	"sync"
+	"time"
 	"unicode/utf8"
 )
 
-// Server is an MCP server. Requests are handled one at a time, in order.
+// Server is an MCP server. Requests are handled one at a time, in order,
+// except the calls to Control tools, which are answered at once.
 type Server struct {
 	o   Options
 	max int
 	log *slog.Logger
+	// warned counts each kind of warning; warnMu guards it. See warn.
+	warnMu sync.Mutex
+	warned map[string]int
+}
+
+// warn logs the first warning of each kind, per subject (a tool's name,
+// or ""), off the caller's goroutine, and only counts the later ones, so
+// a log nobody reads (a full stderr) never holds the reader or the
+// dispatcher: at most one goroutine per kind and subject can wait on it.
+// Serve logs the counts, the same way, when it returns.
+func (s *Server) warn(kind, subject string, level slog.Level, args ...any) {
+	key := kind
+	if subject != "" {
+		key += " (" + subject + ")"
+	}
+	s.warnMu.Lock()
+	if s.warned == nil {
+		s.warned = map[string]int{}
+	}
+	n := s.warned[key]
+	s.warned[key] = n + 1
+	s.warnMu.Unlock()
+	if n == 0 {
+		go s.log.Log(context.Background(), level, kind+"; later ones are counted, not logged", args...)
+	}
+}
+
+// reportWarnings logs, off the caller's goroutine, how many warnings of
+// each kind went unlogged, and starts the counts again.
+func (s *Server) reportWarnings() {
+	s.warnMu.Lock()
+	var args []any
+	for kind, n := range s.warned {
+		if n > 1 {
+			args = append(args, kind, n-1)
+		}
+	}
+	s.warned = nil
+	s.warnMu.Unlock()
+	if len(args) > 0 {
+		go s.log.Warn("warnings not logged", args...)
+	}
 }
 
 // New builds a server from o.
@@ -30,119 +74,103 @@ func New(o Options) *Server {
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
 	}
+	if s.o.MaxQueued <= 0 {
+		s.o.MaxQueued = defaultMaxQueued
+	}
+	if s.o.MaxOutMessages <= 0 {
+		s.o.MaxOutMessages = defaultMaxOutMessages
+	}
+	if s.o.MaxOutBytes <= 0 {
+		s.o.MaxOutBytes = defaultMaxOutBytes
+		if s.o.MaxToolErrorBytes > 0 {
+			// Room for two results of MaxToolErrorBytes, each with every
+			// byte doubled by escaping, with their envelopes (see
+			// MaxResultBytes).
+			s.o.MaxOutBytes = 4*s.o.MaxToolErrorBytes + 2*resultEnvelopeBytes
+		}
+	}
+	if s.o.DrainTimeout <= 0 {
+		s.o.DrainTimeout = defaultDrainTimeout
+	}
+	if s.o.StallTimeout <= 0 {
+		s.o.StallTimeout = defaultStallTimeout
+	}
 	return s
 }
 
-// inputLine is one line read from the client.
-type inputLine struct {
-	data      []byte
-	oversized bool
-	err       error
-}
-
 // Serve reads newline-delimited JSON-RPC messages from r and writes
-// responses to w until r reaches EOF or ctx ends, both of which return nil.
-// Nothing but compact JSON-RPC lines is ever written to w.
+// responses and notifications to w. Nothing but compact JSON-RPC lines is
+// ever written to w, and only by one goroutine.
 //
-// A reader goroutine owns r: it may still read from r once more after Serve
-// returns, so the caller should close r. A blocked w.Write is not
-// interrupted by ctx.
+// Nothing Serve does waits on w. The reader goroutine takes every line as
+// it comes: notifications/cancelled ends the named request, a Control tool
+// is answered at once, and any other request joins a queue of MaxQueued
+// (beyond the one running), past which it is answered "server busy". One
+// dispatcher answers the queue in order, starting each request only once
+// the output backlog is under half its bounds. Every message goes through
+// a bounded output queue.
+//
+// EOF on r means the client is gone. The handler running and the requests
+// still queued run with a cancelled context and are answered in order: a
+// handler that honours its context answers as cancelled (isError). A
+// script that pipes requests in must keep r open until it has its answers.
+//
+// Serve returns:
+//   - at EOF, once the queued requests are answered and the output is
+//     drained: nil, or ErrClientGone when the drain took longer than
+//     DrainTimeout. An input that fails to read ends the same way, and
+//     Serve then returns the read error (joined to ErrClientGone when the
+//     drain ran out);
+//   - when ctx ends, once the output enqueued so far is drained, for at
+//     most DrainTimeout: nil, or an error that is both ErrClientGone and
+//     ctx.Err() when the drain ran out;
+//   - at once with ErrClientGone when the client stopped reading its
+//     output: a response found the backlog at its bound, a write failed,
+//     or no write ended for StallTimeout while messages waited.
+//
+// On each path OnClose runs first, then every handler's context is
+// cancelled. A handler or a write still running when Serve returns is not
+// waited for. The reader goroutine owns r: it may still read from r once
+// more after Serve returns, so the caller should close r.
 func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	lines := make(chan inputLine)
-	go s.readLines(ctx, r, lines)
+	ss := s.newSession(ctx, w)
+	defer ss.hcancel()
+	defer s.reportWarnings()
+	go ss.out.run()
+	go ss.dispatch()
+	go ss.read(r)
 
-	initialized := false
-	for {
-		var in inputLine
-		var ok bool
-		select {
-		case <-ctx.Done():
-			return nil
-		case in, ok = <-lines:
-			if !ok {
-				return nil
-			}
-		}
-		if in.err != nil {
-			return in.err
-		}
-		var out *outgoing
-		if in.oversized {
-			out = errorResponse(nil, codeInvalidRequest,
-				fmt.Sprintf("message exceeds MaxMessageBytes (%d bytes); it was discarded", s.max))
-		} else {
-			out = s.dispatch(ctx, in.data, &initialized)
-		}
-		if out == nil {
-			continue
-		}
-		if err := writeMessage(w, out); err != nil {
-			return err
-		}
+	select {
+	case <-ctx.Done():
+		return ss.endContext(ctx)
+	case <-ss.out.dead:
+		return ss.endGone()
+	case <-ss.inputEnded:
 	}
-}
-
-// readLines splits r into lines. A line longer than the limit is reported
-// once as oversized and the remainder of it is read and dropped, never held.
-func (s *Server) readLines(ctx context.Context, r io.Reader, out chan<- inputLine) {
-	defer close(out)
-	send := func(l inputLine) bool {
-		select {
-		case out <- l:
-			return true
-		case <-ctx.Done():
-			return false
-		}
+	// The reader stops when the client is dead too; that is not an EOF.
+	select {
+	case <-ss.out.dead:
+		return ss.endGone()
+	default:
 	}
-	br := bufio.NewReaderSize(r, 64<<10)
-	var buf []byte
-	over := false
-	for {
-		chunk, err := br.ReadSlice('\n')
-		if !over {
-			if len(buf)+len(chunk) > s.max+1 {
-				over = true
-				buf = nil
-			} else {
-				buf = append(buf, chunk...)
-			}
-		}
-		switch {
-		case err == nil || errors.Is(err, io.EOF):
-			complete := err == nil
-			if !over {
-				buf = bytes.TrimSuffix(buf, []byte("\n"))
-				over = len(buf) > s.max
-			}
-			if over || len(bytes.TrimSpace(buf)) > 0 {
-				if !send(inputLine{data: buf, oversized: over}) {
-					return
-				}
-			}
-			buf, over = nil, false
-			if !complete {
-				return
-			}
-		case errors.Is(err, bufio.ErrBufferFull):
-			// keep accumulating (or discarding) the same line
-		default:
-			send(inputLine{err: err})
-			return
-		}
+	ss.end(CloseEOF)
+	ss.mu.Lock()
+	ss.inputDone = true
+	ss.mu.Unlock()
+	ss.wakeDispatcher()
+	select {
+	case <-ss.dispatched:
+	case <-ctx.Done():
+		return ss.endContext(ctx)
+	case <-ss.out.dead:
+		return ss.endGone()
 	}
-}
-
-func writeMessage(w io.Writer, m *outgoing) error {
-	var b bytes.Buffer
-	enc := json.NewEncoder(&b) // compact, newline-terminated
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(m); err != nil {
-		return err
+	drained := ss.out.drain(time.Now().Add(s.o.DrainTimeout))
+	ss.halt()
+	if !drained {
+		return errors.Join(ss.out.goneErr(), ss.readErr)
 	}
-	_, err := w.Write(b.Bytes())
-	return err
+	return ss.readErr
 }
 
 func errorResponse(id json.RawMessage, code int, msg string) *outgoing {
@@ -151,6 +179,11 @@ func errorResponse(id json.RawMessage, code int, msg string) *outgoing {
 	}
 	return &outgoing{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: msg}}
 }
+
+// maxIDBytes bounds an id as sent. A longer one is refused with a null id,
+// so no answer repeats it, and the answer that replaces one too large for
+// the output bound stays small.
+const maxIDBytes = 1024
 
 // validID reports whether raw is a JSON string or integer, the only id forms
 // MCP allows (null, fractions, exponents, objects and so on are not).
@@ -176,66 +209,48 @@ func validID(raw json.RawMessage) bool {
 // marshal encodes v compactly without HTML escaping, so text such as "<b>&"
 // reaches the client literally.
 func marshal(v any) ([]byte, error) {
-	var b bytes.Buffer
-	enc := json.NewEncoder(&b)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
+	b, err := encodeLine(v)
+	if err != nil {
 		return nil, err
 	}
-	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
+	return bytes.TrimSuffix(b, []byte("\n")), nil
 }
 
-// dispatch handles one line and returns the response, or nil for none.
-func (s *Server) dispatch(ctx context.Context, line []byte, initialized *bool) *outgoing {
+// parse validates one line. It returns the message, or the error answer for
+// a line that is not a valid message, or neither for a line that is
+// dropped silently.
+func (s *Server) parse(line []byte) (*envelope, *outgoing) {
 	trimmed := bytes.TrimSpace(line)
 	if !json.Valid(trimmed) {
-		return errorResponse(nil, codeParseError, "parse error: invalid JSON")
+		return nil, errorResponse(nil, codeParseError, "parse error: invalid JSON")
 	}
 	if trimmed[0] == '[' {
-		return errorResponse(nil, codeInvalidRequest, "batches are not supported")
+		return nil, errorResponse(nil, codeInvalidRequest, "batches are not supported")
 	}
 	if trimmed[0] != '{' {
-		return errorResponse(nil, codeInvalidRequest, "invalid request: a message must be a JSON object")
+		return nil, errorResponse(nil, codeInvalidRequest, "invalid request: a message must be a JSON object")
 	}
 	var env envelope
 	if err := json.Unmarshal(trimmed, &env); err != nil {
-		return errorResponse(nil, codeInvalidRequest, "invalid request: "+err.Error())
+		return nil, errorResponse(nil, codeInvalidRequest, "invalid request: "+err.Error())
 	}
 	if env.Method == "" && (len(env.Result) > 0 || len(env.Error) > 0) {
-		s.log.Warn("dropping a client response; this server sends no requests")
-		return nil
+		s.warn("dropping a client response; this server sends no requests", "", slog.LevelWarn)
+		return nil, nil
 	}
 	if len(env.ID) > 0 && !validID(env.ID) {
-		return errorResponse(nil, codeInvalidRequest, "id must be a string or integer")
+		return nil, errorResponse(nil, codeInvalidRequest, "id must be a string or integer")
+	}
+	if len(env.ID) > maxIDBytes {
+		return nil, errorResponse(nil, codeInvalidRequest, fmt.Sprintf("invalid request: id is %d bytes, over %d", len(env.ID), maxIDBytes))
 	}
 	if env.JSONRPC != "2.0" {
-		return errorResponse(env.ID, codeInvalidRequest, `invalid request: jsonrpc must be "2.0"`)
+		return nil, errorResponse(env.ID, codeInvalidRequest, `invalid request: jsonrpc must be "2.0"`)
 	}
 	if env.Method == "" {
-		return errorResponse(env.ID, codeInvalidRequest, "invalid request: method is required")
+		return nil, errorResponse(env.ID, codeInvalidRequest, "invalid request: method is required")
 	}
-	if len(env.ID) == 0 {
-		// Notification: never answered.
-		return nil
-	}
-	// Unknown methods (server/discover included) answer method-not-found even
-	// before initialize so clients can fall back to the initialize handshake.
-	if env.Method != "initialize" && env.Method != "ping" && !*initialized && knownMethods[env.Method] {
-		return errorResponse(env.ID, codeInvalidRequest, "send initialize first")
-	}
-	result, rerr := s.handle(ctx, env.Method, env.Params)
-	if rerr != nil {
-		return errorResponse(env.ID, rerr.Code, rerr.Message)
-	}
-	if env.Method == "initialize" {
-		*initialized = true
-	}
-	raw, err := marshal(result)
-	if err != nil {
-		s.log.Error("marshal result", "method", env.Method, "err", err)
-		return errorResponse(env.ID, codeInternalError, "internal error")
-	}
-	return &outgoing{JSONRPC: "2.0", ID: env.ID, Result: raw}
+	return &env, nil
 }
 
 var knownMethods = map[string]bool{
@@ -333,6 +348,9 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 	var p struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
+		Meta      struct {
+			ProgressToken json.RawMessage `json:"progressToken"`
+		} `json:"_meta"`
 	}
 	if e := decodeParams(params, &p); e != nil {
 		return nil, e
@@ -340,6 +358,11 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 	i := slices.IndexFunc(s.o.Tools, func(t Tool) bool { return t.Name == p.Name })
 	if i < 0 || s.o.Tools[i].Handler == nil {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown tool: " + echoName(p.Name)}
+	}
+	ss, inSession := ctx.Value(sessionKey{}).(*session)
+	r, queued := ctx.Value(requestKey{}).(*request)
+	if inSession && queued && !s.o.Tools[i].Control && validID(p.Meta.ProgressToken) {
+		ctx = context.WithValue(ctx, progressKey{}, &progressTarget{token: p.Meta.ProgressToken, ss: ss, r: r})
 	}
 	args := p.Arguments
 	if len(args) == 0 || string(args) == "null" {
@@ -352,10 +375,36 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 	if err != nil {
 		res = Result{Text: cut(err.Error(), s.o.MaxToolErrorBytes), IsError: true}
 	}
+	return toolResult(res), nil
+}
+
+// toolResult is the tools/call result for res.
+func toolResult(res Result) any {
 	return map[string]any{
 		"content": []textContent{{Type: "text", Text: res.Text}},
 		"isError": res.IsError,
-	}, nil
+	}
+}
+
+// resultEnvelopeBytes bounds what a tools/call answer adds to its escaped
+// text, for an id of up to maxResultIDBytes.
+const (
+	resultEnvelopeBytes = 256
+	maxResultIDBytes    = 64
+)
+
+// MaxResultBytes is the largest tool result text whose answer line stays
+// within half of MaxOutBytes when JSON escaping doubles every byte, with
+// an id of up to 64 bytes. Doubling is the worst case only for text whose
+// bytes are valid UTF-8 and printable or \n, \r, \t, quotes and
+// backslashes: any other control byte, and an invalid UTF-8 byte, becomes
+// six. An answer line over half of MaxOutBytes, whatever its escaping, is
+// replaced by a small isError result "result too large for the output
+// bound", so a result that size behind a backlog under half the bound,
+// which is when the dispatcher starts a request, always leaves room for
+// the reader's own answers.
+func (s *Server) MaxResultBytes() int {
+	return max((s.o.MaxOutBytes/2-resultEnvelopeBytes)/2, 0)
 }
 
 // runHandler calls the tool and turns a panic into a flag so one bad handler
@@ -363,7 +412,7 @@ func (s *Server) callTool(ctx context.Context, params json.RawMessage) (any, *rp
 func (s *Server) runHandler(ctx context.Context, t Tool, args json.RawMessage) (res Result, err error, panicked bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			s.log.Error("tool handler panicked", "tool", t.Name, "panic", fmt.Sprint(r))
+			s.warn("tool handler panicked", t.Name, slog.LevelError, "tool", t.Name, "panic", fmt.Sprint(r))
 			panicked = true
 		}
 	}()

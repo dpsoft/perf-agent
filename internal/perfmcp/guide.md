@@ -1,6 +1,6 @@
 # perf-agent guide
 
-perf-agent-mcp answers questions about perf-agent profiles (pprof `.pb.gz`, with an optional GPU `.execlog`). It is read-only, offline, and every figure comes from an engine, not from you.
+perf-agent-mcp answers questions about perf-agent profiles (pprof `.pb.gz`, with an optional GPU `.execlog`). It is offline, and every figure comes from an engine, not from you. When started with `--perf-agent` it also captures profiles (see Capture loop).
 
 ## Investigation order
 
@@ -17,7 +17,7 @@ Handles and views are explicit and immutable: every call names its `handle` and 
 
 ## Reading the numbers
 
-- Every integer (values, counts, weights, a failure's `explanation` index) is a decimal string. Do not convert it to a float; quote it as the string. Only source line numbers (`line`, `lines[].n`) are JSON integers.
+- Every integer (values, counts, weights, a failure's `explanation` index) is a decimal string. Do not convert it to a float; quote it as the string. Source line numbers (`line`, `lines[].n`) and the capture tools' `sample_rate`, `pid`, `start_time`, counts and `perf_agent_exit` are JSON integers (an embedded `open` or `diff` result keeps strings).
 - A fact has `status` `ok`, `zero` or `unavailable`. An unavailable fact has a `reason` and no `value`: unavailable is not zero, never report it as 0.
 - A share names its `denominator` (`view_total`, parent, ...). Say which one, and copy the fact's denominator and unit into the claim.
 - Lists are paged: `total_rows`, `skipped`, `omitted_count`, `omitted_weight` (with `omitted_weight_basis`) and `next_cursor`. Pass the cursor back with the same arguments. The omitted rows overlap (a callee is inside its caller), so `omitted_weight` is a sum of the rows' own values, never a remaining share.
@@ -27,7 +27,7 @@ Handles and views are explicit and immutable: every call names its `handle` and 
 
 - A width under `[gpu:launch]` is a sample of launches, not a share of GPU time.
 - `[gpu:launch unsampled]` has no caller and is never attributed to a stack.
-- Nothing is multiplied by the sample period to get launches, executions or time: it is never multiplied by the sample period.
+- Launches, executions and time are never multiplied by the sample period.
 - Executions come only from a checked execlog (`open` reports whether one was accepted and why not). Never count samples or execlog rows as executions.
 - Every GPU answer, `render_flamegraph` results included, carries the view's sampling `notes`; read them. A CPU answer has no `notes` key, except `open`, whose `notes` is always present.
 
@@ -68,6 +68,18 @@ Write each figure as a claim and refer to it from the prose. The engine checks t
 - An existing `out` is never replaced: choose a new name. You cannot set rounding or tolerance.
 - When a tool result is an error it says what to call next.
 - A page's follow-up prompts name the profile's path relative to the profiles root and its digest: open that path and check that `profile_digest` matches before answering them.
+
+## Capture loop
+
+The capture tools work only on a server started with `--perf-agent`; otherwise each answers the code `disabled`. Capture only the processes and commands the user's task names: a launched command runs as the user.
+
+1. One `series` per loop. `capture` the base with `pid`, or `command` (argv: `command[0]` an absolute path or a bare name in PATH, never `./x`; no shell), a `label` such as `base`, and `keep: true` so retention never removes it. `duration` defaults to 10s and is at most `Capture.MaxDuration` (30s unless raised; more is `invalid_argument`). `cwd` defaults to the first `--source` root, else the profiles root, and must be inside one of them. It answers `{job, status: "accepted"}` at once.
+2. `capture_wait` with `id` set to that job until it answers the result. Each call waits at most its `timeout` (default 30s, at most 45s, counted from when the server read the call), then answers the job's state (any `status`, `done` with `derived: "pending"` included): call again. Send one capture call at a time: a call queued behind another spends its `timeout` there. The result holds each profile's `open` result with its `handle`.
+3. After a change, `capture` into the same series with `compare_with` set to the base's id: `001`, or `<series>/001` of the same series. It inherits the base's `modes`, `duration`, `sample_rate`, `unwind` and `kernel_stacks`; passing another value is `incomparable`. The result's `compare` holds the first diff rows of each view and `next`, the `diff` call for the rest.
+4. Read `comparability` in `compare` before trusting the diff: `settings`, `target_exe` (same or changed build-id), and both sides' `profiled_duration` and `attach_latency`. Totals are not normalised; pass `work_base` and `work_new` to `diff` for per-unit deltas. Read the `notes` too.
+5. A failure is an isError result whose text is one JSON object, `{"error": {"code", "message", "retryable", "retry_after", "next", ...}}`. Branch on `error.code` and `retryable`, never on the message, and follow `next`. `capture` itself refuses only at once (an argument, `busy` with this server's job, `budget`, `disabled`, `closing`); a later failure (`busy` from another server, command not found, too many kept captures, `disk`, `exists`, ...) is the job's, answered by `capture_wait` with `job`, `status` and, once assigned, `capture_id`. `busy` and `budget`: retry after `retry_after`. `incomparable`, `unknown_baseline`: the compare is wrong, not the capture. `stuck_child`: do not retry; tell the user. `target_exited`, `no_output`: follow `next`; retry only if `retryable`. `closing`: the server is shutting down; start a new one. `cancelled` with `status: "interrupted"` and `retryable: true`: the server ended under the capture; capture again. `derived: "failed"` on a done capture: its files are kept, only the open or diff failed (`derive_error`).
+6. After a server restart, or once the server no longer holds the job, wait by capture id `<series>/NNN` (`capture` in `capture_list` and the result, `capture_id` in states and errors; a bare `NNN` is refused). The answer comes from the manifest with `derived: "recompute"` and `handles: "reopen"` (also when the store closed a handle): run the calls of `recompute` (its `steps`) in order, where `${<bind>.handle}` and `${<bind>.default_view}` are the handle and default view of the step bound as `<bind>` (each diff uses `${new_<mode>.default_view}` for both views). `status` `loading` or `in_progress` (another server, or recovery, has yet to write its manifest): call again after `retry_after`; `next` says when to stop.
+7. `capture_cancel` stops a job; `capture_list` shows the running job and each series' history.
 
 ## Claimable metrics
 

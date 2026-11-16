@@ -1,0 +1,674 @@
+package capture
+
+import (
+	"bufio"
+	"bytes"
+	"debug/elf"
+	"encoding/binary"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+// ourSelf is this test process as the server.
+func ourSelf() SelfID {
+	return SelfID{UID: os.Getuid(), GID: os.Getgid(), PID: os.Getpid()}
+}
+
+// fakeStat is a /proc/<pid>/stat line with the given comm, state and
+// start time (field 22).
+func fakeStat(pid int, comm, state string, start uint64) string {
+	return fmt.Sprintf("%d (%s) %s 1 1 1 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 %d 1000 100\n", pid, comm, state, start)
+}
+
+// fakeStatus is a /proc/<pid>/status excerpt.
+func fakeStatus(uids, gids, capPrm string) string {
+	return "Name:\tfake\nUmask:\t0022\nState:\tS (sleeping)\n" +
+		"Uid:\t" + uids + "\nGid:\t" + gids + "\n" +
+		"CapInh:\t0000000000000000\nCapPrm:\t" + capPrm + "\nCapEff:\t" + capPrm + "\n"
+}
+
+// fakeProc builds a proc tree with one process: its stat, status and
+// maps (each skipped when empty), an exe link (none when exe is empty)
+// and a root link to "/".
+func fakeProc(t *testing.T, pid int, stat, status, maps, exe string) Proc {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, strconv.Itoa(pid))
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{"stat": stat, "status": status, "maps": maps} {
+		if body == "" {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if exe != "" {
+		if err := os.Symlink(exe, filepath.Join(dir, "exe")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink("/", filepath.Join(dir, "root")); err != nil {
+		t.Fatal(err)
+	}
+	return Proc{Root: root}
+}
+
+// ids is "n n n n", the four ids of a status Uid or Gid line.
+func ids(n int) string { return strings.Repeat(strconv.Itoa(n)+"\t", 3) + strconv.Itoa(n) }
+
+// waitState polls /proc/<pid>/stat until its state is one of want.
+func waitState(t *testing.T, pid int, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+		if err == nil {
+			_, after, _ := strings.Cut(string(b[strings.LastIndexByte(string(b), ')')+1:]), " ")
+			if strings.ContainsAny(after[:1], want) {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("pid %d never reached state %s", pid, want)
+}
+
+func TestPreflightAcceptsAChildOfOurs(t *testing.T) {
+	c := startChild(t, "sleep")
+	st, e := Preflight(DefaultProc(), c.PID, ourSelf())
+	if e != nil {
+		t.Fatalf("a child of ours: %v", e)
+	}
+	start, err := StartTime(DefaultProc(), c.PID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.PID != c.PID || st.StartTime != start || start == 0 {
+		t.Fatalf("state pid %d start %d, want pid %d start %d (non-zero)", st.PID, st.StartTime, c.PID, start)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Base(self)[:min(15, len(filepath.Base(self)))]; st.Comm != want {
+		t.Fatalf("comm %q, want %q", st.Comm, want)
+	}
+	if st.Exe != self {
+		t.Fatalf("exe %q, want %q", st.Exe, self)
+	}
+	uid, gid := os.Getuid(), os.Getgid()
+	if st.UIDs != [4]int{uid, uid, uid, uid} || st.GIDs != [4]int{gid, gid, gid, gid} || st.StatusOwner != uid || st.CapPrm != 0 {
+		t.Fatalf("ids %v %v, status owner %d, CapPrm %#x; want all %d / %d and no capabilities", st.UIDs, st.GIDs, st.StatusOwner, st.CapPrm, uid, gid)
+	}
+	if st.BuildID == "" || len(st.BuildID)%2 != 0 || strings.Trim(st.BuildID, "0123456789abcdef") != "" {
+		t.Fatalf("build-id %q, want lower-case hex", st.BuildID)
+	}
+	// The same file reached through another exe link has the same build-id.
+	p := fakeProc(t, 7, fakeStat(7, "x", "S", 1), "", "", self)
+	if got := ReadBuildID(p, 7); got != st.BuildID {
+		t.Fatalf("build-id through a fake exe link %q, want %q", got, st.BuildID)
+	}
+	if got := ReadBuildID(fakeProc(t, 8, "", "", "", ""), 8); got != "" {
+		t.Fatalf("build-id without an exe %q, want none", got)
+	}
+}
+
+func TestPreflightRefuses(t *testing.T) {
+	c := startChild(t, "sleep")
+	self := ourSelf()
+	exclude := self
+	exclude.Exclude = func(pid int) bool { return pid == c.PID }
+	otherGID := self
+	otherGID.GID++
+
+	gone := startChild(t, "sleep")
+	if err := gone.reap(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		pid  int
+		self SelfID
+		code Code
+		want string
+	}{
+		{"pid 1", 1, self, CodeTargetRefused, "pid 1"},
+		{"the server itself", os.Getpid(), self, CodeTargetRefused, "this server"},
+		{"an excluded child", c.PID, exclude, CodeTargetRefused, "perf-agent or a reaper"},
+		{"a reaped child", gone.PID, self, CodeTargetNotFound, strconv.Itoa(gone.PID)},
+		{"another gid", c.PID, otherGID, CodeTargetRefused, "gid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, e := Preflight(DefaultProc(), tc.pid, tc.self)
+			targetError(t, e, tc.code, tc.want)
+		})
+	}
+
+	t.Run("a kernel thread", func(t *testing.T) {
+		if b, err := os.ReadFile("/proc/2/comm"); err != nil || strings.TrimSpace(string(b)) != "kthreadd" {
+			t.Skipf("pid 2 is not kthreadd here (%q, %v)", b, err)
+		}
+		_, e := Preflight(DefaultProc(), 2, self)
+		targetError(t, e, CodeTargetRefused, "kernel thread")
+	})
+
+	uid, gid := os.Getuid(), os.Getgid()
+	for _, tc := range []struct {
+		name, status, want string
+	}{
+		{"a saved uid", fakeStatus(fmt.Sprintf("%d\t%d\t%d\t%d", uid, uid, uid+1, uid), ids(gid), zero), "saved uid"},
+		{"an fs gid", fakeStatus(ids(uid), fmt.Sprintf("%d\t%d\t%d\t%d", gid, gid, gid, gid+1), zero), "filesystem gid"},
+		{"capabilities", fakeStatus(ids(uid), ids(gid), "0000000000080000"), "cap_sys_ptrace"},
+		{"three uids", fakeStatus(fmt.Sprintf("%d\t%d\t%d", uid, uid, uid), ids(gid), zero), "Uid"},
+		{"no CapPrm", "Uid:\t" + ids(uid) + "\nGid:\t" + ids(gid) + "\n", "CapPrm"},
+		{"Gid twice", fakeStatus(ids(uid), ids(gid), zero) + "Gid:\t" + ids(gid) + "\n", "Gid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := fakeProc(t, 42, fakeStat(42, "fake", "S", 9), tc.status, "", "/bin/true")
+			_, e := Preflight(p, 42, self)
+			targetError(t, e, CodeTargetRefused, tc.want)
+		})
+	}
+}
+
+func TestPreflightRefusesANonDumpableChild(t *testing.T) {
+	c := startChild(t, "nondumpable")
+	if reason, skip := strings.CutPrefix(c.Line, "skip "); skip {
+		t.Skip(reason)
+	}
+	_, e := Preflight(DefaultProc(), c.PID, ourSelf())
+	targetError(t, e, CodeTargetRefused, "not dumpable")
+}
+
+// TestPreflightRefusesAChangedGID: a child that asked to move its
+// effective gid to a supplementary group is refused when the kernel let
+// it, and accepted with its unchanged credentials when it did not (an
+// unprivileged setresgid may only pick the current real, effective or
+// saved gid).
+func TestPreflightRefusesAChangedGID(t *testing.T) {
+	c := startChild(t, "setresgid")
+	_, e := Preflight(DefaultProc(), c.PID, ourSelf())
+	if c.Line == "ready" {
+		targetError(t, e, CodeTargetRefused, "effective gid")
+		return
+	}
+	if !strings.HasPrefix(c.Line, "skip ") {
+		t.Fatalf("child printed %q", c.Line)
+	}
+	if e != nil {
+		t.Fatalf("the gid change failed (%s), yet the preflight refused: %v", c.Line, e)
+	}
+}
+
+// TestPreflightNeverConsultsTheProcDirOwner pins §6.3: dumpability is the
+// exe link and the status owner, never the /proc/<pid> directory owner.
+func TestPreflightNeverConsultsTheProcDirOwner(t *testing.T) {
+	c := startChild(t, "sleep")
+	dir := filepath.Join("/proc", strconv.Itoa(c.PID))
+	status := filepath.Join(dir, "status")
+	uid := os.Getuid()
+	for _, tc := range []struct {
+		name              string
+		dirOwner, stOwner int
+		ok                bool
+	}{
+		{"directory root, status ours", 0, uid, true},
+		{"directory ours, status root", uid, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var asked []string
+			p := DefaultProc()
+			p.owner = func(path string) (int, error) {
+				asked = append(asked, path)
+				switch filepath.Clean(path) {
+				case dir:
+					return tc.dirOwner, nil
+				case status:
+					return tc.stOwner, nil
+				}
+				return uid, nil
+			}
+			st, e := Preflight(p, c.PID, ourSelf())
+			switch {
+			case tc.ok && e != nil:
+				t.Fatalf("refused: %v", e)
+			case !tc.ok:
+				targetError(t, e, CodeTargetRefused, "not dumpable")
+			case st.StatusOwner != tc.stOwner:
+				t.Fatalf("status owner %d, want %d", st.StatusOwner, tc.stOwner)
+			}
+			if !slices.Contains(asked, status) {
+				t.Fatalf("the status owner was never asked (asked %q)", asked)
+			}
+			for _, a := range asked {
+				if filepath.Clean(a) == dir {
+					t.Fatalf("the /proc/<pid> directory owner was asked (asked %q)", asked)
+				}
+			}
+		})
+	}
+}
+
+// TestObserveSeesADumpableDrop is the recheck: a target that passed the
+// preflight and then turned non-dumpable is still observed, and Compare
+// names the change instead of losing it to a refusal.
+func TestObserveSeesADumpableDrop(t *testing.T) {
+	c := startChild(t, "drop-dumpable")
+	was, e := Preflight(DefaultProc(), c.PID, ourSelf())
+	if e != nil {
+		t.Fatal(e)
+	}
+	if !was.ExeReadable {
+		t.Fatal("a passing preflight has an unreadable exe")
+	}
+	if err := syscall.Kill(c.PID, syscall.SIGUSR1); err != nil {
+		t.Fatal(err)
+	}
+	if l := c.next(t); l != "dropped" {
+		t.Fatalf("child printed %q, want dropped", l)
+	}
+	now, e := Observe(DefaultProc(), c.PID)
+	if e != nil {
+		t.Fatalf("observe after the drop: %v", e)
+	}
+	if now.ExeReadable || now.StartTime != was.StartTime {
+		t.Fatalf("after the drop: exe readable %v, start %d (was %d)", now.ExeReadable, now.StartTime, was.StartTime)
+	}
+	e = was.Compare(now)
+	targetError(t, e, CodeTargetChanged, "dumpable")
+	if e.Changed != "dumpable" {
+		t.Fatalf("changed %q, want dumpable", e.Changed)
+	}
+	_, e = Preflight(DefaultProc(), c.PID, ourSelf())
+	targetError(t, e, CodeTargetRefused, "not dumpable")
+}
+
+// TestObserveRereadsTheStartTime: a start time that differs between the
+// first and the last stat read means the pid now names another process,
+// whether or not its exe link was readable.
+func TestObserveRereadsTheStartTime(t *testing.T) {
+	uid, gid := os.Getuid(), os.Getgid()
+	for _, exe := range []string{"", "/bin/true"} {
+		p := fakeProc(t, 44, fakeStat(44, "fake", "S", 9), fakeStatus(ids(uid), ids(gid), zero), "", exe)
+		calls := 0
+		p.StartTimeHook = func(_ int, s uint64) uint64 {
+			calls++
+			return s + uint64(calls)
+		}
+		_, e := Observe(p, 44)
+		targetError(t, e, CodeTargetNotFound, "44")
+		calls = 0
+		_, e = Preflight(p, 44, ourSelf())
+		targetError(t, e, CodeTargetNotFound, "44")
+	}
+}
+
+// TestCompareNamesWhatChanged pins the §6.3 recheck: credentials,
+// dumpability, CapPrm and the start time. An exec of an ordinary program
+// changes none of them and is not a change.
+func TestCompareNamesWhatChanged(t *testing.T) {
+	was := TargetState{
+		PID: 5, StartTime: 100,
+		UIDs: [4]int{1000, 1000, 1000, 1000}, GIDs: [4]int{1000, 1000, 1000, 1000},
+		StatusOwner: 1000, ExeReadable: true, Comm: "app", Exe: "/usr/bin/app", BuildID: "ab",
+	}
+	if e := was.Compare(was); e != nil {
+		t.Fatalf("equal states: %v", e)
+	}
+	execd := was
+	execd.Comm, execd.Exe, execd.BuildID = "other", "/usr/bin/other", "cd"
+	if e := was.Compare(execd); e != nil {
+		t.Fatalf("an exec with the same credentials: %v", e)
+	}
+	for _, tc := range []struct {
+		name    string
+		change  func(*TargetState)
+		code    Code
+		changed string
+	}{
+		{"start time", func(s *TargetState) { s.StartTime++; s.GIDs[1] = 0 }, CodePIDReused, ""},
+		{"effective gid", func(s *TargetState) { s.GIDs[1] = 10 }, CodeTargetChanged, "gid"},
+		{"saved uid", func(s *TargetState) { s.UIDs[2] = 0 }, CodeTargetChanged, "uid"},
+		{"status owner", func(s *TargetState) { s.StatusOwner = 0 }, CodeTargetChanged, "dumpable"},
+		{"exe unreadable", func(s *TargetState) { s.ExeReadable = false }, CodeTargetChanged, "dumpable"},
+		{"nothing observed", func(s *TargetState) { *s = TargetState{} }, CodeTargetChanged, "unreadable"},
+		{"CapPrm", func(s *TargetState) { s.CapPrm = 1 << CapSysAdmin }, CodeTargetChanged, "capabilities"},
+		{"uid and gid", func(s *TargetState) { s.UIDs[0], s.GIDs[3] = 0, 0 }, CodeTargetChanged, "uid,gid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := was
+			tc.change(&now)
+			e := was.Compare(now)
+			targetError(t, e, tc.code, strconv.Itoa(was.PID))
+			if e.Changed != tc.changed {
+				t.Fatalf("changed %q, want %q", e.Changed, tc.changed)
+			}
+		})
+	}
+}
+
+func TestStartTimeReadsField22AfterTheLastParen(t *testing.T) {
+	p := fakeProc(t, 9, fakeStat(9, "a) S (b 1 2", "S", 4242), "", "", "")
+	got, err := StartTime(p, 9)
+	if err != nil || got != 4242 {
+		t.Fatalf("start time %d, %v; want 4242", got, err)
+	}
+	for _, bad := range []string{"9 (x) S 1 2\n", "9 (x S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 77\n", fakeStat(9, "x", "S", 0)[:20] + "zz 1 2\n"} {
+		p := fakeProc(t, 9, bad, "", "", "")
+		if got, err := StartTime(p, 9); err == nil {
+			t.Fatalf("stat %q: start time %d, want an error", bad, got)
+		}
+	}
+}
+
+func TestStartTimeHookFeedsReuse(t *testing.T) {
+	c := startChild(t, "sleep")
+	actual, err := StartTime(DefaultProc(), c.PID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hooked := DefaultProc()
+	hooked.StartTimeHook = func(pid int, start uint64) uint64 {
+		if pid != c.PID {
+			t.Errorf("hook called for pid %d, want %d", pid, c.PID)
+		}
+		return start + 7
+	}
+	if got, err := StartTime(hooked, c.PID); err != nil || got != actual+7 {
+		t.Fatalf("hooked start time %d, %v; want %d", got, err, actual+7)
+	}
+	was, e := Preflight(DefaultProc(), c.PID, ourSelf())
+	if e != nil {
+		t.Fatal(e)
+	}
+	now, e := Preflight(hooked, c.PID, ourSelf())
+	if e != nil {
+		t.Fatal(e)
+	}
+	if now.StartTime != actual+7 {
+		t.Fatalf("hooked preflight start time %d, want %d", now.StartTime, actual+7)
+	}
+	targetError(t, was.Compare(now), CodePIDReused, "reused")
+}
+
+// TestAliveSeesExitAndReuse: alive is the recorded instance in a state
+// other than Z, X or x. A child that exited is not alive while its parent
+// has not reaped it yet, and is not found once it has.
+func TestAliveSeesExitAndReuse(t *testing.T) {
+	p := DefaultProc()
+	c := startChild(t, "sleep")
+	start, err := StartTime(p, c.PID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !Alive(p, c.PID, start) {
+		t.Fatal("a running child is not alive")
+	}
+
+	if err := syscall.Kill(c.PID, syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, c.PID, "T")
+	if !Alive(p, c.PID, start) {
+		t.Fatal("a stopped child is not alive")
+	}
+	if err := syscall.Kill(c.PID, syscall.SIGCONT); err != nil {
+		t.Fatal(err)
+	}
+
+	c.exit()
+	waitExitedNoReap(t, c.PID)
+	if Alive(p, c.PID, start) {
+		t.Fatal("an exited, unreaped child is alive")
+	}
+	_, e := Preflight(p, c.PID, ourSelf())
+	targetError(t, e, CodeTargetExited, "exited")
+
+	if err := c.reap(); err != nil {
+		t.Fatal(err)
+	}
+	if Alive(p, c.PID, start) {
+		t.Fatal("a reaped child is alive")
+	}
+	_, e = Preflight(p, c.PID, ourSelf())
+	targetError(t, e, CodeTargetNotFound, strconv.Itoa(c.PID))
+
+	// The same PID with another start time is another process.
+	c2 := startChild(t, "sleep")
+	start2, err := StartTime(p, c2.PID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reused := p
+	reused.StartTimeHook = func(_ int, s uint64) uint64 { return s + 1 }
+	if Alive(reused, c2.PID, start2) || Alive(p, c2.PID, start2+1) {
+		t.Fatal("a process with another start time is alive as the recorded one")
+	}
+
+	for state, alive := range map[string]bool{"R": true, "S": true, "D": true, "T": true, "t": true, "I": true, "Z": false, "X": false, "x": false} {
+		fp := fakeProc(t, 11, fakeStat(11, "w", state, 500), "", "", "")
+		if got := Alive(fp, 11, 500); got != alive {
+			t.Errorf("state %s: alive %v, want %v", state, got, alive)
+		}
+	}
+}
+
+// A task that has begun exiting (PF_EXITING in its stat flags) has ended,
+// whatever its state says: after exit_mm it is still R or S, but its exe
+// link is gone, which a recheck must not read as a change of dumpability.
+func TestAnExitingTaskHasEnded(t *testing.T) {
+	const pfExiting = 0x4
+	exiting := strings.Replace(fakeStat(11, "w", "S", 500), " 4194304 ", " "+strconv.Itoa(4194304|pfExiting)+" ", 1)
+	status := fakeStatus(ids(os.Getuid()), ids(os.Getgid()), "0000000000000000")
+	fp := fakeProc(t, 11, exiting, status, "", "")
+	if Alive(fp, 11, 500) {
+		t.Error("an exiting task is alive")
+	}
+	if _, e := Observe(fp, 11); errCode(e) != CodeTargetExited {
+		t.Errorf("Observe of an exiting task = %v, want target_exited", e)
+	}
+	if e := vanished(fp, 11, 500); errCode(e) != CodeTargetExited || e.Retryable {
+		t.Errorf("vanished of an exiting task = %v, want target_exited", e)
+	}
+	// Other flags leave a task alive.
+	live := fakeProc(t, 11, fakeStat(11, "w", "S", 500), status, "", "/bin/true")
+	if !Alive(live, 11, 500) {
+		t.Error("a task without PF_EXITING is not alive")
+	}
+}
+
+func TestCheckShimMapped(t *testing.T) {
+	shimFile := filepath.Join(t.TempDir(), "libcupti_shim.so")
+	if err := os.WriteFile(shimFile, []byte("shim"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(t.TempDir(), "libother.so")
+	if err := os.WriteFile(other, []byte("other"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Stat(shimFile, &st); err != nil {
+		t.Fatal(err)
+	}
+	shim := Shim{Path: shimFile, Dev: uint64(st.Dev), Ino: st.Ino}
+	devField := fmt.Sprintf("%02x:%02x", unix.Major(shim.Dev), unix.Minor(shim.Dev))
+	line := func(dev string, ino uint64, path string) string {
+		return fmt.Sprintf("7f0000000000-7f0000001000 r-xp 00000000 %s %d    %s\n", dev, ino, path)
+	}
+	head := line("fd:01", 1111, "/usr/bin/app") + "7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0    [stack]\n"
+
+	wrongDev := shim
+	wrongDev.Dev++
+	odd := map[string]Shim{}
+	for _, name := range []string{"two  spaces.so", "with\ttab.so", "trailing.so "} {
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, []byte("shim"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var st syscall.Stat_t
+		if err := syscall.Stat(path, &st); err != nil {
+			t.Fatal(err)
+		}
+		odd[name] = Shim{Path: path, Dev: uint64(st.Dev), Ino: st.Ino}
+	}
+	for _, tc := range []struct {
+		name, maps string
+		shim       Shim
+		ok         bool
+	}{
+		{"the shim's dev:ino", head + line(devField, shim.Ino, shimFile), shim, true},
+		// btrfs reports one dev in maps and another to stat for the same
+		// inode; the mapped path, resolved in the target's root, is the shim.
+		{"another dev, the shim's path", head + line("00:99", shim.Ino, shimFile), shim, true},
+		{"another inode", head + line(devField, shim.Ino+1, shimFile), shim, false},
+		{"another dev, another file", head + line("00:99", shim.Ino, other), shim, false},
+		// The path names a file with the inode but on another dev than the
+		// shim's: the inode number alone is no match.
+		{"the inode on another dev", head + line("00:99", shim.Ino, shimFile), wrongDev, false},
+		// A deleted mapping is not the file now at that path.
+		{"a deleted mapping", head + line("00:99", shim.Ino, shimFile+" (deleted)"), shim, false},
+		{"not mapped", head, shim, false},
+		// The path is the rest of the line byte for byte.
+		{"two spaces", line("ff:ff", odd["two  spaces.so"].Ino, odd["two  spaces.so"].Path), odd["two  spaces.so"], true},
+		{"a tab", line("ff:ff", odd["with\ttab.so"].Ino, odd["with\ttab.so"].Path), odd["with\ttab.so"], true},
+		{"a trailing space", line("ff:ff", odd["trailing.so "].Ino, odd["trailing.so "].Path), odd["trailing.so "], true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := fakeProc(t, 33, fakeStat(33, "app", "S", 1), "", tc.maps, "")
+			e := CheckShimMapped(p, 33, tc.shim)
+			if tc.ok {
+				if e != nil {
+					t.Fatalf("mapped: %v", e)
+				}
+				return
+			}
+			targetError(t, e, CodeGPUNotInjected, "did not load the CUPTI adapter")
+			if want := "restart it with CUDA_INJECTION64_PATH=" + tc.shim.Path + ", or capture it as a command"; e.Next != want || strings.Contains(e.Message, "restart") {
+				t.Fatalf("message %q, next %q; want the instruction %q in next only", e.Message, e.Next, want)
+			}
+		})
+	}
+
+	t.Run("a live process and its shared library", func(t *testing.T) {
+		sleep, err := exec.LookPath("sleep")
+		if err != nil {
+			t.Skip(err)
+		}
+		cmd := exec.Command(sleep, "30")
+		cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+		lib := mappedLibrary(t, cmd.Process.Pid)
+		var st syscall.Stat_t
+		if err := syscall.Stat(lib, &st); err != nil {
+			t.Fatal(err)
+		}
+		if e := CheckShimMapped(DefaultProc(), cmd.Process.Pid, Shim{Path: lib, Dev: uint64(st.Dev), Ino: st.Ino}); e != nil {
+			t.Fatalf("%s mapped by %s: %v", lib, sleep, e)
+		}
+	})
+}
+
+// mappedLibrary waits for pid to map a shared library and returns its path.
+func mappedLibrary(t *testing.T, pid int) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		f, err := os.Open("/proc/" + strconv.Itoa(pid) + "/maps")
+		if err != nil {
+			t.Fatal(err)
+		}
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			fields := strings.Fields(sc.Text())
+			if len(fields) == 6 && strings.Contains(filepath.Base(fields[5]), ".so") {
+				_ = f.Close()
+				return fields[5]
+			}
+		}
+		_ = f.Close()
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Skipf("pid %d mapped no shared library (a static sleep?)", pid)
+	return ""
+}
+
+// writeNoteELF writes a minimal ELF64 file whose only section is a
+// .note.gnu.build-id note with the given owner name and descriptor.
+func writeNoteELF(t *testing.T, path, name string, desc []byte) {
+	t.Helper()
+	pad := func(b []byte) []byte { return append(b, make([]byte, (4-len(b)%4)%4)...) }
+	var note bytes.Buffer
+	nameBytes := append([]byte(name), 0)
+	for _, v := range []uint32{uint32(len(nameBytes)), uint32(len(desc)), 3 /* NT_GNU_BUILD_ID */} {
+		_ = binary.Write(&note, binary.LittleEndian, v)
+	}
+	note.Write(pad(nameBytes))
+	note.Write(pad(slices.Clone(desc)))
+	strtab := []byte("\x00.note.gnu.build-id\x00.shstrtab\x00")
+
+	const ehsize, shentsize = 64, 64
+	noteOff := uint64(ehsize)
+	strOff := noteOff + uint64(note.Len())
+	shOff := (strOff + uint64(len(strtab)) + 7) &^ 7
+	var out bytes.Buffer
+	hdr := elf.Header64{
+		Type: uint16(elf.ET_EXEC), Machine: uint16(elf.EM_X86_64), Version: uint32(elf.EV_CURRENT),
+		Shoff: shOff, Ehsize: ehsize, Shentsize: shentsize, Shnum: 3, Shstrndx: 2,
+	}
+	copy(hdr.Ident[:], []byte{0x7f, 'E', 'L', 'F', byte(elf.ELFCLASS64), byte(elf.ELFDATA2LSB), byte(elf.EV_CURRENT)})
+	_ = binary.Write(&out, binary.LittleEndian, hdr)
+	out.Write(note.Bytes())
+	out.Write(strtab)
+	out.Write(make([]byte, shOff-uint64(out.Len())))
+	for _, sh := range []elf.Section64{
+		{},
+		{Name: 1, Type: uint32(elf.SHT_NOTE), Flags: uint64(elf.SHF_ALLOC), Off: noteOff, Size: uint64(note.Len()), Addralign: 4},
+		{Name: 20, Type: uint32(elf.SHT_STRTAB), Off: strOff, Size: uint64(len(strtab)), Addralign: 1},
+	} {
+		_ = binary.Write(&out, binary.LittleEndian, sh)
+	}
+	if err := os.WriteFile(path, out.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadBuildIDReadsTheDescriptor(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		name, owner string
+		desc        []byte
+		want        string
+	}{
+		// descsz (8) differs from namesz (4), so the length is the descriptor's.
+		{"gnu", "GNU", []byte{0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4}, "deadbeef01020304"},
+		{"twenty bytes", "GNU", bytes.Repeat([]byte{0xab}, 20), strings.Repeat("ab", 20)},
+		{"another owner", "Go", []byte{1, 2, 3, 4}, ""},
+		{"no descriptor", "GNU", nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			exe := filepath.Join(dir, tc.name)
+			writeNoteELF(t, exe, tc.owner, tc.desc)
+			p := fakeProc(t, 5, fakeStat(5, "x", "S", 1), "", "", exe)
+			if got := ReadBuildID(p, 5); got != tc.want {
+				t.Fatalf("build-id %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

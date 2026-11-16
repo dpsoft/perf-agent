@@ -6,9 +6,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -552,5 +557,90 @@ func TestAnUnknownMethodIsEchoedBounded(t *testing.T) {
 	r := c.call(`{"jsonrpc":"2.0","id":2,"method":"` + strings.Repeat("m", 100000) + `"}`)
 	if r.Error == nil || r.Error.Code != -32601 || len(r.Error.Message) > 200 || !strings.Contains(r.Error.Message, "mmmm") {
 		t.Errorf("error = %.300v", r.Error)
+	}
+}
+
+// stuckLog is a log destination that never returns from Write, as a
+// full stderr nobody reads; writes counts the writes begun.
+type stuckLog struct {
+	writes  atomic.Int64
+	release chan struct{}
+}
+
+func (w *stuckLog) Write(b []byte) (int, error) {
+	w.writes.Add(1)
+	<-w.release
+	return len(b), nil
+}
+
+// A warning on the reader's path never waits for the log: with the log
+// blocked, client responses are still read and dropped, the end of the
+// input is still seen, and each kind of warning is written once.
+func TestAWarningNeverHoldsTheReader(t *testing.T) {
+	w := &stuckLog{release: make(chan struct{})}
+	t.Cleanup(func() { close(w.release) })
+	o := testOptions()
+	o.Log = slog.New(slog.NewTextHandler(w, nil))
+	sr, cw := io.Pipe()
+	s := New(o)
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(t.Context(), sr, io.Discard) }()
+	go func() {
+		for range 3000 {
+			if _, err := io.WriteString(cw, `{"jsonrpc":"2.0","id":"x","result":{}}`+"\n"); err != nil {
+				return
+			}
+		}
+		_ = cw.Close()
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		_ = cw.Close()
+		t.Fatal("the server did not see the end of its input with the log blocked")
+	}
+	if n := w.writes.Load(); n > 1 {
+		t.Errorf("%d log writes for one kind of warning", n)
+	}
+}
+
+// syncLog is a log destination a test reads back.
+type syncLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *syncLog) Write(b []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(b)
+}
+
+func (l *syncLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// A warning is logged once per kind and tool: a second tool's panic is
+// logged with its own name, not counted as the first one's.
+func TestAPanicIsLoggedOncePerTool(t *testing.T) {
+	var log syncLog
+	o := testOptions()
+	o.Log = slog.New(slog.NewTextHandler(&log, nil))
+	o.Tools = append(o.Tools, Tool{Name: "boom2", Description: "panics too",
+		Handler: func(context.Context, json.RawMessage) (Result, error) { panic("kaboom2") }})
+	c := newClient(t, o)
+	c.init()
+	for i, tool := range []string{"boom", "boom", "boom2"} {
+		c.call(fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":%q,"arguments":{}}}`, i+2, tool))
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(log.String(), "tool=boom2") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	got := log.String()
+	if strings.Count(got, "tool=boom ") != 1 || strings.Count(got, "tool=boom2") != 1 {
+		t.Errorf("log:\n%s", got)
 	}
 }

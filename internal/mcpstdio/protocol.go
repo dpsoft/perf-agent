@@ -7,7 +7,9 @@ package mcpstdio
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
+	"time"
 )
 
 // LatestVersion is the protocol revision answered when the client asks for a
@@ -24,10 +26,48 @@ const (
 	codeMethodNotFound = -32601
 	codeInvalidParams  = -32602
 	codeInternalError  = -32603
+	// codeServerBusy answers a request that finds the request queue full.
+	codeServerBusy = -32000
 )
 
-// defaultMaxMessageBytes bounds one input line when Options.MaxMessageBytes is 0.
-const defaultMaxMessageBytes = 4 << 20
+// Defaults for the zero Options fields.
+const (
+	defaultMaxMessageBytes = 4 << 20
+	defaultMaxQueued       = 8
+	defaultMaxOutMessages  = 64
+	defaultMaxOutBytes     = 4 << 20
+	defaultDrainTimeout    = time.Second
+	defaultStallTimeout    = 30 * time.Second
+)
+
+// ErrClientGone is what Serve returns when the client stopped reading its
+// output: a message did not fit in the output queue, a write failed, or the
+// final drain ran out of time.
+var ErrClientGone = errors.New("mcpstdio: the client stopped reading its output")
+
+// CloseReason says why a session ended.
+type CloseReason int
+
+const (
+	// CloseEOF: the input ended (or could not be read).
+	CloseEOF CloseReason = iota
+	// CloseClientGone: the client stopped reading its output.
+	CloseClientGone
+	// CloseContext: the context passed to Serve ended.
+	CloseContext
+)
+
+func (r CloseReason) String() string {
+	switch r {
+	case CloseEOF:
+		return "eof"
+	case CloseClientGone:
+		return "client gone"
+	case CloseContext:
+		return "context done"
+	}
+	return "unknown"
+}
 
 // Implementation identifies the server to the client.
 type Implementation struct {
@@ -62,6 +102,15 @@ type Tool struct {
 	InputSchema json.RawMessage `json:"inputSchema"`
 	Annotations Annotations     `json:"annotations"`
 	Handler     Handler         `json:"-"`
+	// Control marks a tool whose calls are answered on the reader
+	// goroutine, ahead of the queued requests, once initialize has
+	// completed (before that they queue like any request). Its Handler
+	// runs concurrently with the handler the dispatcher is running, so it
+	// must not touch state that only the request handlers own. It must not
+	// block either: while it runs no input is read, so it must do no I/O,
+	// wait on nothing and take no lock that is held across I/O or across
+	// another handler. Progress does nothing in it.
+	Control bool `json:"-"`
 }
 
 // Prompt is a static prompt that expands to one user message.
@@ -97,6 +146,40 @@ type Options struct {
 	// Log receives diagnostics; nil discards them. It must not write to the
 	// stream passed to Serve.
 	Log *slog.Logger
+	// MaxQueued bounds the requests waiting behind the one being handled;
+	// one more is answered "server busy" at once. 0 means 8.
+	MaxQueued int
+	// MaxOutMessages and MaxOutBytes bound the messages waiting to be
+	// written. A response that finds the backlog already at a bound means
+	// the client stopped reading, so one response of any size fits behind
+	// a smaller backlog. A request is started, and a notification sent,
+	// only while the backlog is under half of both; a notification is
+	// dropped otherwise. An answer line over half of MaxOutBytes could
+	// fill the backlog to the bound, and then even a small answer from the
+	// reader (server busy, a Control result) would mark the client dead,
+	// so such a line is measured after escaping and replaced by a small
+	// isError result "result too large for the output bound" (an internal
+	// error for a method other than tools/call). Server.MaxResultBytes is
+	// the largest result sure to fit when escaping at most doubles it;
+	// control and invalid UTF-8 bytes escape to six. 0 means 64 messages,
+	// and room for two answers of MaxToolErrorBytes (4 × MaxToolErrorBytes
+	// plus their envelopes; 4 MiB when that is 0).
+	MaxOutMessages int
+	MaxOutBytes    int
+	// DrainTimeout bounds how long Serve, once the input or its context
+	// ended, waits for the queued output to be written. 0 means 1 s.
+	DrainTimeout time.Duration
+	// StallTimeout is how long the output may make no progress, with
+	// messages waiting, before the client is taken as gone. Progress is
+	// counted per finished write, so one line must finish writing within
+	// StallTimeout; the clock runs only while lines wait behind the one
+	// being written, so a single slow line with nothing behind it is not
+	// timed. 0 means 30 s.
+	StallTimeout time.Duration
+	// OnClose, when set, is called once, on Serve's goroutine, when the
+	// session starts to end and before the handlers' contexts are
+	// cancelled. It must not block.
+	OnClose func(CloseReason)
 }
 
 // envelope is the incoming JSON-RPC message. id stays raw so it is echoed

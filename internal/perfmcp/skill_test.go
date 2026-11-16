@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/dpsoft/perf-agent/internal/capture"
 	"github.com/dpsoft/perf-agent/internal/explain"
 )
 
@@ -20,6 +21,21 @@ var skillArgs = []string{
 	"denominator", "unit", "value", "metric", "scope", "node", "facts",
 	"view_total", "source_unverified", "unsampled_portion", "base_handle", "base_view", "new_handle", "new_view",
 	"view_scope", "id", "publication",
+	// The capture loop's arguments, result fields and values; its failure
+	// codes are capture.DefaultRetryable's.
+	"command", "pid", "series", "label", "keep", "job", "timeout", "compare_with", "compare", "next",
+	"error", "code", "retryable", "retry_after", "recompute", "handles", "reopen",
+	"comparability", "status", "done", "interrupted", "derived", "capture_id",
+	"sample_rate", "start_time", "perf_agent_exit",
+}
+
+// captureCodes are the capture failure codes, which the skill may cite.
+func captureCodes() []string {
+	var codes []string
+	for c := range capture.DefaultRetryable {
+		codes = append(codes, string(c))
+	}
+	return codes
 }
 
 // explainCodes reads the failure and notice codes declared in
@@ -69,7 +85,7 @@ func TestSkillNamesExistInTheServer(t *testing.T) {
 		tools = append(tools, tl.Name)
 	}
 	metrics := explain.Metrics()
-	codes := explainCodes(t)
+	codes := append(explainCodes(t), captureCodes()...)
 
 	cited := map[string]bool{}
 	for _, m := range regexp.MustCompile("`([a-z][a-z_]*)`").FindAllStringSubmatch(skill, -1) {
@@ -79,7 +95,7 @@ func TestSkillNamesExistInTheServer(t *testing.T) {
 		known := slices.Contains(tools, word) || slices.Contains(metrics, word) ||
 			slices.Contains(codes, word) || slices.Contains(skillArgs, word)
 		if !known {
-			t.Errorf("the skill cites `%s`, which is no tool, metric, failure or notice code or known argument", word)
+			t.Errorf("the skill cites `%s`, which is no tool, metric, failure, notice or capture code or known argument", word)
 		}
 	}
 
@@ -100,6 +116,7 @@ func TestSkillNamesExistInTheServer(t *testing.T) {
 	// The rules agents most often get wrong are stated as the guide states them.
 	for _, rule := range []string{
 		"Only node facts are claimable", "Never just copy the engine's value", "`facts` under `view_scope`",
+		"`comparability`", "`closing`", "`stuck_child`",
 	} {
 		if !strings.Contains(skill, rule) {
 			t.Errorf("the skill does not say %q", rule)

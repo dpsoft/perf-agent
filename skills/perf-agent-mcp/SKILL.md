@@ -1,11 +1,11 @@
 ---
 name: perf-agent-mcp
-description: Use when asked to investigate, explain or compare CPU or GPU profiles, flame graphs, hot functions, pprof .pb.gz files or perf-agent output, or when perf-agent MCP tools (open, top, render_flamegraph) are available.
+description: Use when asked to investigate, explain or compare CPU or GPU profiles, flame graphs, hot functions, pprof .pb.gz files or perf-agent output, to capture a program's profile and compare a change with a baseline, or when perf-agent MCP tools (open, top, render_flamegraph, capture) are available.
 ---
 
 # Using the perf-agent MCP server
 
-perf-agent-mcp answers questions about perf-agent profiles (pprof `.pb.gz`, with an optional GPU `.execlog`). It is read-only and offline. Every figure comes from an engine, not from you.
+perf-agent-mcp answers questions about perf-agent profiles (pprof `.pb.gz`, with an optional GPU `.execlog`), and, when started with `--perf-agent`, captures new ones. Every figure comes from an engine, not from you.
 
 ## First
 
@@ -15,7 +15,7 @@ Read the server's own guide before the first tool call: the MCP prompt `perf-age
 
 - A question about where time goes in a profile, why something is slow, what changed between two profiles, or what a GPU kernel launch costs.
 - A request for a flame graph with explanations.
-- Not for profiling a live process or writing profiles: this server only reads existing files.
+- Profiling a process or a command of yours, and comparing a change with a baseline, when the server was started with `--perf-agent` (see Capture loop).
 
 ## Workflow
 
@@ -27,11 +27,19 @@ Read the server's own guide before the first tool call: the MCP prompt `perf-age
 6. `render_flamegraph` checks the claims and writes the page. If it is rejected, nothing was written: read every failure, fix them all (for a mismatch, re-check the claim's node and metric rather than copying the value), and call again with `attempt` set to the returned attempt. An existing `out` is never replaced, so use a new name for a new page.
 7. The live page is not part of this server: it will ship with a separate long-lived serve binary. Use `render_flamegraph` when the user wants a page.
 
+## Capture loop
+
+1. `capture` with `command` (an absolute path, or a bare name in PATH; never `./x`) or `pid`, a `series` per loop and a `label`; keep the base with `keep`. It answers a `job` at once. Capture only the processes and commands the user's task names: a launched command runs as the user.
+2. `capture_wait` with `id` set to that `job` (or the capture id `series/NNN`: `capture_id` in states and errors, `capture` in `capture_list` and the result; never the bare `id` `NNN`) until it returns the result; a state answer (any `status`, `done` with `derived` pending included) means call again: each call blocks at most its `timeout` (default 30s, at most 45s, counted from when the server read the call) and returns the state meanwhile. Send one capture call at a time and wait for its answer; never pipeline them: a call queued behind another spends its `timeout` waiting there. The result holds the `handle` of each profile; use it with the tools above.
+3. After a change, `capture` again in the same series with `compare_with` set to the base's id (`001`, or `series/001` of the same series): it inherits the base's settings, and the result's `compare` carries the diff rows and the `next` call for the rest. Read the compare's `comparability` (settings, target build-id, profiled duration, attach latency) before trusting the diff.
+4. A failure is one JSON `error` with a `code`, `retryable`, `retry_after` and `next`: branch on `code` and `retryable`, never on the message, and follow `next`. `busy` and `budget` say when to retry; `incomparable` and `unknown_baseline` mean the compare is wrong, not the capture; `stuck_child` means do not retry, tell the user; `closing` means this server is shutting down and a new one is needed; `cancelled` with `status` `interrupted` means the server ended under the capture: capture again. The guide lists what the other codes ask.
+5. `capture_cancel` stops a job at once; `capture_list` shows the running job and each series' history. After a server restart, wait by the capture's `capture` (`series/NNN`, as `capture_list` shows it): a `capture_wait` on a capture this server no longer holds in memory answers from its manifest with `handles` set to `reopen` and the `recompute` calls that reopen it; run them in order, filling `${<bind>.handle}` and `${new_<mode>.default_view}` from the `open` steps they name.
+
 Every call names its `handle` and `view`; nothing is "current". The exceptions: `open` takes a `path`; `diff` takes `base_handle`, `base_view`, `new_handle` and `new_view`; if a handle is gone, `open` again. Lists are paged: pass `next_cursor` back as `cursor` with the same arguments.
 
 ## Hard rules
 
-- Integers are decimal strings. Quote them as strings; never turn them into floats. The exception is source line numbers, which are JSON integers.
+- Integers are decimal strings. Quote them as strings; never turn them into floats. The exceptions are source line numbers and the capture tools' own integers (`sample_rate`, a target's or survivor's `pid` and `start_time`, `capture_list`'s counts, `perf_agent_exit`), which are JSON integers; the `open` and `diff` results a capture embeds keep strings.
 - A fact is `ok`, `zero` or `unavailable`. Unavailable is not zero: never report it as 0.
 - Say which denominator a share uses (`view_total`, the parent, ...).
 - A width under `[gpu:launch]` is a sample of launches, not a share of GPU time. Never multiply anything by the sample period to get launches, executions or time.

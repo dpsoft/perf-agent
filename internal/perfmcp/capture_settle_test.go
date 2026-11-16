@@ -1,0 +1,355 @@
+package perfmcp
+
+import (
+	"os"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/dpsoft/perf-agent/internal/capture"
+)
+
+// undecidedEnv is an env whose manifest links answer EIO, and whose
+// manifest names cannot be read, while broken is set; made says whether
+// such a link is made all the same.
+type undecidedEnv struct {
+	*jobEnv
+	mu     sync.Mutex
+	broken bool
+}
+
+func newUndecidedEnv(t *testing.T, made bool) *undecidedEnv {
+	return newUndecidedEnvWith(t, made, nil)
+}
+
+// newUndecidedEnvWith is newUndecidedEnv with setup run on the server too.
+func newUndecidedEnvWith(t *testing.T, made bool, setup func(*Server)) *undecidedEnv {
+	u := &undecidedEnv{}
+	u.jobEnv = newJobEnv(t, jobOpts{setup: func(s *Server) {
+		if setup != nil {
+			setup(s)
+		}
+		s.link = func(r *os.Root, oldname, newname string) error {
+			if !u.isBroken(newname) {
+				return r.Link(oldname, newname)
+			}
+			if made {
+				if err := r.Link(oldname, newname); err != nil {
+					return err
+				}
+			}
+			return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: syscall.EIO}
+		}
+	}})
+	landedLstat = func(r *os.Root, name string) (os.FileInfo, error) {
+		if u.isBroken(name) {
+			return nil, syscall.EIO
+		}
+		return r.Lstat(name)
+	}
+	t.Cleanup(func() { landedLstat = (*os.Root).Lstat })
+	return u
+}
+
+func (u *undecidedEnv) isBroken(name string) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.broken && strings.HasSuffix(name, manifestSuffix)
+}
+
+func (u *undecidedEnv) setBroken(b bool) {
+	u.mu.Lock()
+	u.broken = b
+	u.mu.Unlock()
+}
+
+// undecided starts a compare with 001 whose commit ends undecided.
+func (u *undecidedEnv) undecided(t *testing.T) *job {
+	t.Helper()
+	if _, v := u.run(u.request(300 * time.Millisecond)); v.Status != string(jobDone) {
+		t.Fatalf("base: %+v", v)
+	}
+	u.setBroken(true)
+	j := u.start(u.compareRequest("001"))
+	if !eventuallyTrue(30*time.Second, func() bool { return j.view().Phase == phaseUndecided }) {
+		t.Fatalf("view %+v, err %v", j.view(), jobErr(j))
+	}
+	if !eventuallyTrue(5*time.Second, func() bool { return u.s.registry.active.Load() == nil }) {
+		t.Fatal("an undecided job holds the slot")
+	}
+	return j
+}
+
+// An undecided job answers a cancel as pending, from itself, the registry
+// and its alias, and holds no error yet. When it is settled, the cancel is
+// reported as §7.4 says: too late for a commit that was made, cancelled
+// for one that was not. A committed one keeps its baseline in the recipe.
+func TestAnUndecidedJobAnswersPendingAndReportsTheCancel(t *testing.T) {
+	for _, made := range []bool{true, false} {
+		t.Run(map[bool]string{true: "made", false: "not made"}[made], func(t *testing.T) {
+			u := newUndecidedEnv(t, made)
+			j := u.undecided(t)
+			if ce := jobErr(j); ce != nil {
+				t.Errorf("an undecided job holds the error %v", ce)
+			}
+			// The cancel comes through the registry for one, the job for
+			// the other, so each route is shown to record it.
+			if made {
+				if a, _ := u.s.registry.cancel(j.id); a != cancelAnswerPending {
+					t.Errorf("registry cancel %q", a)
+				}
+			} else if a := j.requestCancel(); a != cancelAnswerPending {
+				t.Errorf("job cancel %q", a)
+			}
+			u.s.registry.mu.Lock()
+			alias := u.s.registry.aliases[j.id].answer
+			u.s.registry.mu.Unlock()
+			if alias != cancelAnswerPending {
+				t.Errorf("alias answer %q", alias)
+			}
+			u.setBroken(false)
+			if next, v := u.run(u.request(300 * time.Millisecond)); v.Status != string(jobDone) {
+				t.Fatalf("next: %+v, err %v", v, jobErr(next))
+			}
+			v := j.view()
+			if made {
+				if v.Status != string(jobDone) || v.Derived != derivedRecompute {
+					t.Fatalf("settled %+v, err %v", v, jobErr(j))
+				}
+				r := u.result(j)
+				if r.Cancel != cancelAnswerTooLate || r.Recompute == nil || r.Recompute.Baseline != "present" {
+					t.Errorf("cancel %q, recompute %+v", r.Cancel, r.Recompute)
+				}
+				if a, _ := u.s.registry.cancel(j.id); a != cancelAnswerTooLate {
+					t.Errorf("registry cancel after the settle %q", a)
+				}
+				return
+			}
+			if ce := jobErr(j); v.Status != string(jobCancelled) || ce == nil || ce.Code != capture.CodeCancelled {
+				t.Fatalf("settled %+v, err %v", v, ce)
+			}
+			if m, ok := u.manifestOf("adhoc", "002"); !ok || m.Error == nil || m.Error.Code != string(capture.CodeCancelled) {
+				t.Errorf("manifest %+v", m)
+			}
+			if a, _ := u.s.registry.cancel(j.id); a != cancelAnswerCancelled {
+				t.Errorf("registry cancel after the settle %q", a)
+			}
+		})
+	}
+}
+
+// A manifest that cannot be read when the commit is settled leaves the job
+// undecided for the next pass, which settles it.
+func TestATransientReadKeepsTheJobUndecided(t *testing.T) {
+	u := newUndecidedEnv(t, true)
+	j := u.undecided(t)
+	var fails atomic.Int32
+	fails.Store(1)
+	settleRead = func(ser *os.Root, name string) (manifest, error) {
+		if fails.Add(-1) >= 0 {
+			return manifest{}, &os.PathError{Op: "open", Path: name, Err: syscall.EIO}
+		}
+		return readManifest(ser, name)
+	}
+	t.Cleanup(func() { settleRead = readManifest })
+	u.setBroken(false)
+	u.run(u.request(300 * time.Millisecond))
+	if v := j.view(); v.Status != string(jobCommitting) || v.Phase != phaseUndecided {
+		t.Fatalf("after a failed read %+v", v)
+	}
+	u.run(u.request(300 * time.Millisecond))
+	if v := j.view(); v.Status != string(jobDone) || v.Derived != derivedRecompute {
+		t.Fatalf("after a good read %+v, err %v", v, jobErr(j))
+	}
+}
+
+// An undecided job is never evicted from the registry, whatever MaxJobs
+// says, so a cancel of it is always recorded and reported at the settle.
+func TestAnUndecidedJobIsNeverEvicted(t *testing.T) {
+	for _, made := range []bool{true, false} {
+		t.Run(map[bool]string{true: "made", false: "not made"}[made], func(t *testing.T) {
+			u := newUndecidedEnv(t, made)
+			u.s.registry.mu.Lock()
+			u.s.registry.lim.MaxJobs = 2
+			u.s.registry.mu.Unlock()
+			j := u.undecided(t)
+			for range 3 {
+				if f, v := u.run(u.compareRequest("999")); v.Status != string(jobFailed) {
+					t.Fatalf("filler %+v, err %v", v, jobErr(f))
+				}
+			}
+			u.s.registry.mu.Lock()
+			_, kept := u.s.registry.byJob[j.id]
+			u.s.registry.mu.Unlock()
+			if !kept {
+				t.Fatal("the undecided job was evicted")
+			}
+			if a, _ := u.s.registry.cancel(j.id); a != cancelAnswerPending {
+				t.Fatalf("cancel %q", a)
+			}
+			u.setBroken(false)
+			u.run(u.request(300 * time.Millisecond))
+			if made {
+				if r := u.result(j); r.Cancel != cancelAnswerTooLate {
+					t.Errorf("result cancel %q", r.Cancel)
+				}
+			} else if v := j.view(); v.Status != string(jobCancelled) {
+				t.Errorf("settled %+v, err %v", v, jobErr(j))
+			}
+		})
+	}
+}
+
+// A cancel at every instant of an undecided job's settle gets an answer
+// the job, its manifest and the registry all agree with (§7.4): one before
+// the retry judges the link is honoured (too late once made, cancelled when
+// not); one after the judge finds a link that was not made decided, so the
+// job fails as its failure manifest says and the cancel is told so; one
+// after the final status is answered from it.
+func TestACancelAtEachSettleInstantIsConsistent(t *testing.T) {
+	const (
+		beforeJudge   = "before the judge"
+		atManifest    = "at the failure manifest's write"
+		afterManifest = "after the failure manifest"
+		viaRegistry   = "through the registry after the failure manifest"
+		afterFinal    = "after the final status"
+	)
+	for _, made := range []bool{true, false} {
+		for _, at := range []string{beforeJudge, atManifest, afterManifest, viaRegistry, afterFinal} {
+			if made && at == atManifest {
+				continue
+			}
+			t.Run(map[bool]string{true: "made", false: "not made"}[made]+"/"+at, func(t *testing.T) {
+				u := newUndecidedEnv(t, made)
+				j := u.undecided(t)
+				var answer string
+				var once sync.Once
+				cancel := func() {
+					once.Do(func() {
+						if at == viaRegistry {
+							answer, _ = u.s.registry.cancel(j.id)
+						} else {
+							answer = j.requestCancel()
+						}
+					})
+				}
+				switch at {
+				case beforeJudge:
+					landedLstat = func(r *os.Root, name string) (os.FileInfo, error) {
+						if u.isBroken(name) {
+							return nil, syscall.EIO
+						}
+						if strings.HasPrefix(name, "002-") && strings.HasSuffix(name, manifestSuffix) {
+							cancel()
+						}
+						return r.Lstat(name)
+					}
+				case atManifest:
+					u.s.writeErr = func(op string) error {
+						if op == "manifest temp" {
+							cancel()
+						}
+						return nil
+					}
+				case afterManifest, viaRegistry:
+					settleRead = func(ser *os.Root, name string) (manifest, error) {
+						cancel()
+						return readManifest(ser, name)
+					}
+					t.Cleanup(func() { settleRead = readManifest })
+				}
+				u.setBroken(false)
+				if next, v := u.run(u.request(300 * time.Millisecond)); v.Status != string(jobDone) {
+					t.Fatalf("next: %+v, err %v", v, jobErr(next))
+				}
+				if at == afterFinal {
+					cancel()
+				}
+				v := j.view()
+				m, ok := u.manifestOf("adhoc", "002")
+				if !ok {
+					t.Fatal("no manifest")
+				}
+				after, _ := u.s.registry.cancel(j.id)
+				code := ""
+				if m.Error != nil {
+					code = m.Error.Code
+				}
+				var want struct{ status, outcome, code, answer, after string }
+				switch {
+				case made:
+					want.status, want.outcome, want.answer, want.after = string(jobDone), captureOK, cancelAnswerPending, cancelAnswerTooLate
+					if at == afterFinal {
+						want.answer = cancelAnswerTooLate
+					}
+				case at == beforeJudge:
+					want.status, want.outcome, want.code, want.answer, want.after = string(jobCancelled), captureFailed, string(capture.CodeCancelled), cancelAnswerPending, cancelAnswerCancelled
+				default:
+					want.status, want.outcome, want.code, want.answer, want.after = string(jobFailed), captureFailed, string(capture.CodeDisk), cancelAnswerEnded, cancelAnswerEnded
+				}
+				got := struct{ status, outcome, code, answer, after string }{v.Status, m.Outcome, code, answer, after}
+				if got != want {
+					t.Errorf("got %+v\nwant %+v", got, want)
+				}
+				if made && at != afterFinal {
+					if r := u.result(j); r.Cancel != cancelAnswerTooLate {
+						t.Errorf("result cancel %q", r.Cancel)
+					}
+				}
+			})
+		}
+	}
+}
+
+// An undecided job is registered, and can be settled, before it lets go
+// of the directory: a maintenance pass that takes the directory the
+// moment it is free finds the job undecided and its decision rule armed.
+func TestAnUndecidedJobIsRegisteredBeforeItLetsGoOfTheDirectory(t *testing.T) {
+	var mu sync.Mutex
+	armed := map[string]bool{}
+	u := newUndecidedEnvWith(t, true, func(s *Server) {
+		s.beforeRelease = func(j *job) {
+			s.capMu.Lock()
+			ok := slices.Contains(s.undecided, j) && j.txn != nil && j.txn.decideFailed != nil
+			s.capMu.Unlock()
+			mu.Lock()
+			armed[j.id] = ok
+			mu.Unlock()
+		}
+	})
+	j := u.undecided(t)
+	mu.Lock()
+	defer mu.Unlock()
+	if !armed[j.id] {
+		t.Errorf("job %s let go of the directory before it was registered undecided with its decision rule", j.id)
+	}
+}
+
+// An undecided job leaves the active slot before it lets go of the
+// directory: a maintenance pass that takes the directory the moment it is
+// free and settles the job updates a finished entry (its result counted
+// against MaxJobBytes), never one the job is yet to finish.
+func TestAnUndecidedJobLeavesTheSlotBeforeItLetsGoOfTheDirectory(t *testing.T) {
+	var mu sync.Mutex
+	left := map[string]bool{}
+	u := newUndecidedEnvWith(t, true, func(s *Server) {
+		s.beforeRelease = func(j *job) {
+			s.registry.mu.Lock()
+			ok := s.registry.active.Load() != j && s.registry.finished(j.id)
+			s.registry.mu.Unlock()
+			mu.Lock()
+			left[j.id] = ok
+			mu.Unlock()
+		}
+	})
+	j := u.undecided(t)
+	mu.Lock()
+	defer mu.Unlock()
+	if !left[j.id] {
+		t.Errorf("job %s let go of the directory while still the registry's active job", j.id)
+	}
+}

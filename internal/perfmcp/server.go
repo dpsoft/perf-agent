@@ -27,8 +27,15 @@ import (
 // Server is the perf-agent MCP server. The store, the diffs, the attempts,
 // the pins and the live page's publications belong to the engine holder:
 // every tool runs holding the engine (see engine), and so will a capture
-// job's steps, so they need no locks of their own. Serve must not run
-// concurrently with itself. A PageView reads only the snapshot the engine
+// job's steps, so they need no locks of their own. Several sessions may
+// share one Server: each Serve is one session, and a transport may answer
+// others through the mcpstdio per-message API. The engine serializes the
+// tools that hold it whichever session calls them; the capture tools do
+// not hold it and keep their state under the job registry's lock. A Serve
+// that ends cancels every capture job, whichever session started it,
+// since a stdio client is the only one that can collect them; a session
+// answered through the per-message API ends no job. A PageView reads only
+// the snapshot the engine
 // holder last committed and the immutable publications it holds. Close
 // may run on another goroutine, even after Serve returned while a handler
 // still runs, and marks the live page closed under its lock.

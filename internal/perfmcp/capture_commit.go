@@ -2,6 +2,7 @@ package perfmcp
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/dpsoft/perf-agent/internal/capture"
@@ -256,7 +256,7 @@ func (s *Server) beginTxn(d *captureDir, series string, id int, label string, se
 		t.in.Finals = append(t.in.Finals, finalName(id, label, o))
 	}
 	name := intentName(id, label)
-	hb, err := s.writeNewFile(ser, heartbeatName(id, label), nil, "heartbeat")
+	hb, err := s.writeNewFile(ser, heartbeatName(id, label), []byte(t.in.Token+"\n"), "heartbeat")
 	if err != nil {
 		return nil, t.abort(err)
 	}
@@ -266,18 +266,28 @@ func (s *Server) beginTxn(d *captureDir, series string, id int, label string, se
 	if err == nil {
 		err = s.linkNoReplace(ser, rootCaptures, tmp.Name, name)
 		if err != nil && !errors.Is(err, errCrash) {
-			_, _, _ = removeByIdentity(ser, tmp.Name, tmp, false)
+			_, _, _ = removeByIdentity(ser, tmp.Name, tmp)
 		}
 	}
 	if err != nil {
 		if !errors.Is(err, errCrash) {
-			_, _, _ = removeByIdentity(ser, hb.Name, hb, false)
+			_, _, _ = removeByIdentity(ser, hb.Name, hb)
 		}
 		return nil, t.abort(err)
 	}
 	t.self = tmp
 	t.self.Name = name
-	_, _, _ = removeByIdentity(ser, tmp.Name, tmp, false)
+	// The temporary is a second name of the intent now. If it cannot go,
+	// it is recorded with the intent's next rewrite and removed with the
+	// rest; a crash right here leaves it for recovery, which proves it by
+	// the intent's own identity.
+	if err := s.wErr("remove intent temp"); errors.Is(err, errCrash) {
+		return t, t.crashed(err)
+	} else if err != nil {
+		t.in.Temps = append(t.in.Temps, tmp)
+	} else if _, left, err := removeByIdentity(ser, tmp.Name, tmp); err != nil || left != "" {
+		t.in.Temps = append(t.in.Temps, tmp)
+	}
 	t.startHeartbeat()
 	if err := s.syncDir(ser, ".", "fsync intent"); err != nil {
 		return t, t.crashed(err)
@@ -365,36 +375,41 @@ func (t *captureTxn) stopHeartbeat() {
 }
 
 // writeNewFile creates name inside root (mode 0600, never replacing
-// anything), writes b and fsyncs it, and returns its identity. op names the
-// write for the seam. A failure removes the file again, by its identity;
-// a name that exists already is an error wrapping fs.ErrExist.
+// anything), writes b and fsyncs it, and returns its identity, digest
+// included. op names the write for the seam. A failure removes the file
+// again, by the identity of what it holds then; a name that exists already
+// is an error wrapping fs.ErrExist.
 func (s *Server) writeNewFile(root *os.Root, name string, b []byte, op string) (fileIdentity, error) {
-	f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := root.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fileIdentity{}, fmt.Errorf("cannot create %s in %s: %w", name, root.Name(), pathless(err))
 	}
-	var id fileIdentity
-	fi, err := f.Stat()
-	if err == nil {
-		id = identityOf(name, fi)
-		err = s.wErr(op)
-	}
+	err = s.wErr(op)
 	if err == nil {
 		_, err = f.Write(b)
 	}
 	if err == nil {
 		err = f.Sync()
 	}
+	var id fileIdentity
+	if fi, serr := f.Stat(); serr == nil {
+		id = identityOf(name, fi)
+		id.SHA256, serr = hashFile(f)
+		if err == nil {
+			err = serr
+		}
+	} else if err == nil {
+		err = serr
+	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
 	if err != nil {
-		if !errors.Is(err, errCrash) && id.Ino != 0 {
-			_, _, _ = removeByIdentity(root, name, id, false)
+		if !errors.Is(err, errCrash) && id.SHA256 != "" {
+			_, _, _ = removeByIdentity(root, name, id)
 		}
 		return fileIdentity{}, fmt.Errorf("cannot write %s in %s: %w", name, root.Name(), pathless(err))
 	}
-	id.Size = int64(len(b))
 	return id, nil
 }
 
@@ -427,12 +442,12 @@ func (t *captureTxn) rewrite() error {
 	if err != nil {
 		return t.crashed(err)
 	}
-	if why, err := matches(t.ser, name, t.self, false); err != nil || why != "" {
-		_, _, _ = removeByIdentity(t.ser, tmp.Name, tmp, false)
+	if why, err := matches(t.ser, name, t.self); err != nil || why != "" {
+		_, _, _ = removeByIdentity(t.ser, tmp.Name, tmp)
 		return fmt.Errorf("the intent %s in %s is no longer the one this capture wrote (%s); it is left as it is", name, t.ser.Name(), cmpOrErr(why, err))
 	}
 	if err := t.ser.Rename(tmp.Name, name); err != nil {
-		_, _, _ = removeByIdentity(t.ser, tmp.Name, tmp, false)
+		_, _, _ = removeByIdentity(t.ser, tmp.Name, tmp)
 		return err
 	}
 	t.self = tmp
@@ -474,13 +489,13 @@ func (t *captureTxn) makeStaging() error {
 func (t *captureTxn) probe() error {
 	p := filepath.Join(t.in.Staging, probeName)
 	q := filepath.Join(t.in.Staging, probeLinkName)
-	id, err := t.s.writeNewFile(t.ser, p, nil, "probe")
+	id, err := t.s.writeNewFile(t.ser, p, []byte(t.in.Token+"\n"), "probe")
 	if err != nil {
 		return t.crashed(err)
 	}
 	lerr := t.s.linkNoReplace(t.ser, rootCaptures, p, q)
-	_, _, _ = removeByIdentity(t.ser, q, id, false)
-	_, _, _ = removeByIdentity(t.ser, p, id, false)
+	_, _, _ = removeByIdentity(t.ser, q, id)
+	_, _, _ = removeByIdentity(t.ser, p, id)
 	if lerr != nil {
 		return capture.Errorf(capture.CodeDisabled,
 			"start perf-agent-mcp with --captures naming a directory inside the profiles root on a filesystem that supports hard links",
@@ -772,7 +787,7 @@ func (t *captureTxn) cleanup() error {
 // removeRecorded removes the file id records, noting it when it is not
 // that file any more.
 func (t *captureTxn) removeRecorded(id fileIdentity, what string) error {
-	_, left, err := removeByIdentity(t.ser, id.Name, id, false)
+	_, left, err := removeByIdentity(t.ser, id.Name, id)
 	if left != "" {
 		t.note("left", id.Name, what+" is now "+left)
 	}
@@ -789,7 +804,7 @@ func (t *captureTxn) note(kind, name, why string) {
 // removeTemps removes the recorded manifest temporaries by identity.
 func (t *captureTxn) removeTemps() error {
 	for _, tmp := range t.in.Temps {
-		_, left, err := removeByIdentity(t.ser, tmp.Name, tmp, false)
+		_, left, err := removeByIdentity(t.ser, tmp.Name, tmp)
 		if err != nil {
 			return err
 		}
@@ -805,7 +820,7 @@ func (t *captureTxn) removeTemps() error {
 // where it still is that file with its size and digest.
 func (t *captureTxn) removeFinals() error {
 	for _, f := range t.in.Files {
-		_, left, err := removeByIdentity(t.ser, f.Name, f, true)
+		_, left, err := removeByIdentity(t.ser, f.Name, f)
 		if err != nil {
 			return err
 		}
@@ -817,68 +832,106 @@ func (t *captureTxn) removeFinals() error {
 }
 
 // removeStaging removes the staging directory, only when it is the one
-// recorded (by device and inode), and in it only what this capture put
-// there: the recorded files by identity, and perf-agent's outputs and the
-// link probe by their names (the directory's identity proves it is the
-// capture's private 0700 workspace). Anything else stays, and so does the
-// directory then.
+// recorded, and in it only what this capture put there: the recorded
+// files by identity, and perf-agent's outputs and the link probe by their
+// names. The directory is opened as a root and proven to be the recorded
+// one (device and inode) before anything in it is removed by name, so no
+// path is walked after the check; its identity proves it is the capture's
+// private 0700 workspace. Anything else stays, and so does the directory
+// then. The empty directory is moved aside, checked again and removed.
 func (t *captureTxn) removeStaging() error {
 	dir := t.in.Staging
 	if t.in.StagingDev == 0 && t.in.StagingIno == 0 {
 		return nil
 	}
-	fi, err := t.ser.Lstat(dir)
+	isStaging := func(fi fs.FileInfo) bool {
+		st, _ := statOf(fi)
+		return fi.IsDir() && st.dev == t.in.StagingDev && st.ino == t.in.StagingIno
+	}
+	lfi, err := t.ser.Lstat(dir)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return nil
 	case err != nil:
 		return err
-	}
-	if st, _ := statOf(fi); !fi.IsDir() || st.dev != t.in.StagingDev || st.ino != t.in.StagingIno {
+	case !isStaging(lfi):
 		t.note("left", dir, "not the staging directory this capture created")
 		return nil
 	}
-	names, err := readDirNames(t.ser, dir)
+	sr, err := t.ser.OpenRoot(dir)
 	if err != nil {
 		return err
+	}
+	defer func() { _ = sr.Close() }()
+	if fi, err := sr.Stat("."); err != nil || !isStaging(fi) {
+		t.note("left", dir, "not the staging directory this capture created")
+		return err
+	}
+	kept, err := t.emptyStaging(sr)
+	if err != nil || kept {
+		return err
+	}
+	q := quarantinePrefix + randHex(8)
+	if err := t.ser.Rename(dir, q); err != nil {
+		return err
+	}
+	if fi, err := t.ser.Lstat(q); err == nil && isStaging(fi) {
+		if err := t.ser.Remove(q); err == nil {
+			return nil
+		}
+		t.note("left", dir, "the staging directory is not empty any more")
+	} else {
+		t.note("left", dir, "not the staging directory this capture created")
+	}
+	if why := restore(t.ser, q, dir); why != "" {
+		t.note("left", q, "moved aside from "+dir+why)
+	}
+	return nil
+}
+
+// emptyStaging removes from the opened staging root what this capture
+// put there, and reports whether anything had to stay.
+func (t *captureTxn) emptyStaging(sr *os.Root) (kept bool, err error) {
+	names, err := readDirNames(sr, ".")
+	if err != nil {
+		return false, err
 	}
 	recorded := map[string]fileIdentity{}
 	for _, f := range t.in.Files {
 		recorded[f.Staged] = f
 	}
+	keep := func(n, why string) {
+		kept = true
+		t.note("left", filepath.Join(t.in.Staging, n), why)
+	}
 	for _, n := range names {
-		p := filepath.Join(dir, n)
 		if f, ok := recorded[n]; ok {
-			if _, left, err := removeByIdentity(t.ser, p, f, false); err != nil {
-				return err
-			} else if left != "" {
-				t.note("left", p, "not the file this capture recorded: "+left)
+			_, left, err := removeByIdentity(sr, n, f)
+			if err != nil {
+				return kept, err
+			}
+			if left != "" {
+				keep(n, "not the file this capture recorded: "+left)
 			}
 			continue
 		}
 		if !slices.Contains(t.in.Outputs, n) && n != probeName && n != probeLinkName {
-			t.note("left", p, "not a file this capture writes")
+			keep(n, "not a file this capture writes")
 			continue
 		}
-		lfi, err := t.ser.Lstat(p)
+		fi, err := sr.Lstat(n)
 		if err != nil {
-			return err
+			return kept, err
 		}
-		if !lfi.Mode().IsRegular() && lfi.Mode()&fs.ModeSymlink == 0 {
-			t.note("left", p, describeType(lfi.Mode())+", not a file perf-agent writes")
+		if !fi.Mode().IsRegular() && fi.Mode()&fs.ModeSymlink == 0 {
+			keep(n, describeType(fi.Mode())+", not a file perf-agent writes")
 			continue
 		}
-		if err := t.ser.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return err
+		if err := sr.Remove(n); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return kept, err
 		}
 	}
-	if err := t.ser.Remove(dir); err != nil {
-		if errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST) {
-			return nil
-		}
-		return err
-	}
-	return nil
+	return kept, nil
 }
 
 // rollback undoes a failed capture live (§7.4): the intent says
@@ -1065,7 +1118,10 @@ func readIntent(ser *os.Root, name string) (intent, fileIdentity, error) {
 	if err := in.check(name); err != nil {
 		return intent{}, fileIdentity{}, fmt.Errorf("intent %s: %w", name, err)
 	}
-	return in, identityOf(name, fi), nil
+	id := identityOf(name, fi)
+	sum := sha256.Sum256(b)
+	id.SHA256 = hex.EncodeToString(sum[:])
+	return in, id, nil
 }
 
 func isHex(s string, n int) bool {

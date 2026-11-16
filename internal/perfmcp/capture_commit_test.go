@@ -865,10 +865,10 @@ func TestRemoveByIdentityNeverRemovesWhatItCannotProve(t *testing.T) {
 	}
 
 	id := record("ours", "ours")
-	if removed, left, err := removeByIdentity(root, "ours", id, true); !removed || left != "" || err != nil || !gone("ours") {
+	if removed, left, err := removeByIdentity(root, "ours", id); !removed || left != "" || err != nil || !gone("ours") {
 		t.Fatalf("our own file: %v %q %v", removed, left, err)
 	}
-	if removed, left, err := removeByIdentity(root, "ours", id, true); removed || left != "" || err != nil {
+	if removed, left, err := removeByIdentity(root, "ours", id); removed || left != "" || err != nil {
 		t.Fatalf("a missing name: %v %q %v", removed, left, err)
 	}
 
@@ -924,7 +924,7 @@ func TestRemoveByIdentityNeverRemovesWhatItCannotProve(t *testing.T) {
 				_ = root.Remove(n)
 			}
 			want := c.make(t)
-			removed, left, err := removeByIdentity(root, "f", want, c.full)
+			removed, left, err := removeByIdentity(root, "f", want)
 			if removed || left == "" || err != nil {
 				t.Fatalf("removed %v, left %q, err %v", removed, left, err)
 			}
@@ -938,7 +938,7 @@ func TestRemoveByIdentityNeverRemovesWhatItCannotProve(t *testing.T) {
 	// name goes and the other link keeps the bytes.
 	pair := record("staged", "ours")
 	_ = root.Link("staged", "final")
-	if removed, _, err := removeByIdentity(root, "staged", pair, true); !removed || err != nil {
+	if removed, _, err := removeByIdentity(root, "staged", pair); !removed || err != nil {
 		t.Fatalf("a staging+final pair: %v %v", removed, err)
 	}
 	if got, _ := root.ReadFile("final"); string(got) != "ours" {

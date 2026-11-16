@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"syscall"
@@ -268,7 +269,7 @@ func seriesManifests(ser *os.Root) (ms []manifest, bad []string, err error) {
 // the same regular file by device and inode, with its size and SHA-256.
 func verifyFiles(ser *os.Root, m manifest) error {
 	for _, want := range m.Files {
-		if why, err := matches(ser, want.Name, want, true); err != nil || why != "" {
+		if why, err := matches(ser, want.Name, want); err != nil || why != "" {
 			return fmt.Errorf("%s: %s", want.Name, cmpOrErr(why, err))
 		}
 	}
@@ -283,10 +284,12 @@ func cmpOrErr(why string, err error) string {
 }
 
 // matches says why name is not the file want records, "" when it is: a
-// regular file (not a symbolic link) with want's device and inode and one
-// or two links (a capture file's staging and final names), and when full,
-// want's size and SHA-256.
-func matches(root *os.Root, name string, want fileIdentity, full bool) (why string, err error) {
+// regular file (not a symbolic link) with want's device and inode, one or
+// two links (a capture file's staging and final names), and want's size
+// and SHA-256. The contents are what prove the file: an inode number can
+// be reused, and this server's own links, renames and heartbeats change
+// the file's ctime. An identity with no digest is never matched.
+func matches(root *os.Root, name string, want fileIdentity) (why string, err error) {
 	fi, err := root.Lstat(name)
 	if err != nil {
 		return "", err
@@ -299,8 +302,8 @@ func matches(root *os.Root, name string, want fileIdentity, full bool) (why stri
 		return "a different file from the one recorded", nil
 	case st.nlink != 1 && st.nlink != 2:
 		return fmt.Sprintf("%d links, not the one or two recorded", st.nlink), nil
-	case !full:
-		return "", nil
+	case want.SHA256 == "":
+		return "a file whose contents were never recorded", nil
 	case fi.Size() != want.Size:
 		return fmt.Sprintf("%d bytes, not the %d recorded", fi.Size(), want.Size), nil
 	}
@@ -334,13 +337,24 @@ func hashFile(f *os.File) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// quarantinePrefix starts the private name a file is moved to while its
+// removal is decided.
+const quarantinePrefix = ".del-"
+
+// quarantineHook, when set, runs between the identity check and the move
+// aside; a seam for tests.
+var quarantineHook func(root *os.Root, name string)
+
 // removeByIdentity removes name inside root only when it is the file want
-// records (see matches; full adds the size and SHA-256, for a final
-// name). It reports whether it removed the name, and when it left it,
-// why: a name that is not provably the recorded file is never removed. A
-// missing name is neither removed nor left.
-func removeByIdentity(root *os.Root, name string, want fileIdentity, full bool) (removed bool, left string, err error) {
-	why, err := matches(root, name, want, full)
+// records (see matches). It reports whether it removed the name, and when
+// it left it, why: a name that is not provably the recorded file is never
+// removed. A missing name is neither removed nor left. The check and the
+// unlink are not one step, so the name is first renamed to a private
+// quarantine name beside it, the file there is checked again, and only
+// then unlinked; a file that turns out not to be the recorded one is put
+// back under its name without replacing anything.
+func removeByIdentity(root *os.Root, name string, want fileIdentity) (removed bool, left string, err error) {
+	why, err := matches(root, name, want)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return false, "", nil
@@ -349,8 +363,37 @@ func removeByIdentity(root *os.Root, name string, want fileIdentity, full bool) 
 	case why != "":
 		return false, why, nil
 	}
-	if err := root.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if quarantineHook != nil {
+		quarantineHook(root, name)
+	}
+	q := filepath.Join(filepath.Dir(name), quarantinePrefix+randHex(8))
+	if err := root.Rename(name, q); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, "", nil
+		}
 		return false, "", err
 	}
-	return true, "", nil
+	why, err = matches(root, q, want)
+	if err == nil && why == "" {
+		if err := root.Remove(q); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return false, "", err
+		}
+		return true, "", nil
+	}
+	return false, cmpOrErr(why, err) + restore(root, q, name), nil
+}
+
+// restore puts q back under name without replacing anything there, and
+// says where the file is when it cannot.
+func restore(root *os.Root, q, name string) string {
+	if err := root.Link(q, name); err == nil {
+		_ = root.Remove(q)
+		return ""
+	}
+	if _, err := root.Lstat(name); errors.Is(err, fs.ErrNotExist) {
+		if err := root.Rename(q, name); err == nil {
+			return ""
+		}
+	}
+	return "; it was moved aside to " + q + ", since its name is taken now"
 }

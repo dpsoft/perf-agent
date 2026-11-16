@@ -330,7 +330,7 @@ func (s *Server) nextID(ser *os.Root) (int, error) {
 	}
 	if err != nil {
 		if !errors.Is(err, errCrash) {
-			_, _, _ = removeByIdentity(ser, tmp, tid, false)
+			_, _, _ = removeByIdentity(ser, tmp, tid)
 		}
 		return 0, fmt.Errorf("cannot write %s in %s: %w", seqFile, ser.Name(), err)
 	}

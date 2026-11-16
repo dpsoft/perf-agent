@@ -58,7 +58,10 @@ func (t *captureTxn) ownerState() ownerState {
 	if hb := t.in.Heartbeat; hb != nil {
 		if fi, err := t.ser.Lstat(hb.Name); err == nil {
 			st, _ := statOf(fi)
-			fresh = st.dev == hb.Dev && st.ino == hb.Ino && t.s.clock().Sub(fi.ModTime()) < staleAfter
+			// A heartbeat dated more than the bound ahead (a clock that
+			// jumped back) is as stale as one that old.
+			age := t.s.clock().Sub(fi.ModTime())
+			fresh = st.dev == hb.Dev && st.ino == hb.Ino && age < staleAfter && age > -staleAfter
 		}
 	}
 	alive := t.s.ownerIsAlive(t.in)
@@ -120,6 +123,20 @@ func (s *Server) recoverSeries(d *captureDir, series string) (notes []string, er
 			continue
 		}
 		t := s.adopt(d, ser, series, in, self)
+		// A temporary that is a second name of the intent itself (a crash
+		// between linking the intent and removing that name) is proven by
+		// the intent's own identity.
+		for _, tn := range names {
+			if strings.HasPrefix(tn, "."+n+".tmp-"+in.Token[:16]) {
+				alias := self
+				alias.Name = tn
+				if removed, _, err := removeByIdentity(ser, tn, alias); err != nil {
+					return notes, d.writeError(err)
+				} else if removed {
+					claimed[tn] = true
+				}
+			}
+		}
 		which := formatID(t.id) + "-" + in.Label
 		mname := manifestName(t.id, in.Label)
 		if _, err := ser.Lstat(mname); err == nil {

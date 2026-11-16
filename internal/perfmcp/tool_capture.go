@@ -744,6 +744,10 @@ func (s *Server) loadHistorical(key string) (any, error) {
 	if s.lookupHook != nil {
 		s.lookupHook(key)
 	}
+	// A write to the capture directory during the read (retention
+	// removing this capture, say) makes the answer stale: it is returned
+	// to this call, but not kept.
+	gen := s.historyGen.Load()
 	series, id, ok := splitCaptureKey(key)
 	if !ok {
 		return nil, errNoCapture
@@ -782,7 +786,10 @@ func (s *Server) loadHistorical(key string) (any, error) {
 			h.base = &bm
 		}
 	}
-	if err := s.registry.put(key, h); err != nil {
+	if s.readHook != nil {
+		s.readHook(key)
+	}
+	if err := s.registry.putIf(key, h, func() bool { return s.historyGen.Load() == gen }); err != nil {
 		s.log.Error("capture registry", "capture", key, "err", err)
 	}
 	return h, nil

@@ -321,19 +321,21 @@ func (s *Server) retain(d *captureDir, p protection, now time.Time) (evicted []s
 	return r.evicted, nil
 }
 
-// forgetEvicted drops what the registry holds of each capture retention
-// removed (keys are captureKey's), so no wait answers one as done from
-// memory, and marks the history changed.
+// forgetEvicted marks the history changed, then drops what the registry
+// holds of each capture retention removed (keys are captureKey's), so no
+// wait answers one as done from memory. The mark comes first: a historical
+// read that kept its answer before the forget loses it to the forget, and
+// one that would keep it after sees the mark and keeps nothing.
 func (s *Server) forgetEvicted(keys []string) {
 	if len(keys) == 0 {
 		return
 	}
+	s.historyChanged()
 	for _, key := range keys {
 		if s.registry != nil {
 			s.registry.forget(key)
 		}
 	}
-	s.historyChanged()
 }
 
 // run is the pass's four steps, after it puts back what an interrupted

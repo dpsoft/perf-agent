@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -1146,6 +1147,68 @@ func TestRetentionForgetsWhatItRemoved(t *testing.T) {
 				t.Errorf("a removed capture answered %s", text)
 			}
 		})
+	}
+}
+
+// A historical read that retention overtakes, removing the capture
+// between the read and the keeping of its answer, keeps nothing: a later
+// wait reads the disk and finds the capture gone.
+func TestARemovalDuringAHistoricalReadKeepsNoAnswer(t *testing.T) {
+	read := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	e := newJobEnv(t, jobOpts{
+		limits: func(l *Limits) { l.Capture.KeepPerSeries = 1 },
+		setup: func(s *Server) {
+			s.readHook = func(k string) {
+				if k == "s/001" {
+					once.Do(func() {
+						close(read)
+						<-release
+					})
+				}
+			}
+		},
+	})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	st := capture.Settings{Modes: cpuOnly, Duration: time.Second, SampleRate: 99, Unwind: "auto"}
+	e.commitSynthetic("s", "a", st, manifest{})
+	e.commitSynthetic("s", "b", st, manifest{})
+	c := e.serve()
+	if text, isErr := c.call("capture_wait", map[string]any{"id": "s/001", "timeout": "1s"}); isErr || isResult(t, text) {
+		t.Fatalf("the paused read answered %s", text)
+	}
+	select {
+	case <-read:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the read never reached its answer")
+	}
+	text, _ := waitEnd(t, c, startCapture(t, c, map[string]any{"command": workloadCmd(t), "series": "s", "duration": "1s"}))
+	if !isResult(t, text) {
+		t.Fatalf("the capture: %s", text)
+	}
+	if _, ok := e.manifestOf("s", "001"); ok {
+		t.Fatal("retention kept 001")
+	}
+	close(release)
+	for end := time.Now().Add(30 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		text, isErr := c.call("capture_wait", map[string]any{"id": "s/001", "timeout": "5s"})
+		if !isErr && !isResult(t, text) {
+			if time.Now().After(end) {
+				t.Fatalf("s/001 is still loading: %s", text)
+			}
+			continue
+		}
+		if !isErr || toolErrorOf(t, text).Code != string(capture.CodeUnknownCapture) {
+			t.Fatalf("a removed capture answered %s", text)
+		}
+		return
 	}
 }
 

@@ -132,6 +132,9 @@ type Server struct {
 	// each historical read; both are seams for tests.
 	listWait   time.Duration
 	lookupHook func(key string)
+	// readHook, when set, runs between a historical read and keeping its
+	// answer; a seam for tests.
+	readHook func(key string)
 	// listKept holds, per capture_list query, a history read that finished
 	// after its call stopped waiting (listMu guards it); historyGen counts
 	// the writes to the capture directory, which make one stale.

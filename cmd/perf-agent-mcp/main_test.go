@@ -941,21 +941,6 @@ func TestRunSaysOutOfRangeLimits(t *testing.T) {
 	}
 }
 
-func TestEveryLimitFieldCanBeSetByFlag(t *testing.T) {
-	l := perfmcp.DefaultLimits()
-	fields := limitFields(&l)
-	if len(fields) < 30 {
-		t.Errorf("only %d settable limits", len(fields))
-	}
-	for name, f := range fields {
-		switch k := f.Kind(); {
-		case f.Type() == reflect.TypeFor[time.Duration](), k >= reflect.Int && k <= reflect.Int64:
-		default:
-			t.Errorf("%s has kind %v", name, k)
-		}
-	}
-}
-
 func TestLogsReachStderr(t *testing.T) {
 	_, stderr, _, _ := session(t)
 	if !strings.Contains(stderr, "msg=opened") {

@@ -227,6 +227,7 @@ func TestCaptureArgumentRefusals(t *testing.T) {
 		{"pid zero", map[string]any{"pid": 0}, capture.CodeInvalidArgument, "pid"},
 		{"pid negative", map[string]any{"pid": -3}, capture.CodeInvalidArgument, "pid"},
 		{"pid as a string", map[string]any{"pid": "12"}, capture.CodeInvalidArgument, "pid"},
+		{"pid over pid_max", map[string]any{"pid": 1 << 40}, capture.CodeInvalidArgument, "pid"},
 		{"empty command", map[string]any{"command": []any{}}, capture.CodeInvalidArgument, "command"},
 		{"empty program", map[string]any{"command": []any{""}}, capture.CodeInvalidArgument, "command"},
 		{"a NUL byte", map[string]any{"command": []any{"/bin/true", "a\x00b"}}, capture.CodeInvalidArgument, "NUL"},
@@ -248,6 +249,8 @@ func TestCaptureArgumentRefusals(t *testing.T) {
 		{"a label too long", with("label", strings.Repeat("l", 33)), capture.CodeInvalidArgument, "label"},
 		{"compare_with not canonical", with("compare_with", "2"), capture.CodeInvalidArgument, "compare_with"},
 		{"compare_with not an id", with("compare_with", "base"), capture.CodeInvalidArgument, "compare_with"},
+		{"compare_with with no series", with("compare_with", "/001"), capture.CodeInvalidArgument, "not a capture id"},
+		{"compare_with with a path after", with("compare_with", "adhoc/001/x"), capture.CodeInvalidArgument, "not a capture id"},
 		{"compare_with in another series", with("series", "a", "compare_with", "b/001"), capture.CodeInvalidArgument, "series"},
 		{"an unknown argument", with("env", []any{"A=1"}), capture.CodeInvalidArgument, "env"},
 	} {
@@ -288,9 +291,10 @@ func TestCaptureRelativeCommandSuggestsTheAbsolutePath(t *testing.T) {
 	for _, tc := range []struct {
 		cmd, cwd, want string
 	}{
-		{"./bench", "/home/u/proj", "/home/u/proj/bench"},
-		{"bin/bench", "/home/u/proj", "/home/u/proj/bin/bench"},
-		{"../tools/bench", "/home/u/proj", "/home/u/tools/bench"},
+		{"./bench", "/home/u/proj", `"/home/u/proj/bench"`},
+		{"bin/bench", "/home/u/proj", `"/home/u/proj/bin/bench"`},
+		{"../tools/bench", "/home/u/proj", `"/home/u/tools/bench"`},
+		{"./bench", "/home/u/a\nb", `"/home/u/a\nb/bench"`},
 	} {
 		text, isErr := c.call("capture", map[string]any{"command": []any{tc.cmd, "-n", "3"}, "cwd": tc.cwd})
 		if !isErr {
@@ -300,6 +304,14 @@ func TestCaptureRelativeCommandSuggestsTheAbsolutePath(t *testing.T) {
 		if w.Code != string(capture.CodeInvalidArgument) || !strings.Contains(w.Message, tc.cmd) || !strings.Contains(w.Next, "pass "+tc.want) {
 			t.Errorf("%s: %+v", tc.cmd, w)
 		}
+		if strings.ContainsAny(w.Message+w.Next, "\n\r") {
+			t.Errorf("a control character is echoed raw: %q", w.Next)
+		}
+	}
+	// ~ is the shell's: it is never joined with cwd.
+	text, _ := c.call("capture", map[string]any{"command": []any{"~/bin/b"}, "cwd": "/home/u"})
+	if w := toolErrorOf(t, text); w.Code != string(capture.CodeInvalidArgument) || strings.Contains(w.Next, "/home/u/~") || !strings.Contains(w.Next, "absolute path") {
+		t.Errorf("~: %+v", w)
 	}
 	// Without an absolute cwd there is nothing to join that is the agent's
 	// own: the advice names no path of the server's.
@@ -687,10 +699,17 @@ func TestCaptureListPagesAndLoads(t *testing.T) {
 		t.Errorf("stranded %+v", l.Stranded)
 	}
 
-	// A history read that does not finish in time is loading; once it is
-	// released the same call answers.
+	// A history read that does not finish in time answers the last read
+	// that did, saying when it was read; with none that is still current,
+	// it is loading. Once the read is released the call answers.
 	ch := make(chan struct{})
 	block.Store(&ch)
+	var kept listing
+	text := c.callOK("capture_list", map[string]any{"series": "s"}, &kept)
+	if kept.Loading || len(kept.Captures) != 4 || !strings.Contains(text, `"read_at"`) {
+		t.Errorf("blocked, with an earlier read: %s", text)
+	}
+	e.s.historyChanged()
 	var loading listing
 	c.callOK("capture_list", map[string]any{"series": "s"}, &loading)
 	if !loading.Loading || loading.Retry != "1s" || len(loading.Captures) != 0 {
@@ -782,6 +801,7 @@ func TestProgressNotificationsAreInPhaseOrder(t *testing.T) {
 	}
 	last, lastProgress := -1, -1.0
 	var seen []string
+	lastMessage, lastAt := "", -100.0
 	for _, n := range notes {
 		var p struct {
 			Token    string  `json:"progressToken"`
@@ -800,11 +820,20 @@ func TestProgressNotificationsAreInPhaseOrder(t *testing.T) {
 		if p.Progress <= lastProgress || p.Total <= 0 {
 			t.Errorf("progress %v after %v, total %v", p.Progress, lastProgress, p.Total)
 		}
+		// The same state is repeated only every 5s.
+		if p.Message == lastMessage && p.Progress-lastAt < 4.5 {
+			t.Errorf("%q repeated after %.2fs", p.Message, p.Progress-lastAt)
+		}
+		if p.Message != lastMessage {
+			lastMessage, lastAt = p.Message, p.Progress
+		}
 		last, lastProgress = r, p.Progress
 		seen = append(seen, p.Message)
 	}
-	if !slices.ContainsFunc(seen, func(m string) bool { return strings.HasPrefix(m, "running") }) {
-		t.Errorf("no running notification in %q", seen)
+	// The capture's own phase change reaches the client without waiting
+	// for the 5s tick: this capture is over before it.
+	if !slices.Contains(seen, "running "+capture.PhaseProfiling) {
+		t.Errorf("no profiling notification in %q", seen)
 	}
 }
 
@@ -932,7 +961,8 @@ func TestTheResultSaysHowTheCommandEnded(t *testing.T) {
 	_, c := newCapEnv(t, jobOpts{})
 	w := capturetest.Workload(t)
 	r, _ := waitResult(t, c, startCapture(t, c, map[string]any{"command": []any{w, "exit-after", "1500ms", "3"}, "duration": "20s"}))
-	if r.Capture.StoppedBy != capture.StoppedByCommandExit || !strings.HasPrefix(r.Capture.Target.Exit, "exited after ") {
+	if r.Capture.StoppedBy != capture.StoppedByCommandExit || !strings.HasPrefix(r.Capture.Target.Exit, "exited 3 after ") ||
+		r.Capture.Target.Exit != "exited 3 after "+r.Capture.ProfiledDuration {
 		t.Errorf("stopped_by %q, target %+v", r.Capture.StoppedBy, r.Capture.Target)
 	}
 	if r.Derived != derivedReady || r.Handles != "" || r.Recompute != nil || len(r.Profiles) != 1 || r.Profiles[0].Open == nil {
@@ -986,4 +1016,175 @@ func TestCaptureToolsNeverWaitForTheEngine(t *testing.T) {
 	if r, _ := waitResult(t, c, id); r.Derived != derivedReady {
 		t.Errorf("result %+v", r)
 	}
+}
+
+// How a target ended reads the same in a live and a historical result:
+// a launched command with its status or signal, a PID with its time.
+func TestTargetExitTexts(t *testing.T) {
+	if got := commandExit(capture.Outcome{WorkloadExited: true, WorkloadStatus: 3, Profiled: 1500 * time.Millisecond}); got != "exited 3 after 1.5s" {
+		t.Errorf("status: %q", got)
+	}
+	if got := commandExit(capture.Outcome{WorkloadExited: true, WorkloadStatus: -1, WorkloadSignal: "killed", Profiled: 2 * time.Second}); got != `killed by signal "killed" after 2s` {
+		t.Errorf("signal: %q", got)
+	}
+	s := newTestServer(t, testConfig(t)).srv
+	info := s.captureInfo(manifest{ID: "001", Series: "s", Label: "a", StoppedBy: capture.StoppedByTargetExit, ProfiledDuration: "1.2s"})
+	if info.Target.Exit != "exited after 1.2s" {
+		t.Errorf("pid: %q", info.Target.Exit)
+	}
+}
+
+// A result that cannot be cut under MaxResponseBytes, even to its paths,
+// is a short error saying how to read the capture.
+func TestAResultTooLargeEvenCutIsAShortError(t *testing.T) {
+	s := newTestServer(t, testConfig(t)).srv
+	s.lim.MaxResponseBytes = 120
+	b := mustJSON(t, map[string]any{"capture": map[string]any{"id": "001", "series": "s", "label": "a", "manifest": "captures/s/001-a.capture.json"},
+		"profiles":  []any{map[string]any{"mode": "cpu", "path": "captures/s/001-a-cpu.pb.gz", "open": map[string]any{"handle": strings.Repeat("h", 64)}}},
+		"recompute": map[string]any{"steps": []any{strings.Repeat("s", 300)}}})
+	res := s.fitResult([]byte(b))
+	if !res.IsError {
+		t.Fatalf("answered %d bytes: %s", len(res.Text), res.Text)
+	}
+	if w := toolErrorOf(t, res.Text); w.Code != string(capture.CodeTooLarge) || !strings.Contains(w.Next, "MaxResponseBytes") {
+		t.Errorf("%+v", w)
+	}
+	s.lim.MaxResponseBytes = 400
+	if res := s.fitResult([]byte(b)); res.IsError || len(res.Text) > 400 {
+		t.Errorf("a minimal cut that fits: %v %d bytes", res.IsError, len(res.Text))
+	}
+}
+
+// A history read slower than capture_list waits still reaches the agent:
+// the next call answers with it.
+func TestCaptureListConvergesWhenTheReadIsSlow(t *testing.T) {
+	e := newJobEnv(t, jobOpts{setup: func(s *Server) {
+		s.listWait = 100 * time.Millisecond
+		s.lookupHook = func(k string) {
+			if strings.HasPrefix(k, "list:") {
+				time.Sleep(300 * time.Millisecond)
+			}
+		}
+	}})
+	st := capture.Settings{Modes: cpuOnly, Duration: time.Second, SampleRate: 99, Unwind: "auto"}
+	e.commitSynthetic("s", "a", st, manifest{})
+	c := e.serve()
+	var first listing
+	c.callOK("capture_list", map[string]any{"series": "s"}, &first)
+	if !first.Loading {
+		t.Fatalf("a 300ms read answered within 100ms: %+v", first)
+	}
+	time.Sleep(400 * time.Millisecond)
+	// Every later call answers, each with the last read that finished,
+	// however often the agent calls.
+	for range 5 {
+		var next listing
+		text := c.callOK("capture_list", map[string]any{"series": "s"}, &next)
+		if next.Loading || len(next.Captures) != 1 || !strings.Contains(text, `"read_at"`) {
+			t.Errorf("the finished read was not answered: %s", text)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// A capture of this server makes the kept read stale.
+	e.s.historyChanged()
+	var stale listing
+	c.callOK("capture_list", map[string]any{"series": "s"}, &stale)
+	if !stale.Loading {
+		t.Errorf("a stale read was answered: %+v", stale)
+	}
+}
+
+// A capture whose server ended under it can be captured again at once.
+func TestAnInterruptedCaptureIsRetryable(t *testing.T) {
+	s, d, clk := newCaptureServer(t)
+	s.captureFault = inject(shot{faultAfterStaging, 1, errCrash})
+	r := drive(t, s, d, capCase{})
+	crashRecover(t, s, d, clk)
+	if m := manifestFor(t, d, "adhoc", r.id, "run"); m.Outcome != captureInterrupted {
+		t.Fatalf("outcome %q", m.Outcome)
+	}
+	profiles := filepath.Dir(d.root.Name())
+	d.close()
+	_, c := newCapEnv(t, jobOpts{profiles: profiles})
+	text, isErr := c.call("capture_wait", map[string]any{"id": "adhoc/001", "timeout": "5s"})
+	if !isErr {
+		t.Fatalf("answered %s", text)
+	}
+	if w := toolErrorOf(t, text); w.Code != string(capture.CodeCancelled) || w.Status != captureInterrupted || !w.Retryable || w.RetryAfter != "0s" {
+		t.Errorf("%+v", w)
+	}
+	var l listing
+	c.callOK("capture_list", map[string]any{"series": "adhoc"}, &l)
+	if len(l.Captures) != 1 || l.Captures[0].Outcome != captureInterrupted {
+		t.Errorf("list %+v", l.Captures)
+	}
+}
+
+// Once retention removes a capture, no answer kept in memory says it is
+// done: a wait reads the disk and finds it gone.
+func TestRetentionForgetsWhatItRemoved(t *testing.T) {
+	e := newJobEnv(t, jobOpts{limits: func(l *Limits) { l.Capture.KeepPerSeries = 1 }})
+	st := capture.Settings{Modes: cpuOnly, Duration: time.Second, SampleRate: 99, Unwind: "auto"}
+	e.commitSynthetic("s", "a", st, manifest{})
+	e.commitSynthetic("s", "b", st, manifest{})
+	c := e.serve()
+	if r, _ := waitResult(t, c, "s/001"); r.Derived != derivedRecompute {
+		t.Fatalf("first answer %+v", r)
+	}
+	text, _ := waitEnd(t, c, startCapture(t, c, map[string]any{"command": workloadCmd(t), "series": "s", "duration": "1s"}))
+	if !isResult(t, text) {
+		t.Fatalf("the capture: %s", text)
+	}
+	if _, ok := e.manifestOf("s", "001"); ok {
+		t.Fatal("retention kept 001")
+	}
+	text, isErr := c.call("capture_wait", map[string]any{"id": "s/001", "timeout": "5s"})
+	if !isErr || toolErrorOf(t, text).Code != string(capture.CodeUnknownCapture) {
+		t.Errorf("a removed capture answered %s", text)
+	}
+}
+
+// Ids whose jobs have left the registry still answer, by job id and by
+// capture id: a cancel with the final state and both ids, a wait with
+// the job id, and a job that failed before it had a capture id with its
+// code.
+func TestEvictedIDsStillAnswer(t *testing.T) {
+	_, c := newCapEnv(t, jobOpts{limits: func(l *Limits) { l.Capture.MaxJobs = 1 }})
+	done := startCapture(t, c, map[string]any{"command": workloadCmd(t), "series": "x", "duration": "1s"})
+	waitResult(t, c, done)
+	early := startCapture(t, c, map[string]any{"command": workloadCmd(t), "cwd": "/nonexistent-dir-for-a-test"})
+	if text, isErr := waitEnd(t, c, early); !isErr || toolErrorOf(t, text).Code != string(capture.CodeInvalidArgument) {
+		t.Fatalf("early failure: %s", text)
+	}
+	waitResult(t, c, startCapture(t, c, map[string]any{"command": workloadCmd(t), "series": "y", "duration": "1s"}))
+
+	for _, id := range []string{done, "x/001"} {
+		var a map[string]string
+		c.callOK("capture_cancel", map[string]any{"id": id}, &a)
+		if a["status"] != cancelAnswerTooLate || a["job"] != done || a["id"] != "x/001" {
+			t.Errorf("cancel %s: %v", id, a)
+		}
+	}
+	r := map[string]json.RawMessage{}
+	text, _ := waitEnd(t, c, done)
+	if err := json.Unmarshal([]byte(text), &r); err != nil || string(r["job"]) != `"`+done+`"` || string(r["derived"]) != `"recompute"` {
+		t.Errorf("wait by the evicted job id: %s", text)
+	}
+	text, isErr := c.call("capture_wait", map[string]any{"id": early, "timeout": "1s"})
+	if w := toolErrorOf(t, text); !isErr || w.Code != string(capture.CodeInvalidArgument) || w.Job != early || w.Status != string(jobFailed) {
+		t.Errorf("wait by an evicted job that failed early: %s", text)
+	}
+}
+
+// An undecided commit is listed as one, not as a rollback.
+func TestAnUndecidedCommitIsListedAsUndecided(t *testing.T) {
+	u := newUndecidedEnv(t, false)
+	j := u.undecided(t)
+	c := u.serve()
+	var l listing
+	c.callOK("capture_list", map[string]any{}, &l)
+	if len(l.Stranded) != 1 || l.Stranded[0].Capture != j.captureIDNow() || l.Stranded[0].State != stateUndecided {
+		t.Errorf("stranded %+v", l.Stranded)
+	}
+	u.setBroken(false)
 }

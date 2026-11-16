@@ -97,11 +97,13 @@ type listProfile struct {
 	Handle profilemodel.Handle `json:"handle,omitzero"`
 }
 
-// strandedRow is a rollback of this server that could not write its
-// failure manifest yet.
+// strandedRow is a capture of this server whose files are not settled
+// yet: a rollback that could not write its failure manifest, or a commit
+// whose manifest link had an outcome nobody could read.
 type strandedRow struct {
 	Capture string `json:"capture"`
 	Label   string `json:"label"`
+	State   string `json:"state"`
 	Note    string `json:"note"`
 }
 
@@ -116,7 +118,10 @@ type listAnswer struct {
 	InProgress string        `json:"in_progress,omitzero"`
 	Warnings   []string      `json:"warnings,omitzero"`
 	Loading    bool          `json:"loading,omitzero"`
-	RetryAfter string        `json:"retry_after,omitzero"`
+	// ReadAt is when the history answered was read, when it is an earlier
+	// read's because this call's did not finish in time.
+	ReadAt     string `json:"read_at,omitzero"`
+	RetryAfter string `json:"retry_after,omitzero"`
 
 	TotalRows    string `json:"total_rows,omitzero"`
 	Skipped      string `json:"skipped,omitzero"`
@@ -124,8 +129,13 @@ type listAnswer struct {
 	NextCursor   string `json:"next_cursor,omitzero"`
 }
 
-// strandedNote is what a stranded rollback's row says.
-const strandedNote = "its rollback has not written its failure manifest yet; this server retries it before each capture and every 30s"
+// The states and notes of a capture whose files are not settled yet.
+const (
+	stateRollback  = "rollback stranded"
+	strandedNote   = "its rollback has not written its failure manifest yet; this server retries it before each capture and every 30s"
+	stateUndecided = "commit undecided"
+	undecidedNote  = "its manifest link had an outcome nobody could read, so it may have committed; this server settles it from the disk before each capture and every 30s, and capture_wait then answers how it ended"
+)
 
 // handleList answers from memory at once (the jobs, the stranded
 // rollbacks) and reads the history from the manifests through the lookup
@@ -163,34 +173,21 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 			}
 		}
 	}
-	s.capMu.Lock()
-	stranded := slices.Clone(s.stranded)
-	s.capMu.Unlock()
-	for _, t := range stranded {
-		if series == "" || t.series == series {
-			out.Stranded = append(out.Stranded, strandedRow{Capture: captureKey(t.series, formatID(t.id)), Label: t.in.Label, Note: strandedNote})
-		}
-	}
+	out.Stranded = s.unsettledRows(series)
 
-	key := "list:" + series
-	l, ok := s.lookups.get(key, func() (any, error) { return s.loadHistory(series) })
-	var (
-		v     any
-		ready bool
-	)
-	if ok {
-		v, ready, err = l.wait(ctx, cmp.Or(s.listWait, listWaitDefault))
-	}
+	h, asOf, err := s.history(ctx, series)
 	switch {
-	case !ok || !ready:
+	case errors.Is(err, errLoading):
 		out.Loading, out.RetryAfter = true, loadingRetry.String()
 		return answer(out)
 	case err != nil:
 		out.Warnings = append(out.Warnings, "the history cannot be read: "+causeText(err))
 		return answer(out)
 	}
-	h := v.(*captureHistory)
 	out.Leftovers, out.Warnings = strconv.Itoa(h.leftovers), append(out.Warnings, h.warnings...)
+	if !asOf.IsZero() {
+		out.ReadAt = asOf.UTC().Format(time.RFC3339)
+	}
 	bind := binding("capture_list", struct {
 		Series string `json:"series"`
 	}{series})
@@ -216,6 +213,96 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 	}
 	return mcpstdio.Result{Text: string(b)}, nil
 }
+
+// unsettledRows are this server's captures in series ("" for all) whose
+// files are not settled: an undecided commit (its transaction is an
+// undecided job's) or a stranded rollback. Both lists are read under
+// capMu, which also orders a job's transaction against its removal.
+func (s *Server) unsettledRows(series string) []strandedRow {
+	s.capMu.Lock()
+	defer s.capMu.Unlock()
+	var rows []strandedRow
+	undecided := map[*captureTxn]bool{}
+	for _, j := range s.undecided {
+		if j.txn != nil {
+			undecided[j.txn] = true
+		}
+	}
+	add := func(t *captureTxn, state, note string) {
+		if series == "" || t.series == series {
+			rows = append(rows, strandedRow{Capture: captureKey(t.series, formatID(t.id)), Label: t.in.Label, State: state, Note: note})
+		}
+	}
+	for _, t := range s.stranded {
+		if undecided[t] {
+			add(t, stateUndecided, undecidedNote)
+			delete(undecided, t)
+			continue
+		}
+		add(t, stateRollback, strandedNote)
+	}
+	for _, j := range s.undecided {
+		if j.txn != nil && undecided[j.txn] {
+			add(j.txn, stateUndecided, undecidedNote)
+		}
+	}
+	return rows
+}
+
+// errLoading is a history not read by the call's deadline.
+var errLoading = errors.New("the history is still being read")
+
+// listKeep is how old a kept history may be to be answered.
+const listKeep = 30 * time.Second
+
+// keptHistory is the last history read for a query, at gen, the history
+// generation then, and at, when it was read.
+type keptHistory struct {
+	h   *captureHistory
+	gen uint64
+	at  time.Time
+}
+
+// history is the capture directory's history for series, read through
+// the lookup pool, waiting at most listWait. A read that does not finish
+// by then goes on, and what the last finished read found is answered
+// instead, with when it was read, while this server has written nothing
+// in the capture directory since and it is under listKeep old: a read
+// slower than the call's wait still reaches the agent. errLoading says
+// there is nothing to answer yet.
+func (s *Server) history(ctx context.Context, series string) (h *captureHistory, asOf time.Time, err error) {
+	key := "list:" + series
+	load := func() (any, error) {
+		gen := s.historyGen.Load()
+		h, err := s.loadHistory(series)
+		if err == nil {
+			s.listMu.Lock()
+			s.listKept[key] = keptHistory{h: h, gen: gen, at: time.Now()}
+			s.listMu.Unlock()
+		}
+		return h, err
+	}
+	if l, ok := s.lookups.get(key, load); ok {
+		v, ready, err := l.wait(ctx, cmp.Or(s.listWait, listWaitDefault))
+		switch {
+		case ready && err != nil:
+			return nil, asOf, err
+		case ready:
+			return v.(*captureHistory), asOf, nil
+		}
+	}
+	s.listMu.Lock()
+	kept, ok := s.listKept[key]
+	s.listMu.Unlock()
+	if ok && kept.gen == s.historyGen.Load() && time.Since(kept.at) < listKeep {
+		return kept.h, kept.at, nil
+	}
+	return nil, asOf, errLoading
+}
+
+// historyChanged says the capture directory was written: a kept history
+// is stale.
+func (s *Server) historyChanged() { s.historyGen.Add(1) }
 
 // withHandles is rows, copied, with the handle of each profile this
 // server has open, read from the map the store publishes for any

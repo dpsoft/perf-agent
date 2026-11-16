@@ -116,6 +116,8 @@ func (s *Server) runJob(j *job) {
 	r := &jobRun{s: s, j: j, ctx: ctx, series: cmp.Or(j.req.Series, defaultSeries), label: cmp.Or(j.req.Label, defaultLabel)}
 	status, e := r.capture()
 	r.release()
+	// Whatever the end, the capture directory may have been written.
+	s.historyChanged()
 	switch status {
 	case jobDone:
 		r.done()
@@ -902,6 +904,9 @@ func (r *jobRun) manifestFrom(o capture.Outcome) manifest {
 		m.ProfiledDuration = o.Profiled.Round(time.Millisecond).String()
 	}
 	m.StoppedBy = o.StoppedBy
+	if o.Launched && o.WorkloadExited && o.StoppedBy == capture.StoppedByCommandExit {
+		m.Target.Exit = commandExit(o)
+	}
 	m.Notes = slices.Clone(o.Notes)
 	if r.eff.KernelStacks {
 		m.Notes = append(m.Notes, kernelNote)
@@ -911,6 +916,16 @@ func (r *jobRun) manifestFrom(o capture.Outcome) manifest {
 		m.Cleanup = o.Cleanup
 	}
 	return m
+}
+
+// commandExit is how a launched command that ended the capture exited:
+// its status, or the signal that killed it, and after how long.
+func commandExit(o capture.Outcome) string {
+	after := o.Profiled.Round(time.Millisecond).String()
+	if o.WorkloadSignal != "" {
+		return fmt.Sprintf("killed by signal %q after %s", o.WorkloadSignal, after)
+	}
+	return fmt.Sprintf("exited %d after %s", o.WorkloadStatus, after)
 }
 
 // commit is §7.4 steps 8-11, as the transaction's finish runs them, with
@@ -977,7 +992,7 @@ func (r *jobRun) profiled() time.Duration {
 func (r *jobRun) end(status jobStatus, e *capture.Error) {
 	j := r.j
 	j.mu.Lock()
-	j.ending = status
+	j.ending, j.endCode = status, e.Code
 	j.mu.Unlock()
 	if err := r.s.registry.finish(j, 0, r.profiled()); err != nil {
 		r.s.log.Error("capture registry", "job", j.id, "err", err)

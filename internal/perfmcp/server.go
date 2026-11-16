@@ -129,6 +129,12 @@ type Server struct {
 	// each historical read; both are seams for tests.
 	listWait   time.Duration
 	lookupHook func(key string)
+	// listKept holds, per capture_list query, a history read that finished
+	// after its call stopped waiting (listMu guards it); historyGen counts
+	// the writes to the capture directory, which make one stale.
+	listMu     sync.Mutex
+	listKept   map[string]keptHistory
+	historyGen atomic.Uint64
 }
 
 // readSelfStatus reads this process's /proc/self/status; a seam for tests.
@@ -163,6 +169,7 @@ func New(cfg Config) (_ *Server, err error) {
 		evalSymlinks: filepath.EvalSymlinks,
 		engine:       newEngine(),
 		dirMu:        make(chan struct{}, 1),
+		listKept:     map[string]keptHistory{},
 	}
 	s.ctx, s.stop = context.WithCancel(context.Background())
 	s.cgroupParent = sync.OnceValue(s.findCgroupParent)

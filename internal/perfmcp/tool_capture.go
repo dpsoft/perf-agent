@@ -28,6 +28,7 @@ const (
 	waitDefault     = 30 * time.Second
 	waitCap         = 45 * time.Second
 	progressEvery   = 5 * time.Second
+	phasePoll       = 250 * time.Millisecond
 	listWaitDefault = 10 * time.Second
 	loadingRetry    = time.Second
 )
@@ -113,7 +114,7 @@ func (s *Server) captureTool() mcpstdio.Tool {
 	schema := fmt.Sprintf(`{
   "type": "object",
   "properties": {
-    "pid": {"type": "integer", "minimum": 1, "description": "A running process of yours to profile. Exactly one of pid and command."},
+    "pid": {"type": "integer", "minimum": 1, "maximum": %d, "description": "A running process of yours to profile. Exactly one of pid and command."},
     "command": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "A program to launch and profile: command[0] is an absolute path or a bare name looked up in PATH (never ./x), the rest its arguments. No shell. Exactly one of pid and command."},
     "cwd": {"type": "string", "description": "The command's directory, inside a --source root or the profiles root; a relative cwd is relative to the profiles root. Default: the first --source root, else the profiles root."},
     "modes": {"type": "array", "items": {"enum": ["cpu", "offcpu", "gpu"]}, "uniqueItems": true, "minItems": 1, "description": "What to profile; default [\"cpu\"]. gpu needs --gpu-shim."},
@@ -127,7 +128,7 @@ func (s *Server) captureTool() mcpstdio.Tool {
     "keep": {"type": "boolean", "description": "Exempt this capture from retention, as for a loop's baseline. Default false."}
   },
   "additionalProperties": false
-}`, c.MaxDuration, c.MaxSampleRate, maxSeriesName, maxLabel)
+}`, maxPID, c.MaxDuration, c.MaxSampleRate, maxSeriesName, maxLabel)
 	return mcpstdio.Tool{
 		Name:  "capture",
 		Title: "Capture a profile",
@@ -185,6 +186,9 @@ func (s *Server) handleCapture(_ context.Context, raw json.RawMessage) (mcpstdio
 	}
 	return answer(acceptedAnswer{Job: j.id, Status: string(jobAccepted), ETA: (j.reserve + etaSlack).Round(100 * time.Millisecond).String()})
 }
+
+// maxPID is the largest process id Linux hands out (PID_MAX_LIMIT).
+const maxPID = 1 << 22
 
 // The values unwind takes.
 var unwinds = []string{"auto", "fp", "dwarf"}
@@ -281,8 +285,8 @@ func checkTarget(a captureArgs) *capture.Error {
 		return invalidArgument(both, "capture needs a target: pid or command")
 	case a.PID != nil && a.Command != nil:
 		return invalidArgument(both, "capture takes pid or command, not both")
-	case a.PID != nil && *a.PID < 1:
-		return invalidArgument("pass the pid of a running process of yours", "pid %d is not a process id", *a.PID)
+	case a.PID != nil && (*a.PID < 1 || *a.PID > maxPID):
+		return invalidArgument("pass the pid of a running process of yours", "pid %d is not a process id (1 to %d)", *a.PID, maxPID)
 	case a.PID != nil && a.Cwd != "":
 		return invalidArgument("drop cwd: a process runs where it already runs", "cwd is for a launched command, and pid names a running process")
 	case a.PID != nil:
@@ -302,8 +306,11 @@ func checkTarget(a captureArgs) *capture.Error {
 		return nil
 	}
 	next := "pass command[0] as an absolute path (cwd joined with it), or a bare name found in PATH"
-	if filepath.IsAbs(a.Cwd) {
-		next = fmt.Sprintf("pass %s as command[0]: cwd joined with %s", echo(filepath.Join(a.Cwd, name)), echo(name))
+	switch {
+	case strings.HasPrefix(name, "~"):
+		next = "pass command[0] as an absolute path: no shell runs the command, so ~ is not expanded"
+	case filepath.IsAbs(a.Cwd):
+		next = fmt.Sprintf("pass %q as command[0]: cwd joined with %q", echo(filepath.Join(a.Cwd, name)), echo(name))
 	}
 	return invalidArgument(next, "command[0] %q is a relative path; it must be an absolute path or a bare name looked up in PATH", echo(name))
 }
@@ -339,8 +346,11 @@ func compareID(with, series string) (string, *capture.Error) {
 	next := fmt.Sprintf("pass the id of a capture of series %s as capture_list shows it, such as 001", series)
 	id := with
 	if s, rest, found := strings.Cut(with, "/"); found {
+		if s == "" {
+			return "", invalidArgument(next, "compare_with %q is not a capture id such as 001", echo(with))
+		}
 		if s != series {
-			return "", invalidArgument("compare within one series: capture into series "+echo(s)+", or start a new loop",
+			return "", invalidArgument(fmt.Sprintf("compare within one series: capture into series %q, or start a new loop", echo(s)),
 				"compare_with %q names a capture of series %q, and this capture is in series %s", echo(with), echo(s), series)
 		}
 		id = rest
@@ -415,20 +425,20 @@ func (s *Server) handleWait(ctx context.Context, raw json.RawMessage) (mcpstdio.
 	if j, ok := s.registry.get(a.ID); ok {
 		return s.waitJob(ctx, j, d), nil
 	}
-	key := a.ID
-	if captureID, final, ok := s.registry.final(a.ID); ok {
-		if captureID == "" {
-			return endedEarly(a.ID, final), nil
+	key, jobID := a.ID, ""
+	if al, ok := s.registry.final(a.ID); ok {
+		if al.captureID == "" {
+			return endedEarly(al), nil
 		}
-		if j, ok := s.registry.get(captureID); ok {
+		if j, ok := s.registry.get(al.captureID); ok {
 			return s.waitJob(ctx, j, d), nil
 		}
-		key = captureID
+		key, jobID = al.captureID, al.jobID
 	}
 	if _, _, ok := splitCaptureKey(key); !ok {
 		return toolError(unknownCapture(a.ID, "no capture job of this server, and no capture id as <series>/NNN"), nil), nil
 	}
-	return s.waitHistorical(ctx, key, d), nil
+	return s.waitHistorical(ctx, key, jobID, d), nil
 }
 
 // splitCaptureKey splits a capture id "series/NNN".
@@ -442,17 +452,19 @@ func splitCaptureKey(key string) (series string, id int, ok bool) {
 }
 
 // endedEarly answers a wait for a job that ended before it had a capture
-// id and whose entry has since left the registry: only its final answer
-// is remembered.
-func endedEarly(jobID, final string) mcpstdio.Result {
-	if final == cancelAnswerCancelled {
-		w := toWireError(capture.Errorf(capture.CodeCancelled, "", "job %s was cancelled before it had a capture id", jobID))
-		w.Job, w.Status = jobID, string(jobCancelled)
-		return errorResult(w)
+// id and whose entry has since left the registry: its alias keeps the code
+// it failed with, not the rest of its error.
+func endedEarly(a jobAlias) mcpstdio.Result {
+	status, code := jobFailed, a.code
+	if a.answer == cancelAnswerCancelled {
+		status, code = jobCancelled, capture.CodeCancelled
 	}
-	w := toWireError(capture.Errorf(capture.CodeUnknownCapture, "capture again; capture_list shows the series' history",
-		"job %s failed before it had a capture id, and its error is no longer in this server's memory", jobID))
-	w.Job, w.Status = jobID, string(jobFailed)
+	if code == "" {
+		code = capture.CodeUnknownCapture
+	}
+	w := toWireError(capture.Errorf(code, "capture again; capture_list shows the series' history",
+		"job %s ended %s with %s before it had a capture id; the rest of its error is no longer in this server's memory", a.jobID, status, code))
+	w.Job, w.Status = a.jobID, string(status)
 	return errorResult(w)
 }
 
@@ -463,29 +475,40 @@ func endedEarly(jobID, final string) mcpstdio.Result {
 func (s *Server) waitJob(ctx context.Context, j *job, d time.Duration) mcpstdio.Result {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
-	tick := time.NewTicker(progressEvery)
-	defer tick.Stop()
+	// The capture's own phases (attaching, profiling, finishing) change
+	// inside its Run, which wakes no one: they are read every phasePoll.
+	poll := time.NewTicker(phasePoll)
+	defer poll.Stop()
 	p := progress{ctx: ctx, j: j, last: -1}
-	mark := ""
+	mark, sent := "", time.Time{}
 	for {
 		v, settled, changed := j.watch()
 		if settled {
 			return s.jobAnswer(j)
 		}
-		if m := v.Status + " " + v.Phase; m != mark {
+		if m := v.Status + " " + v.Phase; m != mark || time.Since(sent) >= progressEvery {
 			p.send(v)
-			mark = m
+			mark, sent = m, time.Now()
 		}
 		select {
 		case <-changed:
-		case <-tick.C:
-			p.send(j.view())
+		case <-poll.C:
 		case <-timer.C:
-			return viewAnswer(j.view())
+			return s.stateAnswer(j)
 		case <-ctx.Done():
-			return viewAnswer(j.view())
+			return s.stateAnswer(j)
 		}
 	}
+}
+
+// stateAnswer is j's answer when a wait ends first: its state, or, when it
+// settled at that very moment, its result or error.
+func (s *Server) stateAnswer(j *job) mcpstdio.Result {
+	v, settled, _ := j.watch()
+	if settled {
+		return s.jobAnswer(j)
+	}
+	return viewAnswer(v)
 }
 
 // progress sends a wait's progress notifications: progress is the
@@ -508,9 +531,15 @@ func (p *progress) send(v jobView) {
 func viewAnswer(v jobView) mcpstdio.Result {
 	r, err := answer(v)
 	if err != nil {
-		return toolError(capture.Errorf(capture.CodeUnknownCapture, "", "%v", err), nil)
+		return internalError(err)
 	}
 	return r
+}
+
+// internalError answers a fault of this server's own, which no capture
+// code describes; it never happens with the types it encodes.
+func internalError(err error) mcpstdio.Result {
+	return mcpstdio.Result{Text: "internal error: " + err.Error(), IsError: true}
 }
 
 // jobAnswer is a settled job's answer: its error when it failed or was
@@ -526,7 +555,7 @@ func (s *Server) jobAnswer(j *job) mcpstdio.Result {
 		return toolError(cmp.Or(e, cancelledError()), j)
 	}
 	if e == nil {
-		e = capture.Errorf(capture.CodeDisk, "", "the capture failed and recorded no error")
+		return internalError(fmt.Errorf("job %s failed and recorded no error", j.id))
 	}
 	return toolError(e, j)
 }
@@ -539,7 +568,7 @@ func (s *Server) resultAnswer(jobID string, b []byte, derived string, recipe *re
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(b, &top); err != nil {
 		s.log.Error("capture result", "job", jobID, "err", err)
-		return toolError(capture.Errorf(capture.CodeDisk, "", "the result of job %s cannot be read", jobID), nil)
+		return internalError(fmt.Errorf("the result of job %s cannot be read: %v", jobID, err))
 	}
 	top["job"], top["status"] = rawString(jobID), rawString(string(jobDone))
 	if _, ok := top["derived"]; !ok {
@@ -555,9 +584,9 @@ func (s *Server) resultAnswer(jobID string, b []byte, derived string, recipe *re
 	}
 	out, err := marshal(top)
 	if err != nil {
-		return toolError(capture.Errorf(capture.CodeDisk, "", "the result of job %s cannot be encoded", jobID), nil)
+		return internalError(fmt.Errorf("the result of job %s cannot be encoded: %v", jobID, err))
 	}
-	return mcpstdio.Result{Text: string(s.cutResult(out, s.lim.MaxResponseBytes))}
+	return s.fitResult(out)
 }
 
 func rawString(s string) json.RawMessage {
@@ -610,9 +639,9 @@ var errNoCapture = errors.New("no such capture")
 // waitHistorical answers the capture key from its manifest: from the
 // registry when it was read before, else through the lookup pool, waiting
 // at most d. One not read by then, or a full pool, is loading.
-func (s *Server) waitHistorical(ctx context.Context, key string, d time.Duration) mcpstdio.Result {
+func (s *Server) waitHistorical(ctx context.Context, key, jobID string, d time.Duration) mcpstdio.Result {
 	if h, ok := s.registry.historical(key); ok {
-		return s.historicalAnswer(key, h)
+		return s.historicalAnswer(key, jobID, h)
 	}
 	l, ok := s.lookups.get(key, func() (any, error) { return s.loadHistorical(key) })
 	if !ok {
@@ -627,7 +656,7 @@ func (s *Server) waitHistorical(ctx context.Context, key string, d time.Duration
 	case err != nil:
 		return toolError(unknownCapture(key, "a capture whose manifest cannot be read: "+causeText(err)), nil)
 	}
-	return s.historicalAnswer(key, v.(*historical))
+	return s.historicalAnswer(key, jobID, v.(*historical))
 }
 
 // loadingAnswer is a historical answer that is still being read.
@@ -642,21 +671,25 @@ func loadingAnswer(key string) mcpstdio.Result {
 
 // historicalAnswer is a capture read back from its manifest: a committed
 // one's result, whose derived results are to be recomputed with the calls
-// it carries, or a failed one's error.
-func (s *Server) historicalAnswer(key string, h *historical) mcpstdio.Result {
+// it carries, or a failed one's error. jobID, when known, is the job of
+// this server that made it.
+func (s *Server) historicalAnswer(key, jobID string, h *historical) mcpstdio.Result {
 	m := h.m
 	if m.Outcome != captureOK {
 		e := errorFromWire(m.Error)
 		status := string(jobFailed)
 		if e == nil {
+			// The server ended under the capture: nothing about the
+			// capture itself failed, so it may be run again at once.
 			e = capture.Errorf(capture.CodeCancelled, "capture again",
 				"the server running capture %s ended before it finished; recovery removed what it had written", key)
+			e.Retryable, e.RetryAfter = true, 0
 			status = captureInterrupted
 		} else if e.Code == capture.CodeCancelled {
 			status = string(jobCancelled)
 		}
 		w := toWireError(e)
-		w.CaptureID, w.Status = key, status
+		w.Job, w.CaptureID, w.Status = jobID, key, status
 		return errorResult(w)
 	}
 	res := captureResult{
@@ -669,13 +702,21 @@ func (s *Server) historicalAnswer(key string, h *historical) mcpstdio.Result {
 	}
 	b, err := json.Marshal(res)
 	if err != nil {
-		return toolError(capture.Errorf(capture.CodeDisk, "", "the answer for %s cannot be encoded", key), nil)
+		return internalError(fmt.Errorf("the answer for %s cannot be encoded: %v", key, err))
 	}
 	var top map[string]json.RawMessage
-	_ = json.Unmarshal(b, &top)
+	if err := json.Unmarshal(b, &top); err != nil {
+		return internalError(err)
+	}
 	top["status"] = rawString(string(jobDone))
-	out, _ := marshal(top)
-	return mcpstdio.Result{Text: string(s.cutResult(out, s.lim.MaxResponseBytes))}
+	if jobID != "" {
+		top["job"] = rawString(jobID)
+	}
+	out, err := marshal(top)
+	if err != nil {
+		return internalError(err)
+	}
+	return s.fitResult(out)
 }
 
 // readCaptureDir opens the capture directory to read it, creating nothing:
@@ -812,8 +853,8 @@ func (s *Server) handleCancel(_ context.Context, raw json.RawMessage) (mcpstdio.
 	out := cancelAnswer{Job: a.ID}
 	if j, ok := s.registry.get(a.ID); ok {
 		out.Job, out.ID = j.id, j.captureIDNow()
-	} else if captureID, _, ok := s.registry.final(a.ID); ok {
-		out.ID = captureID
+	} else if al, ok := s.registry.final(a.ID); ok {
+		out.Job, out.ID = al.jobID, al.captureID
 	}
 	status, ok := s.registry.cancel(a.ID)
 	if !ok {
@@ -831,6 +872,19 @@ const (
 	cutViewsNote   = "each profile's open was cut to its handle and default_view, and each compare view to its totals and next, to fit MaxResponseBytes"
 	cutMinimalNote = "the result is over MaxResponseBytes even cut: call open with each profile's path, and diff, for its contents"
 )
+
+// fitResult is the result b as an answer, cut to MaxResponseBytes; one
+// that cannot be cut that far is a short error saying how to read it.
+func (s *Server) fitResult(b []byte) mcpstdio.Result {
+	max := s.lim.MaxResponseBytes
+	out := s.cutResult(b, max)
+	if len(out) <= max {
+		return mcpstdio.Result{Text: string(out)}
+	}
+	return toolError(capture.Errorf(capture.CodeTooLarge,
+		"restart perf-agent-mcp with a larger --limit MaxResponseBytes=N; capture_list shows the capture's paths, which open takes",
+		"the capture's result is over MaxResponseBytes=%d even cut to its paths", max), nil)
+}
 
 // cutResult cuts the result b to max bytes (§4.3), a step at a time,
 // each named in its notes: the opens to their handle, views, default view
@@ -894,6 +948,12 @@ func (s *Server) cutResult(b []byte, max int) []byte {
 		minimal["profiles"] = mustRaw(ps)
 	}
 	out, err := marshal(minimal)
+	if err == nil && len(out) > max {
+		// The recipe is the longest part left; the paths it opens are in
+		// profiles.
+		delete(minimal, "recompute")
+		out, err = marshal(minimal)
+	}
 	if err != nil {
 		return b
 	}

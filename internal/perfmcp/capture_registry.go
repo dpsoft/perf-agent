@@ -1,6 +1,7 @@
 package perfmcp
 
 import (
+	"cmp"
 	"container/list"
 	"encoding/json"
 	"errors"
@@ -54,19 +55,22 @@ type registry struct {
 	byJob     map[string]*list.Element
 	byCapture map[string]*list.Element
 	bytes     int
-	// aliases outlive the LRU: a job id still resolves to its capture id
-	// and final answer after its entry is evicted. aliasRing holds their
-	// ids oldest first from aliasNext, to forget the oldest past
-	// maxJobAliases.
-	aliases   map[string]jobAlias
-	aliasRing []string
-	aliasNext int
+	// aliases outlive the LRU: a job id, and its capture id through
+	// captureAliases, still resolve to the job's capture id and final
+	// answer after its entry is evicted. aliasRing holds the job ids oldest
+	// first from aliasNext, to forget the oldest past maxJobAliases.
+	aliases        map[string]jobAlias
+	captureAliases map[string]string
+	aliasRing      []string
+	aliasNext      int
 }
 
-// jobAlias is what is remembered of a finished job: its capture id, "" when
-// it ended before it had one, and what a cancel of it is told.
+// jobAlias is what is remembered of a finished job: its id, its capture
+// id, "" when it ended before it had one, what a cancel of it is told, and
+// the code it failed with, "" when it did not fail.
 type jobAlias struct {
-	captureID, answer string
+	jobID, captureID, answer string
+	code                     capture.Code
 }
 
 // registryEntry is a finished job, or a historical answer read from a
@@ -85,14 +89,15 @@ type registryEntry struct {
 // nonce so that ids from another server process never match.
 func newRegistry(lim CaptureLimits, nonce string) *registry {
 	return &registry{
-		lim:       lim,
-		nonce:     nonce,
-		res:       map[*job]*reservation{},
-		lru:       list.New(),
-		byJob:     map[string]*list.Element{},
-		byCapture: map[string]*list.Element{},
-		aliases:   map[string]jobAlias{},
-		aliasRing: make([]string, maxJobAliases),
+		lim:            lim,
+		nonce:          nonce,
+		res:            map[*job]*reservation{},
+		lru:            list.New(),
+		byJob:          map[string]*list.Element{},
+		byCapture:      map[string]*list.Element{},
+		aliases:        map[string]jobAlias{},
+		captureAliases: map[string]string{},
+		aliasRing:      make([]string, maxJobAliases),
 	}
 }
 
@@ -168,7 +173,7 @@ func (r *registry) finish(j *job, resultBytes int, profiled time.Duration) error
 	if resultBytes < 0 || profiled < 0 {
 		return fmt.Errorf("finish %s with %d bytes, %v profiled: %w", j.id, resultBytes, profiled, errNegative)
 	}
-	answer, captureID := finalAnswer(j)
+	answer, captureID, code := finalAnswer(j)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.active.Load() != j {
@@ -188,7 +193,7 @@ func (r *registry) finish(j *job, resultBytes int, profiled time.Duration) error
 	el := r.lru.PushFront(&registryEntry{j: j, answer: answer, jobID: j.id, captureID: captureID, bytes: resultBytes})
 	r.index(el)
 	r.bytes += resultBytes
-	r.remember(j.id, jobAlias{captureID: captureID, answer: answer})
+	r.remember(jobAlias{jobID: j.id, captureID: captureID, answer: answer, code: code})
 	r.evict(el)
 	return nil
 }
@@ -207,14 +212,17 @@ func (r *registry) update(j *job, resultBytes int) error {
 	if !terminal {
 		return fmt.Errorf("update %s: %w", j.id, errNotFinished)
 	}
-	answer, captureID := finalAnswer(j)
+	answer, captureID, code := finalAnswer(j)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.finished(j.id) {
 		return fmt.Errorf("update %s: %w", j.id, errNotAdmitted)
 	}
 	if _, ok := r.aliases[j.id]; ok {
-		r.aliases[j.id] = jobAlias{captureID: captureID, answer: answer}
+		r.aliases[j.id] = jobAlias{jobID: j.id, captureID: captureID, answer: answer, code: code}
+		if captureID != "" {
+			r.captureAliases[captureID] = j.id
+		}
 	}
 	el, ok := r.byJob[j.id]
 	if !ok {
@@ -293,14 +301,37 @@ func (r *registry) alias(jobID string) (captureID string, ok bool) {
 	return a.captureID, ok
 }
 
-// final is the capture id and the final answer of the finished job jobID,
-// from its alias, which outlives its entry; ok is false for a job id this
-// registry does not remember.
-func (r *registry) final(jobID string) (captureID, answer string, ok bool) {
+// final is the alias of the finished job with the job or capture id id,
+// which outlives its entry; ok is false for an id this registry does not
+// remember.
+func (r *registry) final(id string) (jobAlias, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	a, ok := r.aliases[jobID]
-	return a.captureID, a.answer, ok
+	return r.aliasOf(id)
+}
+
+// aliasOf is the alias of the job or capture id id. r.mu is held.
+func (r *registry) aliasOf(id string) (jobAlias, bool) {
+	if a, ok := r.aliases[id]; ok {
+		return a, true
+	}
+	if jobID, ok := r.captureAliases[id]; ok {
+		a, ok := r.aliases[jobID]
+		return a, ok
+	}
+	return jobAlias{}, false
+}
+
+// forget drops the entry of captureID, a finished job's or a historical
+// answer, once retention has removed the capture: a later wait reads the
+// disk and finds it gone. The job's alias stays, since its final answer is
+// still true; a job whose commit is undecided is kept.
+func (r *registry) forget(captureID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if el, ok := r.byCapture[captureID]; ok && el.Value.(*registryEntry).answer != cancelAnswerPending {
+		r.remove(el)
+	}
 }
 
 // historical is the historical answer kept for captureID, which becomes
@@ -368,26 +399,31 @@ func (r *registry) finalOf(id string) (answer string, pending *job, ok bool) {
 		}
 		return e.answer, nil, true
 	}
-	if a, ok := r.aliases[id]; ok {
+	if a, ok := r.aliasOf(id); ok {
 		return a.answer, nil, true
 	}
 	return "", nil, false
 }
 
-// finalAnswer is what a cancel of the finished job j is told, and its
-// capture id. A job leaves the slot before it has ended only when its
-// commit is undecided: it may have committed, so the answer is that the
-// decision is pending until update records how it was settled.
-func finalAnswer(j *job) (answer, captureID string) {
+// finalAnswer is what a cancel of the finished job j is told, its capture
+// id, and the code it failed with. A job leaves the slot before it has
+// ended only when its commit is undecided: it may have committed, so the
+// answer is that the decision is pending until update records how it was
+// settled.
+func finalAnswer(j *job) (answer, captureID string, code capture.Code) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	code = j.endCode
+	if j.err != nil {
+		code = cmp.Or(code, j.err.Code)
+	}
 	if j.ending.terminal() {
-		return j.ending.cancelAnswer(), j.captureID
+		return j.ending.cancelAnswer(), j.captureID, code
 	}
 	if !j.status.terminal() {
-		return cancelAnswerPending, j.captureID
+		return cancelAnswerPending, j.captureID, ""
 	}
-	return j.status.cancelAnswer(), j.captureID
+	return j.status.cancelAnswer(), j.captureID, code
 }
 
 // finished reports whether the job jobID has finished here, by its entry
@@ -454,15 +490,21 @@ func (r *registry) remove(el *list.Element) {
 	r.bytes -= e.bytes
 }
 
-// remember records the alias of the finished job jobID, forgetting the
-// oldest past maxJobAliases. r.mu is held.
-func (r *registry) remember(jobID string, a jobAlias) {
+// remember records the alias of a finished job, by its job id and its
+// capture id, forgetting the oldest past maxJobAliases. r.mu is held.
+func (r *registry) remember(a jobAlias) {
 	if old := r.aliasRing[r.aliasNext]; old != "" {
+		if c := r.aliases[old].captureID; c != "" && r.captureAliases[c] == old {
+			delete(r.captureAliases, c)
+		}
 		delete(r.aliases, old)
 	}
-	r.aliasRing[r.aliasNext] = jobID
+	r.aliasRing[r.aliasNext] = a.jobID
 	r.aliasNext = (r.aliasNext + 1) % len(r.aliasRing)
-	r.aliases[jobID] = a
+	r.aliases[a.jobID] = a
+	if a.captureID != "" {
+		r.captureAliases[a.captureID] = a.jobID
+	}
 }
 
 // captureIDIs reports whether id is j's capture id, once it has one.

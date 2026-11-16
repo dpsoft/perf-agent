@@ -309,6 +309,7 @@ func (s *Server) retain(d *captureDir, p protection, now time.Time) (evicted []s
 	}
 	r := &retention{s: s, d: d, p: p, names: map[string][]string{}}
 	defer r.close()
+	defer func() { s.forgetEvicted(evicted) }()
 	if err := r.load(); err != nil {
 		return nil, r.fail(err)
 	}
@@ -316,6 +317,22 @@ func (s *Server) retain(d *captureDir, p protection, now time.Time) (evicted []s
 		return r.evicted, r.fail(err)
 	}
 	return r.evicted, nil
+}
+
+// forgetEvicted drops what the registry holds of each capture retention
+// removed (evicted names "series/NNN-label"), so no wait answers one as
+// done from memory, and marks the history changed.
+func (s *Server) forgetEvicted(evicted []string) {
+	if len(evicted) == 0 {
+		return
+	}
+	for _, name := range evicted {
+		key, _, _ := strings.Cut(name, "-")
+		if s.registry != nil {
+			s.registry.forget(key)
+		}
+	}
+	s.historyChanged()
 }
 
 // run is the pass's four steps, after it puts back what an interrupted

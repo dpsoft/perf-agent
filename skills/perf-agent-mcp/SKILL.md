@@ -30,10 +30,10 @@ Read the server's own guide before the first tool call: the MCP prompt `perf-age
 ## Capture loop
 
 1. `capture` with `command` (an absolute path, or a bare name in PATH; never `./x`) or `pid`, a `series` per loop and a `label`; keep the base with `keep`. It answers a `job` at once.
-2. `capture_wait` with that `job` (or the capture `id`, `series/NNN`) until it returns the result: each call blocks at most its `timeout` (45s) and returns the state meanwhile. The result holds the `handle` of each profile; use it with the tools above.
+2. `capture_wait` with that `job` (or the capture `id`, `series/NNN`) until it returns the result: each call blocks at most its `timeout` (default 30s, at most 45s) and returns the state meanwhile. The result holds the `handle` of each profile; use it with the tools above.
 3. After a change, `capture` again with `compare_with` set to the base's id: it inherits the base's settings, and the result's `compare` carries the diff rows and the `next` call for the rest.
 4. A failure is one JSON `error` with a `code`, `retryable`, `retry_after` and `next`: follow `next`. `busy` and `budget` say when to retry; `incomparable` and `unknown_baseline` mean the compare is wrong, not the capture.
-5. `capture_cancel` stops a job at once; `capture_list` shows the running job and each series' history, with the `recompute` calls when a result is no longer in memory (`handles` is then `reopen`).
+5. `capture_cancel` stops a job at once; `capture_list` shows the running job and each series' history. A `capture_wait` on a capture this server no longer holds in memory answers from its manifest with `handles` set to `reopen` and the `recompute` calls that reopen it.
 
 Every call names its `handle` and `view`; nothing is "current". The exceptions: `open` takes a `path`; `diff` takes `base_handle`, `base_view`, `new_handle` and `new_view`; if a handle is gone, `open` again. Lists are paged: pass `next_cursor` back as `cursor` with the same arguments.
 

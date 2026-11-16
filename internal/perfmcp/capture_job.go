@@ -129,6 +129,9 @@ type job struct {
 	// registry frees its slot, so a cancel and the registry already answer
 	// from it.
 	ending jobStatus
+	// endCode is the code of the error the job is ending with, kept with
+	// ending for the registry's alias.
+	endCode capture.Code
 	// duration is the capture's effective duration, once the job knows it.
 	duration time.Duration
 	// recipe is how to make a done job's results again from its files, for

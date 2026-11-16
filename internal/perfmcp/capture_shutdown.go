@@ -134,6 +134,7 @@ func (s *Server) maintenance(full bool) {
 		return
 	}
 	defer func() { _ = lease.Close() }()
+	defer s.historyChanged()
 	s.retryStrandedPass(d)
 	if !full {
 		return

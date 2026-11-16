@@ -135,6 +135,8 @@ type job struct {
 	endCode capture.Code
 	// duration is the capture's effective duration, once the job knows it.
 	duration time.Duration
+	// ended is when the job reached its end state, where elapsed stops.
+	ended time.Time
 	// recipe is how to make a done job's results again from its files, for
 	// a wait that finds its handles evicted from the store.
 	recipe *recompute
@@ -182,6 +184,9 @@ func (j *job) set(f func()) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	f()
+	if j.status.terminal() && j.ended.IsZero() {
+		j.ended = time.Now()
+	}
 	mark := string(j.status)
 	if j.status == jobDone && j.derived != "" {
 		mark += "/" + j.derived
@@ -221,6 +226,9 @@ func (j *job) viewLocked(now time.Time) jobView {
 	from := j.began
 	if from.IsZero() {
 		from = j.created
+	}
+	if !j.ended.IsZero() {
+		now = j.ended
 	}
 	elapsed := now.Sub(from)
 	v.Elapsed = elapsed.Round(100 * time.Millisecond).String()

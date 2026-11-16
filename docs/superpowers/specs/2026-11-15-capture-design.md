@@ -243,7 +243,10 @@ is released, against the snapshot.
 
   It does no disk I/O, takes no lock, and never waits on the engine. The
   capture id (`parse-opt/002`) appears in the job's state once
-  `preparing` has assigned it.
+  `preparing` has assigned it. `eta` (here and in the job's state) is an
+  upper bound: the duration plus 5 s of slack, counting
+  `Capture.MaxDuration` for a `compare_with` capture that inherits its
+  duration until the baseline's is known.
 - **The job owns its rollback.** The transports never decide one.
 - **The engine is taken only at two points (CAP-R13):**
   - `preparing`'s shared inputs (baseline, pins, protected inputs,
@@ -467,9 +470,13 @@ capture {"command": ["/home/u/proj/bench"], "cwd": "/home/u/proj", "series": "pa
   stop.
 - **`profiles[].open`:** the `open` tool's own result for that file,
   produced by the same code path. If the whole response would exceed
-  `MaxResponseBytes`, each `open` is cut to `handle`, `views`,
-  `default_view` and `quality`, with the note "call `open` with path for
-  the full result".
+  `MaxResponseBytes`, it is cut a step at a time: each `open` to
+  `handle`, `views`, `default_view` and `quality`; the compare's rows; the
+  workload's output tail; each `open` to `handle` and `default_view` and
+  each compare view to its totals and `next`. The result then carries
+  **one** cut note, replaced at each step, that says everything cut and
+  the calls that bring it back (`open` with each profile's path, `diff`
+  with each view's `next`).
 - **`target`:** carries `comm` and the basename of `exe`, never `cmdline`,
   which can hold secrets. The workload's argv is not echoed back either:
   the agent sent it. When the target's end stopped the capture, `exit`
@@ -772,7 +779,7 @@ These go in a new `Limits.Capture` struct, so they are settable through
 | `Capture.MaxProfileBytes` | `Model.MaxRawBytes` (256 MiB) | — | A larger file could not be opened anyway |
 | `Capture.MaxExeclogBytes` | `Model.MaxSidecarBytes` | — | Same reason |
 | `Capture.MaxStoredBytes` | 4 GiB | — | The total size of the capture directory, measured before each capture (it includes earlier runs). Retention (§7.3) makes room first; `disk` only if that is not enough |
-| `Capture.KeepPerSeries` | 10 | — | Unkept captures retained per series, newest first (§7.3) |
+| `Capture.KeepPerSeries` | 10 | — | Unkept captures retained per series, newest first (§7.3). A capture open in this server's store is protected, so with more handles open in one series than this, retention keeps them all until they are evicted from the store (`MaxOpenHandles`) |
 | `Capture.MaxKeptPerSeries` | 4 | — | `keep: true` captures per series; one more is refused (`invalid_argument`), so `keep` cannot defeat retention |
 | `Capture.CompareRows` | 20 | `MaxDiffRows` | Diff rows in a `compare_with` result |
 | `Capture.MaxJobs` | 32 | — | Terminal jobs kept in memory, LRU (CAP-R11, CAP-R16) |

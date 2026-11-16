@@ -70,7 +70,9 @@ func TestALinkThatLandedIsCommitted(t *testing.T) {
 
 // TestAForeignFileAtTheManifestNameIsExists: a manifest name taken by a
 // file this server did not write is exists, never disk, and the file is
-// kept byte for byte.
+// kept byte for byte. So are the published files: something other than
+// nothing is at the manifest name, and it might list them, so the
+// rollback stays stranded instead of removing them.
 func TestAForeignFileAtTheManifestNameIsExists(t *testing.T) {
 	s, d, _ := newCaptureServer(t)
 	theirs := []byte("not a manifest\n")
@@ -89,8 +91,11 @@ func TestAForeignFileAtTheManifestNameIsExists(t *testing.T) {
 	if got, err := os.ReadFile(name); err != nil || !bytes.Equal(got, theirs) {
 		t.Fatalf("the foreign file is %q, %v", got, err)
 	}
-	if files, _ := filepath.Glob(filepath.Join(d.root.Name(), "adhoc", "001-run-*")); len(files) != 0 {
-		t.Fatalf("capture files left: %v", files)
+	if files, _ := filepath.Glob(filepath.Join(d.root.Name(), "adhoc", "001-run-*")); len(files) != 1 {
+		t.Fatalf("the published files were removed beside a manifest name in use: %v", files)
+	}
+	if len(s.stranded) != 1 {
+		t.Fatalf("the rollback is not stranded: %d", len(s.stranded))
 	}
 }
 

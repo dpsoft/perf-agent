@@ -266,7 +266,7 @@ func TestTokenNamedTemporariesAreProvenByWhatTheyHold(t *testing.T) {
 	tok := r.txn.in.Token[:16]
 	m := r.txn.manifestOf(manifest{}, captureFailed, nil)
 	b, _ := json.Marshal(m)
-	writeFile(t, ser, "."+manifestName(1, "run")+".tmp-"+tok, string(b))
+	writeFile(t, ser, "."+manifestName(1, "run")+".tmp-"+tok, string(b)+"\n")
 	notes := crashRecover(t, s, d, clk)
 	noOrphans(t, notes)
 	invariant(t, d, notes)

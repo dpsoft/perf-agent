@@ -164,7 +164,10 @@ type manifest struct {
 	Survivors        []wireSurvivor   `json:"survivors,omitzero"`
 	Cleanup          string           `json:"cleanup,omitzero"`
 	Cancel           string           `json:"cancel,omitzero"`
-	WrittenBy        string           `json:"written_by"`
+	// Token is the owner token of the intent that wrote the manifest: it
+	// proves a manifest temporary a crash left was this server's.
+	Token     string `json:"token,omitzero"`
+	WrittenBy string `json:"written_by"`
 }
 
 // readSmall reads name inside root, refusing a symbolic link, anything but
@@ -216,8 +219,7 @@ func openNoFollow(root *os.Root, name string) (*os.File, fs.FileInfo, error) {
 }
 
 // readManifest reads and checks the manifest name inside a series: at most
-// 1 MiB, format 1, written by perf-agent-mcp, and the id and label its
-// name says.
+// 1 MiB, and valid for that name (see checkManifest).
 func readManifest(ser *os.Root, name string) (manifest, error) {
 	var m manifest
 	b, _, err := readSmall(ser, name, maxManifestBytes)
@@ -227,26 +229,37 @@ func readManifest(ser *os.Root, name string) (manifest, error) {
 	if err != nil {
 		return manifest{}, fmt.Errorf("manifest %s: %w", name, err)
 	}
+	if err := checkManifest(m, name); err != nil {
+		return manifest{}, err
+	}
+	return m, nil
+}
+
+// checkManifest refuses a manifest that is not this server's as name: its
+// format, its writer, the id and label its name says, a known outcome,
+// files exactly when it is ok, and each file named for this capture with a
+// digest.
+func checkManifest(m manifest, name string) error {
 	id, label, kind, ok := parseName(name)
 	switch {
 	case m.Format != manifestFormat:
-		return manifest{}, fmt.Errorf("manifest %s has format %d, not %d", name, m.Format, manifestFormat)
+		return fmt.Errorf("manifest %s has format %d, not %d", name, m.Format, manifestFormat)
 	case m.WrittenBy != writtenBy:
-		return manifest{}, fmt.Errorf("manifest %s was not written by %s", name, writtenBy)
+		return fmt.Errorf("manifest %s was not written by %s", name, writtenBy)
 	case !ok || kind != kindManifest || m.ID != formatID(id) || m.Label != label:
-		return manifest{}, fmt.Errorf("manifest %s names capture %s-%s", name, echo(m.ID), echo(m.Label))
+		return fmt.Errorf("manifest %s names capture %s-%s", name, echo(m.ID), echo(m.Label))
 	case m.Outcome != captureOK && m.Outcome != captureFailed && m.Outcome != captureInterrupted:
-		return manifest{}, fmt.Errorf("manifest %s has outcome %q", name, echo(m.Outcome))
+		return fmt.Errorf("manifest %s has outcome %q", name, echo(m.Outcome))
 	case (m.Outcome == captureOK) != (len(m.Files) > 0):
-		return manifest{}, fmt.Errorf("manifest %s is %s with %d files", name, m.Outcome, len(m.Files))
+		return fmt.Errorf("manifest %s is %s with %d files", name, m.Outcome, len(m.Files))
 	}
 	for _, f := range m.Files {
 		out, ok := strings.CutPrefix(f.Name, formatID(id)+"-"+label+"-")
 		if !ok || !validName(out, maxFileName) || !isHex(f.SHA256, 64) {
-			return manifest{}, fmt.Errorf("manifest %s lists file %s", name, echo(f.Name))
+			return fmt.Errorf("manifest %s lists file %s", name, echo(f.Name))
 		}
 	}
-	return m, nil
+	return nil
 }
 
 // seriesManifests reads every manifest of a series, in id order. bad
@@ -301,22 +314,9 @@ func cmpOrErr(why string, err error) string {
 // be reused, and this server's own links, renames and heartbeats change
 // the file's ctime. An identity with no digest is never matched.
 func matches(root *os.Root, name string, want fileIdentity) (why string, err error) {
-	fi, err := root.Lstat(name)
-	if err != nil {
-		return "", err
-	}
-	st, _ := statOf(fi)
-	switch {
-	case !fi.Mode().IsRegular():
-		return describeType(fi.Mode()) + ", not the regular file recorded", nil
-	case st.dev != want.Dev || st.ino != want.Ino:
-		return "a different file from the one recorded", nil
-	case st.nlink != 1 && st.nlink != 2:
-		return fmt.Sprintf("%d links, not the one or two recorded", st.nlink), nil
-	case want.SHA256 == "":
-		return "a file whose contents were never recorded", nil
-	case fi.Size() != want.Size:
-		return fmt.Sprintf("%d bytes, not the %d recorded", fi.Size(), want.Size), nil
+	fi, why, err := statMatches(root, name, want)
+	if err != nil || why != "" {
+		return why, err
 	}
 	f, ofi, err := openNoFollow(root, name)
 	if err != nil {
@@ -326,6 +326,41 @@ func matches(root *os.Root, name string, want fileIdentity) (why string, err err
 	if !os.SameFile(fi, ofi) {
 		return "a different file from the one recorded", nil
 	}
+	return contentsMatch(f, want)
+}
+
+// statMatches is matches without the contents: what Lstat shows of name
+// (a regular file, the recorded device and inode, one or two links, the
+// recorded size, and a digest on record to check later).
+func statMatches(root *os.Root, name string, want fileIdentity) (fs.FileInfo, string, error) {
+	fi, err := root.Lstat(name)
+	if err != nil {
+		return nil, "", err
+	}
+	return fi, statWhy(fi, want), nil
+}
+
+// statWhy says why fi is not the file want records, by its stat alone.
+func statWhy(fi fs.FileInfo, want fileIdentity) string {
+	st, _ := statOf(fi)
+	switch {
+	case !fi.Mode().IsRegular():
+		return describeType(fi.Mode()) + ", not the regular file recorded"
+	case st.dev != want.Dev || st.ino != want.Ino:
+		return "a different file from the one recorded"
+	case st.nlink != 1 && st.nlink != 2:
+		return fmt.Sprintf("%d links, not the one or two recorded", st.nlink)
+	case want.SHA256 == "":
+		return "a file whose contents were never recorded"
+	case fi.Size() != want.Size:
+		return fmt.Sprintf("%d bytes, not the %d recorded", fi.Size(), want.Size)
+	}
+	return ""
+}
+
+// contentsMatch says why the open file's contents are not the recorded
+// ones, "" when they are.
+func contentsMatch(f *os.File, want fileIdentity) (string, error) {
 	sum, err := hashFile(f)
 	if err != nil {
 		return "", err
@@ -358,6 +393,9 @@ const quarantinePrefix = ".del-"
 var (
 	quarantineHook      func(root *os.Root, name string)
 	quarantineAfterHook func() error
+	// quarantineBeforeUnlink runs between the last check of the
+	// quarantined file and its unlink; a seam for tests.
+	quarantineBeforeUnlink func(root *os.Root, q string)
 )
 
 // removeByIdentity removes name inside root only when it is the file want
@@ -376,7 +414,9 @@ func removeByIdentity(root *os.Root, name string, want fileIdentity) (removed bo
 // capture's token, so that recovery can tell whose quarantined file a
 // crash left.
 func removeTagged(root *os.Root, name string, want fileIdentity, tag string) (removed bool, left string, err error) {
-	why, err := matches(root, name, want)
+	// Only the stat is checked under the name: the contents are hashed
+	// once, under the quarantine name, where nothing else looks.
+	_, why, err := statMatches(root, name, want)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		return false, "", nil
@@ -412,14 +452,36 @@ func removeTagged(root *os.Root, name string, want fileIdentity, tag string) (re
 			return fail(err)
 		}
 	}
-	why, err = matches(root, q, want)
-	if err == nil && why == "" {
-		if err := root.Remove(q); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	f, fi, err := openNoFollow(root, q)
+	if err != nil {
+		if errors.Is(err, errNotRegular) {
+			return false, err.Error() + restore(root, q, name), nil
+		}
+		return fail(err)
+	}
+	defer func() { _ = f.Close() }()
+	why = statWhy(fi, want)
+	if why == "" {
+		if why, err = contentsMatch(f, want); err != nil {
 			return fail(err)
 		}
-		return true, "", nil
 	}
-	return false, cmpOrErr(why, err) + restore(root, q, name), nil
+	if why != "" {
+		return false, why + restore(root, q, name), nil
+	}
+	// Right before the unlink, the quarantine name must still be the file
+	// just checked. This narrows the window in which a same-user process
+	// could rename another file onto the name; it does not close it.
+	if quarantineBeforeUnlink != nil {
+		quarantineBeforeUnlink(root, q)
+	}
+	if lfi, err := root.Lstat(q); err != nil || !os.SameFile(lfi, fi) {
+		return false, "the file under the quarantine name " + q + " changed before its unlink; it is left there", nil
+	}
+	if err := root.Remove(q); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fail(err)
+	}
+	return true, "", nil
 }
 
 // restore puts q back under name without replacing anything there, and

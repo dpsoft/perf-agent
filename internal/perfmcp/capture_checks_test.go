@@ -113,6 +113,7 @@ func TestIntentCheckRefusesWhatTheProtocolNeverCreates(t *testing.T) {
 	if err := good.check(name); err != nil {
 		t.Fatalf("a valid intent: %v", err)
 	}
+	reasons := map[string]string{"output-path": "lists output", "token": "token", "token-case": "token"}
 	for _, c := range []struct {
 		name string
 		edit func(*intent)
@@ -123,10 +124,15 @@ func TestIntentCheckRefusesWhatTheProtocolNeverCreates(t *testing.T) {
 		{"label", func(in *intent) { in.Label = "../run" }},
 		{"series", func(in *intent) { in.Series = "a/b" }},
 		{"token", func(in *intent) { in.Token = "short" }},
-		{"token-case", func(in *intent) { in.Token = strings.ToUpper(in.Token) }},
+		{"token-case", func(in *intent) {
+			in.Token = strings.ToUpper(in.Token)
+			in.Temps[0].Name = "." + manifestName(1, "run") + ".tmp-" + in.Token[:16]
+		}},
 		{"staging", func(in *intent) { in.Staging = "../elsewhere" }},
 		{"outputs", func(in *intent) { in.Outputs = append(in.Outputs, "gpu.pb.gz") }},
-		{"output-path", func(in *intent) { in.Outputs[0], in.Finals[0] = "a/b", finalName(1, "run", "a/b") }},
+		{"output-path", func(in *intent) {
+			in.Outputs[0], in.Finals[0], in.Files[0].Name, in.Files[0].Staged = "a/b", finalName(1, "run", "a/b"), finalName(1, "run", "a/b"), "a/b"
+		}},
 		{"final", func(in *intent) { in.Finals[0] = "001-run-other" }},
 		{"file", func(in *intent) { in.Files[0].Name = "elsewhere" }},
 		{"staged", func(in *intent) { in.Files[0].Staged = "other" }},
@@ -143,8 +149,12 @@ func TestIntentCheckRefusesWhatTheProtocolNeverCreates(t *testing.T) {
 				t.Fatal(err)
 			}
 			c.edit(&in)
-			if err := in.check(name); err == nil {
+			err := in.check(name)
+			if err == nil {
 				t.Fatal("accepted")
+			}
+			if want := reasons[c.name]; want != "" && !strings.Contains(err.Error(), want) {
+				t.Fatalf("refused for another reason: %v", err)
 			}
 		})
 	}

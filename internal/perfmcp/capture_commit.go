@@ -217,8 +217,10 @@ type captureTxn struct {
 	// validated are the files validate checked, before record.
 	validated []fileIdentity
 	// pending is a failure manifest a stranded rollback still has to
-	// commit.
+	// commit; decide is the manifest temporary of a capture whose manifest
+	// link may or may not have been made.
 	pending *manifest
+	decide  *fileIdentity
 	// cancelNote is what to report about a cancel that met the commit.
 	cancelNote string
 	// notes say what the transaction left where it was, and why.
@@ -271,7 +273,7 @@ func (s *Server) beginTxn(d *captureDir, series string, id int, label string, se
 	tmp, err := t.writeTemp(name, b, "intent")
 	if err == nil {
 		err = s.linkNoReplace(ser, rootCaptures, tmp.Name, name)
-		if err != nil && !errors.Is(err, errCrash) && landed(ser, name, tmp) {
+		if err != nil && !errors.Is(err, errCrash) && landed(ser, name, tmp) == linkMade {
 			err = nil
 		}
 		if err != nil && !errors.Is(err, errCrash) {
@@ -305,7 +307,7 @@ func (s *Server) beginTxn(d *captureDir, series string, id int, label string, se
 	hbTmp, err := t.writeTemp(hbName, []byte(t.in.Token+"\n"), "heartbeat")
 	if err == nil {
 		err = s.linkNoReplace(ser, rootCaptures, hbTmp.Name, hbName)
-		if err != nil && !errors.Is(err, errCrash) && landed(ser, hbName, hbTmp) {
+		if err != nil && !errors.Is(err, errCrash) && landed(ser, hbName, hbTmp) == linkMade {
 			err = nil
 		}
 		if err != nil && !errors.Is(err, errCrash) {
@@ -331,6 +333,13 @@ func (s *Server) beginTxn(d *captureDir, series string, id int, label string, se
 	return t, t.rewrite()
 }
 
+// landedLstat is how a link's outcome is checked; a seam for tests.
+var landedLstat = (*os.Root).Lstat
+
+// errAlreadyCommitted is a rollback that found this capture's own ok
+// manifest at its manifest name: the capture committed after all.
+var errAlreadyCommitted = errors.New("the capture is committed")
+
 // startTime is this process's start time, through the selfStartTime seam.
 func (s *Server) startTime() (uint64, error) {
 	if s.selfStartTime != nil {
@@ -339,16 +348,31 @@ func (s *Server) startTime() (uint64, error) {
 	return selfStart()
 }
 
-// landed reports whether name now is the file tmp records: a link that
+// linkOutcome is what a link that answered an error did.
+type linkOutcome int
+
+const (
+	linkNotMade linkOutcome = iota
+	linkMade
+	linkUnknown
+)
+
+// landed says whether name now is the file tmp records: a link that
 // answered an error may still have been made (a retransmitted NFS request
-// answers EEXIST for the link it made itself).
-func landed(root *os.Root, name string, tmp fileIdentity) bool {
-	fi, err := root.Lstat(name)
-	if err != nil {
-		return false
+// answers EEXIST for the link it made itself). When the name cannot be
+// read the answer is unknown, and nothing may be undone on a guess.
+func landed(root *os.Root, name string, tmp fileIdentity) linkOutcome {
+	fi, err := landedLstat(root, name)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return linkNotMade
+	case err != nil:
+		return linkUnknown
 	}
-	st, _ := statOf(fi)
-	return fi.Mode().IsRegular() && st.dev == tmp.Dev && st.ino == tmp.Ino
+	if st, _ := statOf(fi); fi.Mode().IsRegular() && st.dev == tmp.Dev && st.ino == tmp.Ino {
+		return linkMade
+	}
+	return linkNotMade
 }
 
 // abort ends a transaction whose intent was never written.
@@ -550,6 +574,9 @@ func (t *captureTxn) probe() error {
 		return t.crashed(err)
 	}
 	lerr := t.s.linkNoReplace(t.ser, rootCaptures, p, q)
+	if lerr != nil && landed(t.ser, q, id) == linkMade {
+		lerr = nil
+	}
 	for _, n := range []string{q, p} {
 		if _, _, err := t.remove(t.ser, n, id); errors.Is(err, errCrash) {
 			return t.crashed(err)
@@ -721,7 +748,7 @@ func (t *captureTxn) link() error {
 				return err
 			}
 		}
-		if err := t.s.linkNoReplace(t.ser, rootCaptures, filepath.Join(t.in.Staging, f.Staged), f.Name); err != nil && !landed(t.ser, f.Name, f) {
+		if err := t.s.linkNoReplace(t.ser, rootCaptures, filepath.Join(t.in.Staging, f.Staged), f.Name); err != nil && landed(t.ser, f.Name, f) != linkMade {
 			if errors.Is(err, fs.ErrExist) {
 				return capture.Errorf(capture.CodeExists, "pass another label", "%v", err)
 			}
@@ -740,7 +767,7 @@ func (t *captureTxn) manifestOf(m manifest, outcome string, e *wireError) manife
 	m.Format, m.ID, m.Series, m.Label = manifestFormat, formatID(t.id), t.series, t.in.Label
 	m.Outcome, m.Error = outcome, e
 	m.Settings, m.SettingsDigest = t.in.Settings, settingsDigest(t.in.Settings)
-	m.WrittenBy = writtenBy
+	m.Token, m.WrittenBy = t.in.Token, writtenBy
 	m.Files = nil
 	if outcome == captureOK {
 		for _, f := range t.in.Files {
@@ -801,9 +828,14 @@ func (t *captureTxn) commit(m manifest, d *decisionWord) (committed bool, err er
 	}
 	if err == nil {
 		err = t.s.linkNoReplace(t.ser, rootCaptures, tmp.Name, name)
-		if err != nil && landed(t.ser, name, tmp) {
-			t.s.log.Warn("the manifest link answered an error but was made; the capture is committed", "manifest", name, "err", err)
-			err = nil
+		if err != nil {
+			switch landed(t.ser, name, tmp) {
+			case linkMade:
+				t.s.log.Warn("the manifest link answered an error but was made; the capture is committed", "manifest", name, "err", err)
+				err = nil
+			case linkUnknown:
+				return false, t.undecided(tmp, err)
+			}
 		}
 	}
 	if err != nil {
@@ -811,13 +843,56 @@ func (t *captureTxn) commit(m manifest, d *decisionWord) (committed bool, err er
 			return false, t.crashed(err)
 		}
 		var cause error = t.linkCause(err)
-		if d.settle(false) == cancelAnswerCancelled {
+		if d.settle(false) == cancelAnswerCancelled || d.cancelled() {
 			cause = cancelledError()
 		}
-		return false, t.fail(cause, m)
+		if rerr := t.rollback(t.cause(cause), m); errors.Is(rerr, errAlreadyCommitted) {
+			return true, nil
+		} else if errors.Is(rerr, errCrash) {
+			return false, errCrash
+		}
+		return false, cause
 	}
 	t.cancelNote = d.settle(true)
 	return true, t.afterCommit()
+}
+
+// undecided keeps a capture whose manifest link answered an error and
+// whose manifest name cannot be read: it may have committed, so nothing is
+// undone. The intent and its heartbeat stay, and retryStranded settles it
+// from what is on disk: committed when the manifest name is the manifest
+// temporary, rolled back when nothing is there.
+func (t *captureTxn) undecided(tmp fileIdentity, err error) error {
+	t.decide = &tmp
+	t.s.capMu.Lock()
+	if !slices.Contains(t.s.stranded, t) {
+		t.s.stranded = append(t.s.stranded, t)
+	}
+	t.s.capMu.Unlock()
+	t.s.log.Warn("cannot tell whether the manifest link was made; the capture is kept until it can", "series", t.series, "id", formatID(t.id), "err", err)
+	return capture.Errorf(capture.CodeDisk, "the next capture settles it from what is on disk, and capture_list then shows its outcome",
+		"cannot tell whether capture %s/%s was committed: its manifest link answered %v and the name could not be read; its files are kept",
+		t.series, formatID(t.id), errnoText(err))
+}
+
+// settle decides an undecided capture from its manifest name.
+func (t *captureTxn) settle() error {
+	tmp := *t.decide
+	switch landed(t.ser, manifestName(t.id, t.in.Label), tmp) {
+	case linkUnknown:
+		return fmt.Errorf("capture %s/%s: the manifest name still cannot be read", t.series, formatID(t.id))
+	case linkMade:
+		t.decide = nil
+		t.unstrand()
+		return t.afterCommit()
+	}
+	t.decide = nil
+	t.unstrand()
+	cause := capture.Errorf(capture.CodeDisk, "", "the manifest link of capture %s/%s was not made", t.series, formatID(t.id))
+	if err := t.rollback(cause, manifest{}); err != nil && !errors.Is(err, errAlreadyCommitted) {
+		return err
+	}
+	return nil
 }
 
 // afterCommit removes what the committed capture no longer needs:
@@ -1105,6 +1180,25 @@ func (t *captureTxn) rollback(cause *capture.Error, m manifest) error {
 func (t *captureTxn) unwind(fm manifest, p faultPoint) error {
 	t.pending = &fm
 	name := manifestName(t.id, t.in.Label)
+	// The published files go only when nothing is at the manifest name:
+	// this capture's own ok manifest there means it committed after all,
+	// and anything else (another file, a name that cannot be read) may be
+	// a manifest that lists them.
+	switch state, err := t.manifestAtName(); state {
+	case manifestOursOK:
+		t.pending = nil
+		t.unstrand()
+		if err := t.finishCommitted(true); err != nil {
+			t.s.log.Warn("capture committed after all; the next recovery removes what it left", "series", t.series, "id", formatID(t.id), "err", err)
+		}
+		return errAlreadyCommitted
+	case manifestOursFailed:
+		t.pending = nil
+		t.unstrand()
+		return t.afterFailure(t.finishCommitted(false))
+	case manifestOther:
+		return t.strand(err)
+	}
 	if err := t.removeTemps(); err != nil {
 		return t.strand(err)
 	}
@@ -1138,7 +1232,7 @@ func (t *captureTxn) unwind(fm manifest, p faultPoint) error {
 	err := t.s.wErr("manifest link")
 	if err == nil {
 		err = t.s.linkNoReplace(t.ser, rootCaptures, tmp.Name, name)
-		if err != nil && landed(t.ser, name, tmp) {
+		if err != nil && landed(t.ser, name, tmp) == linkMade {
 			err = nil
 		}
 	}
@@ -1151,6 +1245,49 @@ func (t *captureTxn) unwind(fm manifest, p faultPoint) error {
 		return t.afterFailure(err)
 	}
 	return t.afterFailure(t.cleanup())
+}
+
+// What is at a capture's manifest name, for a rollback.
+const (
+	manifestAbsent = iota
+	manifestOursOK
+	manifestOursFailed
+	manifestOther
+)
+
+// manifestAtName says what is at the manifest name: nothing; this
+// capture's own ok manifest (its token and its recorded files); its own
+// failure manifest; or anything else, with the reason.
+func (t *captureTxn) manifestAtName() (int, error) {
+	name := manifestName(t.id, t.in.Label)
+	_, err := landedLstat(t.ser, name)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return manifestAbsent, nil
+	case err != nil:
+		return manifestOther, fmt.Errorf("cannot read the manifest name %s: %w", name, err)
+	}
+	m, err := readManifest(t.ser, name)
+	if err != nil {
+		return manifestOther, capture.Errorf(capture.CodeExists, "pass another label", "%s is taken by a file this capture did not write (%v)", name, err)
+	}
+	if m.Token != t.in.Token {
+		return manifestOther, capture.Errorf(capture.CodeExists, "pass another label", "%s is another capture's manifest", name)
+	}
+	switch {
+	case m.Outcome == captureOK && sameFiles(m.Files, t.in.Files):
+		return manifestOursOK, nil
+	case m.Outcome != captureOK:
+		return manifestOursFailed, nil
+	}
+	return manifestOther, fmt.Errorf("%s is an ok manifest of this capture with other files", name)
+}
+
+// sameFiles reports whether a manifest's files are the recorded ones.
+func sameFiles(got, want []fileIdentity) bool {
+	return slices.EqualFunc(got, want, func(a, b fileIdentity) bool {
+		return a.Name == b.Name && a.Dev == b.Dev && a.Ino == b.Ino && a.Size == b.Size && a.SHA256 == b.SHA256
+	})
 }
 
 // afterFailure ends a transaction whose failure manifest is linked; a
@@ -1201,11 +1338,18 @@ func (s *Server) retryStranded() error {
 	s.capMu.Unlock()
 	var errs []error
 	for _, t := range list {
-		if t.pending == nil || t.dead {
+		var err error
+		switch {
+		case t.dead:
 			t.unstrand()
-			continue
+		case t.decide != nil:
+			err = t.settle()
+		case t.pending != nil:
+			err = t.unwind(*t.pending, faultInRollback)
+		default:
+			t.unstrand()
 		}
-		if err := t.unwind(*t.pending, faultInRollback); err != nil {
+		if err != nil {
 			errs = append(errs, err)
 		}
 	}

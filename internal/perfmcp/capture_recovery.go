@@ -1,6 +1,7 @@
 package perfmcp
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -261,6 +262,16 @@ func (s *Server) recoverSeries(d *captureDir, series string) (notes []string, er
 		return notes, d.writeError(err)
 	}
 	slices.Sort(names)
+	// owners names the capture each token belongs to, for the report of a
+	// quarantine name nothing proves.
+	owners := map[string]string{}
+	if ms, _, err := seriesManifests(ser); err == nil {
+		for _, m := range ms {
+			if len(m.Token) == 32 {
+				owners[m.Token[:16]] = m.ID + "-" + m.Label
+			}
+		}
+	}
 	for _, n := range names {
 		_, _, kind, ok := parseName(n)
 		switch {
@@ -268,6 +279,13 @@ func (s *Server) recoverSeries(d *captureDir, series string) (notes []string, er
 		case strings.HasPrefix(n, stagingPrefix):
 			add("orphan_staging", n, "no intent identifies this staging directory, so it is never removed automatically; remove it by hand")
 		case strings.HasPrefix(n, ".") && s.removeStray(ser, series, n):
+		case strings.HasPrefix(n, quarantinePrefix):
+			tok, _, _ := strings.Cut(strings.TrimPrefix(n, quarantinePrefix), "-")
+			whose := "a removal a crash interrupted moved this file aside"
+			if c, ok := owners[tok]; ok {
+				whose = "this file was moved aside from one of capture " + c + "'s names when a crash interrupted its removal"
+			}
+			add("orphan_temp", n, whose+", and nothing proves it is the server's own; check it before removing it by hand")
 		case strings.HasPrefix(n, "."):
 			add("orphan_temp", n, "a file this server cannot prove it made, so it is never removed automatically; remove it by hand")
 		case ok && kind == kindHeartbeat:
@@ -307,20 +325,42 @@ func (t *captureTxn) isRecorded(id fileIdentity) bool {
 	return err == nil && why == ""
 }
 
-// holdsToken reports whether b is bytes only this capture wrote: its
-// token (the heartbeat, the probe), or a version of its intent.
+// holdsToken reports whether b is exactly bytes this capture writes: its
+// token and a newline (the heartbeat, the probe), or a version of its
+// intent as the server encodes it. The bytes must equal the decoded
+// value's own encoding, so nothing else can ride along (an added field, an
+// edit, another layout), and the intent must be valid, of this capture and
+// carry its token.
 func (in intent) holdsToken(b []byte) bool {
 	if string(b) == in.Token+"\n" {
 		return true
 	}
 	var other intent
-	return json.Unmarshal(b, &other) == nil && other.Token == in.Token && other.ID == in.ID && other.Label == in.Label && other.Series == in.Series
+	if json.Unmarshal(b, &other) != nil {
+		return false
+	}
+	if canon, err := json.Marshal(other); err != nil || !bytes.Equal(canon, b) {
+		return false
+	}
+	id, ok := parseID(other.ID)
+	return ok && other.check(intentName(id, other.Label)) == nil &&
+		other.Token == in.Token && other.ID == in.ID && other.Label == in.Label && other.Series == in.Series
 }
 
-// holdsManifest reports whether b is a manifest of this capture.
+// holdsManifest reports whether b is exactly a manifest of this capture as
+// the server writes it: the decoded value's own encoding and a newline, a
+// valid manifest for this capture's name, and this capture's token.
 func (in intent) holdsManifest(b []byte) bool {
 	var m manifest
-	return json.Unmarshal(b, &m) == nil && m.WrittenBy == writtenBy && m.ID == in.ID && m.Label == in.Label && m.Series == in.Series
+	if json.Unmarshal(b, &m) != nil {
+		return false
+	}
+	if canon, err := json.Marshal(m); err != nil || !bytes.Equal(append(canon, '\n'), b) {
+		return false
+	}
+	id, ok := parseID(in.ID)
+	return ok && checkManifest(m, manifestName(id, in.Label)) == nil &&
+		m.Token == in.Token && m.Series == in.Series
 }
 
 // proveQuarantined is the identity that proves a quarantined name of this

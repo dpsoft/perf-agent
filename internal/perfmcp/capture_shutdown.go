@@ -101,9 +101,30 @@ func (s *Server) waitJobs(d time.Duration) {
 	}
 }
 
+// maintenanceJoin bounds Close's wait for the maintenance goroutine: a
+// pass ends its waits at once when the server closes, and its file writes
+// (each one temporary and its link) are short, but a stuck filesystem must
+// not hold Close for good.
+const maintenanceJoin = 2 * time.Second
+
+// waitMaintenance waits up to d for the maintenance goroutine to return.
+func (s *Server) waitMaintenance(d time.Duration) {
+	if s.maintained == nil {
+		return
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-s.maintained:
+	case <-t.C:
+		s.logBounded(slog.LevelWarn, "capture maintenance still running at close", "waited", d)
+	}
+}
+
 // maintain is the background maintenance: one full pass (recovery and
 // retention) at start, then the stranded rollbacks every strandedEvery.
 func (s *Server) maintain() {
+	defer close(s.maintained)
 	s.maintenance(true)
 	close(s.startPassDone)
 	tick := time.NewTicker(strandedEvery)

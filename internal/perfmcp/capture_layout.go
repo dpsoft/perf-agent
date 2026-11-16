@@ -77,7 +77,7 @@ func (s *Server) captureDirName() string {
 
 // openCaptureDir opens the capture directory, creating it (mode 0700) and
 // its .owner record on first use. .owner is written without replacing
-// anything; when it exists already it is read back, and a directory that
+// anything, and only when it is missing; when it exists it is read, and a directory that
 // belongs to the other kind of server is owner_mismatch. The kind read is
 // cached, so later calls can refuse a mismatch without I/O
 // (ownerMismatch).
@@ -120,19 +120,23 @@ func (s *Server) openCaptureDir() (*captureDir, *capture.Error) {
 	return d, nil
 }
 
-// claimOwner writes d's .owner as this server's kind, or checks the one
-// there, and caches the kind it found.
+// claimOwner checks d's .owner, or writes it as this server's kind when
+// there is none, and caches the kind it found. An .owner that is there is
+// only read: a directory in use is never written to here, so an exit or a
+// crash during an open leaves no temporary of it.
 func (s *Server) claimOwner(d *captureDir) *capture.Error {
-	b, _ := json.Marshal(ownerRecord{Kind: d.owner, Format: 1})
-	_, err := s.publishNew(d.root, rootCaptures, ".", ownerFile, append(b, '\n'), 0o600)
-	switch {
-	case err == nil:
-		s.ownerSeen.Store(&d.owner)
-		return nil
-	case !errors.Is(err, fs.ErrExist):
-		return d.writeError(err)
+	if _, err := d.root.Lstat(ownerFile); errors.Is(err, fs.ErrNotExist) {
+		b, _ := json.Marshal(ownerRecord{Kind: d.owner, Format: 1})
+		_, err := s.publishNew(d.root, rootCaptures, ".", ownerFile, append(b, '\n'), 0o600)
+		switch {
+		case err == nil:
+			s.ownerSeen.Store(&d.owner)
+			return nil
+		case !errors.Is(err, fs.ErrExist):
+			return d.writeError(err)
+		}
 	}
-	b, _, err = readSmall(d.root, ownerFile, maxSmallFile)
+	b, _, err := readSmall(d.root, ownerFile, maxSmallFile)
 	var rec ownerRecord
 	if err == nil {
 		err = json.Unmarshal(b, &rec)

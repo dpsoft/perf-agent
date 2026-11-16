@@ -89,6 +89,9 @@ type Server struct {
 	// so a test can write in the capture directory without that pass
 	// recovering what it writes.
 	startPassDone chan struct{}
+	// maintained is closed when the maintenance goroutine has returned,
+	// which Close waits for, bounded.
+	maintained chan struct{}
 	// selfStartTime reads this process's start time for its intents (nil:
 	// /proc).
 	selfStartTime func() (uint64, error)
@@ -237,6 +240,7 @@ func New(cfg Config) (_ *Server, err error) {
 	if s.captureDisabled == "" {
 		s.lookups = newLookupPool(lookupWorkers, lookupQueue)
 		s.startPassDone = make(chan struct{})
+		s.maintained = make(chan struct{})
 		if beforeMaintenance != nil {
 			beforeMaintenance(s)
 		}
@@ -357,11 +361,12 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 }
 
 // Close cancels the capture jobs and kills their captures, waits up to
-// Capture.StopGrace + 1 s for the jobs to roll back (not when a signal path
-// already called KillCaptures), stops the live page, if any, and closes the
-// server's roots. It may run on another goroutine than Serve's, while a
-// request is in flight, and does not wait for the engine or for a
-// maintenance pass: a handler may still run after Serve returned. The
+// Capture.StopGrace + 1 s for the jobs to roll back and up to
+// maintenanceJoin for the maintenance goroutine to end (neither when a
+// signal path already called KillCaptures), stops the live page, if any,
+// and closes the server's roots. It may run on another goroutine than
+// Serve's, while a request is in flight, and does not wait for the engine:
+// a handler may still run after Serve returned. The
 // page's streams end first and its other responses get liveShutdown before
 // their connections are dropped, so a tab that stopped reading delays Close
 // by at most that. A second Close does nothing and returns nil.
@@ -381,6 +386,7 @@ func (s *Server) Close() error {
 	s.KillCaptures()
 	if !signalled {
 		s.waitJobs(s.lim.Capture.StopGrace + time.Second)
+		s.waitMaintenance(maintenanceJoin)
 	}
 	if s.lookups != nil {
 		s.lookups.close()

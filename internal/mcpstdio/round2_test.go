@@ -130,6 +130,11 @@ func TestTheReadErrorIsKeptOnEveryEnd(t *testing.T) {
 			if r := <-closes.ch; r != CloseEOF {
 				t.Fatalf("OnClose(%v)", r)
 			}
+			// The initialize answer must be stuck in the blocked write
+			// before the session ends: with nothing written yet, the drain
+			// has nothing to wait for and ends at once, rightly without
+			// ErrClientGone.
+			<-w.entered
 			if path == "dead" {
 				// Its answer waits behind the blocked one and stalls, while
 				// the second call holds the dispatcher.

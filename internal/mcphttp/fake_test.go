@@ -205,6 +205,9 @@ type answer struct {
 	// net/http cancels it when its background read of the connection
 	// fails, a read deadline's expiry included.
 	reqErr error
+	// wrote is when the transport started writing the answer, and
+	// returned when its ServeHTTP returned.
+	wrote, returned time.Time
 }
 
 const testMaxBody = 1 << 20
@@ -278,8 +281,10 @@ func (h *hub) record(next http.Handler) http.Handler {
 		defer h.served.Add(1)
 		rec := &recorder{ResponseWriter: w}
 		next.ServeHTTP(rec, r)
+		returned := time.Now()
 		h.mu.Lock()
-		h.answers = append(h.answers, answer{status: cmpStatus(rec.status), header: w.Header().Clone(), body: rec.body.Bytes(), reqErr: r.Context().Err()})
+		h.answers = append(h.answers, answer{status: cmpStatus(rec.status), header: w.Header().Clone(), body: rec.body.Bytes(),
+			reqErr: r.Context().Err(), wrote: rec.wrote, returned: returned})
 		h.mu.Unlock()
 	})
 }
@@ -295,11 +300,13 @@ type recorder struct {
 	http.ResponseWriter
 	status int
 	body   bytes.Buffer
+	wrote  time.Time
 }
 
 func (r *recorder) WriteHeader(code int) {
 	if r.status == 0 {
 		r.status = code
+		r.wrote = time.Now()
 	}
 	r.ResponseWriter.WriteHeader(code)
 }
@@ -307,6 +314,7 @@ func (r *recorder) WriteHeader(code int) {
 func (r *recorder) Write(p []byte) (int, error) {
 	if r.status == 0 {
 		r.status = http.StatusOK
+		r.wrote = time.Now()
 	}
 	r.body.Write(p)
 	return r.ResponseWriter.Write(p)

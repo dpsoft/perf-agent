@@ -313,20 +313,33 @@ func TestTheBodyDeadlineIsClearedBeforeTheWait(t *testing.T) {
 	}
 }
 
+// TestAClientThatStopsReadingIsDroppedAfterTheWriteBound: an answer far
+// larger than the socket buffers, to a client that reads nothing, holds
+// its handler for WriteBound from the start of the write, not longer. The
+// time to make the answer is not counted: under the race detector a
+// 16 MiB answer takes about a second to build.
 func TestAClientThatStopsReadingIsDroppedAfterTheWriteBound(t *testing.T) {
-	h := startHub(t, func(o *Options) { o.WriteBound = 200 * time.Millisecond }, nil)
+	const bound = 200 * time.Millisecond
+	h := startHub(t, func(o *Options) { o.WriteBound = bound }, nil)
 	sid := h.initialize()
 	// initialize's handler counts as returned only after its answer left.
 	eventually(t, time.Second, "initialize's handler returns", func() bool { return h.served.Load() == 1 })
 	base := h.tr.Stats()
 	c := h.dial()
-	start := time.Now()
 	if _, err := c.Write(h.rawRequest(sid, callBody(1, "big", map[string]int{"bytes": 16 << 20}))); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, time.Second, "the handler returns", func() bool { return h.served.Load() == 2 })
-	if d := time.Since(start); d > time.Second {
-		t.Fatalf("the handler returned after %v", d)
+	// Without the bound the handler never returns; 10 s only keeps a
+	// failing run short.
+	eventually(t, 10*time.Second, "the handler returns", func() bool { return h.served.Load() == 2 })
+	h.mu.Lock()
+	a := h.answers[len(h.answers)-1]
+	h.mu.Unlock()
+	if a.wrote.IsZero() {
+		t.Fatal("the transport wrote nothing")
+	}
+	if d := a.returned.Sub(a.wrote); d > bound+500*time.Millisecond {
+		t.Fatalf("the handler returned %v after it started writing, WriteBound %v", d, bound)
 	}
 	if got := h.tr.Stats(); got != base {
 		t.Fatalf("Stats %+v, baseline %+v", got, base)

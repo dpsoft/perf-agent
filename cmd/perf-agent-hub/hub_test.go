@@ -29,236 +29,6 @@ import (
 	"github.com/dpsoft/perf-agent/internal/perfmcp"
 )
 
-// The clients of the tests: an MCP client's calls may take a while; a
-// page's reads should not.
-var (
-	mcpHTTP  = &http.Client{Timeout: 60 * time.Second}
-	pageHTTP = &http.Client{Timeout: 30 * time.Second}
-)
-
-// protocolVersion is the MCP revision the test client speaks.
-const protocolVersion = "2025-11-25"
-
-// hubClient is an MCP client of the hub over Streamable HTTP, as Claude
-// Code and Codex send it: POST /mcp with a bearer token, JSON in and out.
-type hubClient struct {
-	t       testing.TB
-	url     string
-	bearer  string
-	session string
-	next    atomic.Int64
-}
-
-func newHubClient(t testing.TB, port int, bearer string) *hubClient {
-	return &hubClient{t: t, url: fmt.Sprintf("http://127.0.0.1:%d/mcp", port), bearer: bearer}
-}
-
-// answer is one HTTP answer of /mcp.
-type answer struct {
-	status int
-	header http.Header
-	body   []byte
-}
-
-// rpcAnswer is a JSON-RPC answer.
-type rpcAnswer struct {
-	ID     json.RawMessage `json:"id"`
-	Result json.RawMessage `json:"result"`
-	Error  *struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
-// send posts one message, a notification when id is "", without failing
-// the test: it may run on any goroutine.
-func (c *hubClient) send(id, method string, params any) (answer, error) {
-	msg := map[string]any{"jsonrpc": "2.0", "method": method}
-	if id != "" {
-		msg["id"] = json.RawMessage(id)
-	}
-	if params != nil {
-		msg["params"] = params
-	}
-	b, err := json.Marshal(msg)
-	if err != nil {
-		return answer{}, err
-	}
-	req, err := http.NewRequest(http.MethodPost, c.url, bytes.NewReader(b))
-	if err != nil {
-		return answer{}, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("Authorization", "Bearer "+c.bearer)
-	if c.session != "" {
-		req.Header.Set(mcphttp.HeaderSession, c.session)
-		req.Header.Set(mcphttp.HeaderVersion, protocolVersion)
-	}
-	res, err := mcpHTTP.Do(req)
-	if err != nil {
-		return answer{}, err
-	}
-	defer func() { _ = res.Body.Close() }()
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		return answer{}, err
-	}
-	return answer{status: res.StatusCode, header: res.Header, body: body}, nil
-}
-
-// post is send that fails the test on a transport error.
-func (c *hubClient) post(id, method string, params any) (int, http.Header, []byte) {
-	c.t.Helper()
-	a, err := c.send(id, method, params)
-	if err != nil {
-		c.t.Fatalf("%s: %v", method, err)
-	}
-	return a.status, a.header, a.body
-}
-
-// decode reads a 200 answer to the request with id.
-func decode(a answer, id string) (rpcAnswer, error) {
-	var r rpcAnswer
-	if a.status != http.StatusOK {
-		return r, fmt.Errorf("status %d: %s", a.status, a.body)
-	}
-	if err := json.Unmarshal(a.body, &r); err != nil {
-		return r, fmt.Errorf("%s: %v", a.body, err)
-	}
-	if string(r.ID) != id {
-		return r, fmt.Errorf("answer for id %s to request %s", r.ID, id)
-	}
-	return r, nil
-}
-
-// rpc sends a request and returns its answer, which must be a 200 for
-// its id.
-func (c *hubClient) rpc(method string, params any) rpcAnswer {
-	c.t.Helper()
-	id := strconv.FormatInt(c.next.Add(1), 10)
-	r, err := decode(must(c.send(id, method, params))(c.t), id)
-	if err != nil {
-		c.t.Fatalf("%s: %v", method, err)
-	}
-	return r
-}
-
-// must is v, failing t on err.
-func must[T any](v T, err error) func(testing.TB) T {
-	return func(t testing.TB) T {
-		t.Helper()
-		if err != nil {
-			t.Fatal(err)
-		}
-		return v
-	}
-}
-
-// initialize opens a session labelled label.
-func (c *hubClient) initialize(label string) {
-	c.t.Helper()
-	a := must(c.send("0", "initialize", map[string]any{
-		"protocolVersion": protocolVersion,
-		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": label, "version": "1"},
-	}))(c.t)
-	if _, err := decode(a, "0"); err != nil {
-		c.t.Fatalf("initialize: %v", err)
-	}
-	c.session = a.header.Get(mcphttp.HeaderSession)
-	if c.session == "" {
-		c.t.Fatal("initialize answered no session")
-	}
-	if status, _, body := c.post("", "notifications/initialized", nil); status != http.StatusAccepted {
-		c.t.Fatalf("notifications/initialized: %d %s", status, body)
-	}
-}
-
-// toolResult is a tools/call result.
-type toolResult struct {
-	Content []struct {
-		Text string `json:"text"`
-	} `json:"content"`
-	IsError bool `json:"isError"`
-}
-
-func (r rpcAnswer) tool() (string, bool, error) {
-	if r.Error != nil {
-		return "", false, fmt.Errorf("error %d %s", r.Error.Code, r.Error.Message)
-	}
-	var res toolResult
-	if err := json.Unmarshal(r.Result, &res); err != nil || len(res.Content) != 1 {
-		return "", false, fmt.Errorf("result %s (%v)", r.Result, err)
-	}
-	return res.Content[0].Text, res.IsError, nil
-}
-
-// try calls a tool and returns its text and isError.
-func (c *hubClient) try(name string, args any) (string, bool) {
-	c.t.Helper()
-	text, isErr, err := c.rpc("tools/call", map[string]any{"name": name, "arguments": args}).tool()
-	if err != nil {
-		c.t.Fatalf("%s: %v", name, err)
-	}
-	return text, isErr
-}
-
-// tool calls a tool that must succeed.
-func (c *hubClient) tool(name string, args any) string {
-	c.t.Helper()
-	text, isErr := c.try(name, args)
-	if isErr {
-		c.t.Fatalf("%s: %s", name, text)
-	}
-	return text
-}
-
-// opened is a profile's handle at its default view.
-type opened struct{ handle, view string }
-
-func (c *hubClient) open(path string) opened {
-	c.t.Helper()
-	var out struct {
-		Handle      string `json:"handle"`
-		DefaultView string `json:"default_view"`
-	}
-	if err := json.Unmarshal([]byte(c.tool("open", map[string]any{"path": path})), &out); err != nil {
-		c.t.Fatal(err)
-	}
-	return opened{out.Handle, out.DefaultView}
-}
-
-// publish publishes o's facts on the page and returns the publication.
-func (c *hubClient) publish(o opened) string {
-	c.t.Helper()
-	var out struct{ Publication, URL string }
-	text := c.tool("page_explain", map[string]any{"handle": o.handle, "view": o.view, "explanations": []any{}})
-	if err := json.Unmarshal([]byte(text), &out); err != nil || out.Publication == "" {
-		c.t.Fatalf("page_explain: %s (%v)", text, err)
-	}
-	return out.Publication
-}
-
-// nodeID is the ID of o's first node named name.
-func (c *hubClient) nodeID(o opened, name string) string {
-	c.t.Helper()
-	var out struct {
-		Rows []struct{ Node, Name string } `json:"rows"`
-	}
-	text := c.tool("top", map[string]any{"handle": o.handle, "view": o.view, "rows": "nodes", "limit": 200})
-	if err := json.Unmarshal([]byte(text), &out); err != nil {
-		c.t.Fatal(err)
-	}
-	for _, r := range out.Rows {
-		if r.Name == name {
-			return r.Node
-		}
-	}
-	c.t.Fatalf("no node %q in %s", name, text)
-	return ""
-}
-
 // newPageReport is a report as the live page posts it to its inbox.
 func newPageReport(page *url.URL, body []byte) (*http.Request, error) {
 	req, err := http.NewRequest(http.MethodPost, page.String()+"inbox", bytes.NewReader(body))
@@ -319,13 +89,13 @@ func startLocal(t testing.TB, extra ...string) *local {
 	return l
 }
 
-func (l *local) client(t testing.TB, label string) *hubClient {
+func (l *local) client(t testing.TB, label string) *httpClient {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(l.xdg, "perf-agent-mcp", "mcp-token"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newHubClient(t, l.port, strings.TrimSpace(string(b)))
+	c := newHTTPClient(t, l.port, strings.TrimSpace(string(b)))
 	c.initialize(label)
 	return c
 }
@@ -413,7 +183,7 @@ func TestShutdownOrder(t *testing.T) {
 	removeFiles = func(d *runtimeDir) error { record("files removed"); return pFiles(d) }
 
 	c := l.client(t, "order")
-	c.tool("open", map[string]any{"path": "cpu.pb.gz"})
+	c.call("open", map[string]any{"path": "cpu.pb.gz"})
 	start := time.Now()
 	l.in.shutdown()
 	if took := time.Since(start); took > 500*time.Millisecond {
@@ -706,7 +476,7 @@ func TestHubToolList(t *testing.T) {
 	var info struct {
 		ServerInfo struct{ Name string } `json:"serverInfo"`
 	}
-	fresh := newHubClient(t, p.port, p.mcpToken())
+	fresh := newHTTPClient(t, p.port, p.mcpToken())
 	if err := json.Unmarshal(fresh.rpc("initialize", map[string]any{"protocolVersion": protocolVersion}).Result, &info); err != nil || info.ServerInfo.Name != "perf-agent-hub" {
 		t.Errorf("serverInfo.name %q (%v)", info.ServerInfo.Name, err)
 	}
@@ -818,7 +588,7 @@ func TestTheChainIsComposedEndToEnd(t *testing.T) {
 	if code := postReport(t, p.pageURL(), map[string]string{"kind": "ask", "publication": pub, "node": node}); code != 204 {
 		t.Fatalf("an ask: %d", code)
 	}
-	if state := cl.tool("page_state", map[string]any{}); !strings.Contains(state, `"b"`) {
+	if state := cl.call("page_state", map[string]any{}); !strings.Contains(state, `"b"`) {
 		t.Errorf("page_state does not hold the ask of b: %s", state)
 	}
 }

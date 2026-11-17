@@ -635,6 +635,10 @@ func linksNetworking(t *testing.T, pkg string) {
 
 // The stdio server opens no socket: its binary links no networking
 // package and none of the packages that serve the page or MCP over HTTP.
+// perf-agent-hub's TestTheHubBinaryLinksThePageAndTransport is the
+// positive half, and its source scan (TestNoClientNetworkingInTheServer)
+// reads this binary's packages too, so the exec and listen rules hold
+// here as well.
 func TestTheServerLinksNoNetworking(t *testing.T) {
 	linksNetworking(t, ".")
 }

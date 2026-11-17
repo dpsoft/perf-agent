@@ -130,6 +130,9 @@ type allowedFiles struct {
 	// covered are the import paths of the non-standard packages the scan
 	// reads; an import of another one is a finding. nil checks none.
 	covered map[string]bool
+	// listenCallers are the files allowed one reference each to
+	// livehttp.Listen, a call or a func value; any other is a finding.
+	listenCallers []string
 }
 
 // helperRule is a process-start helper declared in file, and the only
@@ -268,6 +271,9 @@ type scanned struct {
 	launches []string
 	// helpers are the reviewed helper calls seen, as "fn: helper(arg0, …)".
 	helpers []string
+	// listenCallers are the files seen with their one allowed reference
+	// to livehttp.Listen.
+	listenCallers []string
 }
 
 // typeUnit is one package to type-check: its files for one target, the
@@ -440,6 +446,9 @@ func (s *scanner) check(u typeUnit) {
 			s.launchCalls(f, info, pkg, u.files[i], seen)
 		}
 	}
+	for i, f := range files {
+		s.listenRefs(f, info, s.display(u.files[i]), seen)
+	}
 	for _, helper := range slices.Sorted(maps.Keys(s.allow.helpers)) {
 		rule := s.allow.helpers[helper]
 		fn, ok := pkg.Scope().Lookup(helper).(*types.Func)
@@ -502,6 +511,55 @@ func (s *scanner) helperCalls(files []*ast.File, paths []string, info *types.Inf
 			return true
 		})
 	}
+}
+
+// listenAdvice is the finding for a reference to livehttp.Listen
+// outside allow.listenCallers, or past the first in one of them.
+func (s *scanner) listenAdvice() string {
+	only := "no file may"
+	if len(s.allow.listenCallers) > 0 {
+		only = "only " + strings.Join(s.allow.listenCallers, " and ") + " may, once"
+	}
+	return "references " + strings.TrimPrefix(listenerPkg, "github.com/dpsoft/perf-agent/") + ".Listen: " + only
+}
+
+// isListener reports whether obj is livehttp.Listen.
+func isListener(obj types.Object) bool {
+	fn, ok := obj.(*types.Func)
+	return ok && fn.Pkg() != nil && fn.Pkg().Path() == listenerPkg && fn.Name() == "Listen"
+}
+
+// listenRefs allows, in a file of allow.listenCallers, the first reference
+// to livehttp.Listen, a call or a func value, and reports every other one
+// in f: the selector's name resolved by go/types, so a renamed import and
+// an unqualified use inside livehttp are seen too.
+func (s *scanner) listenRefs(f *ast.File, info *types.Info, name string, seen map[string]bool) {
+	sels := map[*ast.Ident]*ast.SelectorExpr{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		if sel, ok := n.(*ast.SelectorExpr); ok {
+			sels[sel.Sel] = sel
+		}
+		return true
+	})
+	ast.Inspect(f, func(n ast.Node) bool {
+		id, ok := n.(*ast.Ident)
+		if !ok || !isListener(info.Uses[id]) {
+			return true
+		}
+		key := "livehttp.Listen in " + name
+		if slices.Contains(s.allow.listenCallers, name) && !seen[key] {
+			seen[key] = true
+			if sel := sels[id]; sel != nil {
+				s.allowed[sel] = true
+			}
+			if !slices.Contains(s.out.listenCallers, name) {
+				s.out.listenCallers = append(s.out.listenCallers, name)
+			}
+			return true
+		}
+		s.report(id, "%s", s.listenAdvice())
+		return true
+	})
 }
 
 // ownArgument says why arg, a variable or a field of one, is not fd's own
@@ -912,6 +970,8 @@ func (s *scanner) syntax(file string) {
 		if ok {
 			qual := p + "." + sel.Sel.Name
 			switch {
+			case p == listenerPkg && sel.Sel.Name == "Listen":
+				s.report(sel, "%s", s.listenAdvice())
 			case p == "os/exec" && execFile && !slices.Contains(rule.types, sel.Sel.Name):
 				s.report(sel, "uses %s: %s", qual, rule.advice())
 			case slices.Contains(listenNames[p], sel.Sel.Name):
@@ -1103,23 +1163,32 @@ func scanFiles(t *testing.T, dirs map[string]string) []string {
 	return files
 }
 
-// scanPattern is what the network scan reads: the binary, and the
-// packages that serve the live page and MCP over HTTP, which the binary
-// does not link, so the one listening call stays under the scan.
-const scanPattern = ". ../../internal/livehttp ../../internal/perfpage ../../internal/mcphttp"
+// scanPattern is what the network scan reads: both binaries, the hub,
+// which links the page and MCP over HTTP, and the stdio server, which
+// must keep to the same exec and listen rules though it links no
+// networking at all.
+const scanPattern = ". ../perf-agent-mcp"
+
+// listenerPkg is the package of the one listening call, and listenCaller
+// the one file allowed to reference it, once.
+const (
+	listenerPkg  = "github.com/dpsoft/perf-agent/internal/livehttp"
+	listenCaller = "cmd/perf-agent-hub/hub.go"
+)
 
 // TestNoClientNetworkingInTheServer reads the source of every non-standard
-// package scanPattern links on any scan target, internal/livehttp's,
+// package either binary links on any scan target, internal/livehttp's,
 // internal/perfpage's and internal/mcphttp's included, and finds no dial,
 // name lookup, HTTP client, non-TCP socket or raw system call, no
-// listening call but the one in
-// internal/livehttp/listen.go, which checks the address is loopback first,
-// no os/exec outside the git probe and capture's exec_linux.go, each held
-// to its reviewed calls, no hand-built or retargeted exec.Cmd, and in
-// capture no raw system call but the launcher's prctl and exec.
+// listening call but the one in internal/livehttp/listen.go, which checks
+// the address is loopback first, no reference to livehttp.Listen but the
+// hub's one in hub.go, no os/exec outside the git probe and capture's
+// exec_linux.go, each held to its reviewed calls, no hand-built or
+// retargeted exec.Cmd, and in capture no raw system call but the
+// launcher's prctl and exec.
 // None of those packages has code the scan cannot read: no cgo, assembly
-// or object files for any target, and no go:linkname; and the binary
-// links none of the process packages.
+// or object files for any target, and no go:linkname; and neither binary
+// links one of the process packages.
 func TestNoClientNetworkingInTheServer(t *testing.T) {
 	root, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
@@ -1142,8 +1211,11 @@ func TestNoClientNetworkingInTheServer(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
+		"github.com/dpsoft/perf-agent/cmd/perf-agent-hub",
+		"github.com/dpsoft/perf-agent/cmd/perf-agent-mcp",
 		"github.com/dpsoft/perf-agent/internal/capture",
 		"github.com/dpsoft/perf-agent/internal/livehttp",
+		"github.com/dpsoft/perf-agent/internal/mcpflags",
 		"github.com/dpsoft/perf-agent/internal/mcphttp",
 		"github.com/dpsoft/perf-agent/internal/perfpage",
 		"github.com/dpsoft/perf-agent/internal/perfmcp",
@@ -1163,7 +1235,7 @@ func TestNoClientNetworkingInTheServer(t *testing.T) {
 	}
 	got := scanNetworking(t, files, listed.units, display, allowedFiles{
 		listen: listenFile, exec: execRules, launch: launchFile, noShell: shellFreeDir,
-		helpers: helperRules, covered: listed.covered(),
+		helpers: helperRules, covered: listed.covered(), listenCallers: []string{listenCaller},
 	})
 	for _, f := range got.findings {
 		t.Error(f)
@@ -1174,6 +1246,9 @@ func TestNoClientNetworkingInTheServer(t *testing.T) {
 	// imports.
 	if !slices.Equal(got.listens, []string{"net.Listen"}) {
 		t.Errorf("listening calls in %s = %v, want exactly net.Listen", listenFile, got.listens)
+	}
+	if !slices.Equal(got.listenCallers, []string{listenCaller}) {
+		t.Errorf("livehttp.Listen is referenced, as allowed, in %v, want exactly once in %s", got.listenCallers, listenCaller)
 	}
 	for _, file := range slices.Sorted(maps.Keys(execRules)) {
 		if !got.exec[file] {
@@ -1719,5 +1794,59 @@ func TestTheScanListsEveryTarget(t *testing.T) {
 		"mac/mac.go:3: imports plugin, which can start a process or load code",
 		"main_linux_riscv64.go:3: imports example.com/targets/riscv, which no scan target links, so the scan does not read it",
 		"tagged.go:5: imports net/smtp",
+	})
+}
+
+// livehttp.Listen is referenced once, in the hub's hub.go, whether called
+// or taken as a func value: a reference anywhere else, a second one in
+// hub.go, and any in a file no unit type-checks are findings.
+func TestTheNetworkScanPinsTheListenCaller(t *testing.T) {
+	allow := allowedFiles{listen: "listen.go", exec: gitOnly, listenCallers: []string{"cmd/perf-agent-hub/hub.go"}}
+	only := "references internal/livehttp.Listen: only cmd/perf-agent-hub/hub.go may, once"
+	scan := func(t *testing.T, files map[string]string, typed bool) scanned {
+		t.Helper()
+		dir := t.TempDir()
+		paths := writeFixturesIn(t, dir, files)
+		var units []typeUnit
+		if typed {
+			byDir := map[string][]string{}
+			for _, p := range paths {
+				byDir[filepath.Dir(p)] = append(byDir[filepath.Dir(p)], p)
+			}
+			for _, d := range slices.Sorted(maps.Keys(byDir)) {
+				units = append(units, fixtureUnit(byDir[d]...))
+			}
+		}
+		display := func(f string) string { rel, _ := filepath.Rel(dir, f); return filepath.ToSlash(rel) }
+		return scanNetworking(t, paths, units, display, allow)
+	}
+	hubOnce := "package main\nimport \"github.com/dpsoft/perf-agent/internal/livehttp\"\nvar listen = livehttp.Listen\n"
+
+	t.Run("once in hub.go", func(t *testing.T) {
+		got := scan(t, map[string]string{"cmd/perf-agent-hub/hub.go": hubOnce}, true)
+		checkFindings(t, got.findings, nil)
+		if want := []string{"cmd/perf-agent-hub/hub.go"}; !slices.Equal(got.listenCallers, want) {
+			t.Errorf("listen callers = %v, want %v", got.listenCallers, want)
+		}
+	})
+	t.Run("called in perfpage", func(t *testing.T) {
+		got := scan(t, map[string]string{
+			"cmd/perf-agent-hub/hub.go":  hubOnce,
+			"internal/perfpage/serve.go": "package perfpage\nimport lh \"github.com/dpsoft/perf-agent/internal/livehttp\"\nfunc serve() { _, _ = lh.Listen(\"127.0.0.1:0\") }\n",
+		}, true)
+		checkFindings(t, got.findings, []string{"internal/perfpage/serve.go:3: " + only})
+	})
+	t.Run("twice in hub.go", func(t *testing.T) {
+		got := scan(t, map[string]string{
+			"cmd/perf-agent-hub/hub.go": hubOnce + "func again() { _, _ = livehttp.Listen(\"127.0.0.1:0\") }\n",
+		}, true)
+		checkFindings(t, got.findings, []string{"cmd/perf-agent-hub/hub.go:4: " + only})
+	})
+	t.Run("in a file no unit type-checks", func(t *testing.T) {
+		got := scan(t, map[string]string{"cmd/perf-agent-hub/hub.go": hubOnce}, false)
+		checkFindings(t, got.findings, []string{"cmd/perf-agent-hub/hub.go:3: " + only})
+		if len(got.listenCallers) != 0 {
+			t.Errorf("listen callers = %v, want none", got.listenCallers)
+		}
 	})
 }

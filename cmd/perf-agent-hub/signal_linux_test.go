@@ -248,14 +248,14 @@ func TestShutdownDoesNotWaitForLongCalls(t *testing.T) {
 			"--limit", "Capture.MaxDuration=2m", "--limit", "Capture.MinFreeBytes=1048576"},
 	})
 	c := p.client("long")
-	text := c.tool("capture", map[string]any{"command": []any{capturetest.Workload(t), "sleep", "2m"}, "duration": "1m"})
+	text := c.call("capture", map[string]any{"command": []any{capturetest.Workload(t), "sleep", "2m"}, "duration": "1m"})
 	var job struct{ Job, Status string }
 	if json.Unmarshal([]byte(text), &job) != nil || job.Status != "accepted" {
 		t.Fatalf("capture: %s", text)
 	}
 	for end := time.Now().Add(60 * time.Second); ; {
 		var v struct{ Status, Phase string }
-		text := c.tool("capture_wait", map[string]any{"id": job.Job, "timeout": "500ms"})
+		text := c.call("capture_wait", map[string]any{"id": job.Job, "timeout": "500ms"})
 		if json.Unmarshal([]byte(text), &v) != nil {
 			t.Fatalf("capture_wait: %s", text)
 		}

@@ -67,6 +67,8 @@ func TestMain(m *testing.M) {
 	code := capturetest.Main(m)
 	if hubBinDir != "" {
 		_ = os.RemoveAll(hubBinDir)
+		// The shared parent goes too, unless another run still uses it.
+		_ = os.Remove(filepath.Dir(hubBinDir))
 	}
 	os.Exit(code)
 }
@@ -116,20 +118,53 @@ func fakeVerify(p string) (capture.Binary, error) {
 	return capture.Binary{Path: p, ID: id, Version: "v0.0.0-test"}, err
 }
 
-// hubBinDir holds the test binary hubCommand runs.
+// hubBinDir holds the binaries the tests build: under the user's cache
+// directory, not the temporary one, which may be mounted noexec or
+// nosuid. TestMain removes it.
 var hubBinDir string
 
-// hubTestBinary builds this package's test binary without the race
-// detector, whose overhead would slow the shutdowns the tests time.
-var hubTestBinary = sync.OnceValues(func() (string, error) {
-	dir, err := os.MkdirTemp("", "perf-agent-hub-test")
+// binDir makes hubBinDir, once.
+var binDir = sync.OnceValues(func() (string, error) {
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	base := filepath.Join(cache, "perf-agent-hub-test")
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		return "", err
+	}
+	dir, err := os.MkdirTemp(base, "bin-")
 	if err != nil {
 		return "", err
 	}
 	hubBinDir = dir
+	return dir, nil
+})
+
+// hubTestBinary builds this package's test binary without the race
+// detector, whose overhead would slow the shutdowns the tests time.
+var hubTestBinary = sync.OnceValues(func() (string, error) {
+	dir, err := binDir()
+	if err != nil {
+		return "", err
+	}
 	bin := filepath.Join(dir, "hub.test")
 	if out, err := exec.Command("go", "test", "-c", "-buildvcs=false", "-o", bin, ".").CombinedOutput(); err != nil {
 		return "", fmt.Errorf("go test -c: %v\n%s", err, out)
+	}
+	return bin, nil
+})
+
+// hubBinary builds the command itself, as a user's go build makes it:
+// the binary whose sockets and symbols the network tests check.
+var hubBinary = sync.OnceValues(func() (string, error) {
+	dir, err := binDir()
+	if err != nil {
+		return "", err
+	}
+	bin := filepath.Join(dir, "perf-agent-hub")
+	if out, err := exec.Command("go", "build", "-buildvcs=false", "-o", bin, ".").CombinedOutput(); err != nil {
+		return "", fmt.Errorf("go build: %v\n%s", err, out)
 	}
 	return bin, nil
 })
@@ -222,6 +257,9 @@ type hubOptions struct {
 	stdout, stderr *os.File
 	// started, when set, replaces the wait for the runtime files.
 	started func(*hubProc)
+	// built runs the command as go build makes it, rather than this test
+	// binary: the test seams of the environment then do nothing.
+	built bool
 }
 
 // hubProc is a running perf-agent-hub.
@@ -254,7 +292,16 @@ func startHub(t testing.TB, o hubOptions) *hubProc {
 	p := &hubProc{t: t, xdg: o.xdg, dir: filepath.Join(o.xdg, "perf-agent-mcp"), profiles: o.profiles, port: o.port,
 		stdout: &lockedBuffer{}, stderr: &lockedBuffer{}, exited: make(chan struct{})}
 	args := append([]string{"--profiles", o.profiles, "--port", strconv.Itoa(o.port)}, o.args...)
-	p.cmd = hubCommand(t, append([]string{"XDG_RUNTIME_DIR=" + o.xdg}, o.env...), args...)
+	if o.built {
+		bin, err := hubBinary()
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.cmd = exec.Command(bin, args...)
+		p.cmd.Env = append(append(os.Environ(), "XDG_RUNTIME_DIR="+o.xdg), o.env...)
+	} else {
+		p.cmd = hubCommand(t, append([]string{"XDG_RUNTIME_DIR=" + o.xdg}, o.env...), args...)
+	}
 	// The pipes the test reads are closed in this process once the hub
 	// has its own copies.
 	var mine []*os.File
@@ -370,9 +417,9 @@ func (p *hubProc) stop(sig syscall.Signal, d time.Duration) time.Duration {
 }
 
 // client is an MCP client of p, initialized with label.
-func (p *hubProc) client(label string) *hubClient {
+func (p *hubProc) client(label string) *httpClient {
 	p.t.Helper()
-	c := newHubClient(p.t, p.port, p.mcpToken())
+	c := newHTTPClient(p.t, p.port, p.mcpToken())
 	c.initialize(label)
 	return c
 }
@@ -470,9 +517,9 @@ func TestNoTokenEverReachesStderr(t *testing.T) {
 	if code := postReport(t, page, map[string]string{"kind": "ask", "publication": pub, "node": c.nodeID(o, "b")}); code != 204 {
 		t.Errorf("inbox: %d", code)
 	}
-	c.tool("page_state", map[string]any{})
+	c.call("page_state", map[string]any{})
 	// A wrong token in a request is not echoed either.
-	wrong := newHubClient(t, p.port, strings.Repeat("A", 43))
+	wrong := newHTTPClient(t, p.port, strings.Repeat("A", 43))
 	if status, _, _ := wrong.post("1", "ping", nil); status != 401 {
 		t.Errorf("a wrong bearer: %d", status)
 	}
@@ -499,7 +546,7 @@ func TestThePageURLGoesToStdoutOnly(t *testing.T) {
 	for end := time.Now().Add(5 * time.Second); !strings.HasSuffix(p.stdout.String(), "\n") && time.Now().Before(end); {
 		time.Sleep(10 * time.Millisecond)
 	}
-	p.client("x").tool("open", map[string]any{"path": "cpu.pb.gz"})
+	p.client("x").call("open", map[string]any{"path": "cpu.pb.gz"})
 	p.stop(syscall.SIGTERM, 3*time.Second)
 	if got := p.stdout.String(); got != want+"\n" {
 		t.Errorf("stdout %q, want the page URL %q alone", got, want+"\n")

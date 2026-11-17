@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -538,38 +539,136 @@ func TestOneCallRunsAtATime(t *testing.T) {
 	}
 }
 
-// TestConnectionsAreCapped: the listener serves at most maxConns
-// connections at once; one more waits until another closes.
-func TestConnectionsAreCapped(t *testing.T) {
-	l := startLocal(t)
-	page := strings.TrimSpace(l.stdout.String())
-	host := must(url.Parse(page))(t).Host
-	conns := make([]net.Conn, maxConns)
+// idleConns opens n connections to l that send nothing.
+func idleConns(t *testing.T, l *local, n int) []net.Conn {
+	t.Helper()
+	conns := make([]net.Conn, n)
 	for i := range conns {
-		conns[i] = must(net.Dial("tcp", host))(t)
-		defer func() { _ = conns[i].Close() }()
+		conns[i] = must(net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", l.port)))(t)
+		t.Cleanup(func() { _ = conns[i].Close() })
 	}
+	return conns
+}
+
+// TestIdleConnectionsNeverDelayAToken: connections that never send a
+// byte, which anyone on the machine can open without a token, are closed
+// after firstByteWait and never stand between a client with the token
+// and its answer.
+func TestIdleConnectionsNeverDelayAToken(t *testing.T) {
+	l := startLocal(t)
+	idle := idleConns(t, l, 200)
 	time.Sleep(100 * time.Millisecond)
-	extra := must(net.Dial("tcp", host))(t)
-	defer func() { _ = extra.Close() }()
-	path := must(url.Parse(page))(t).Path
-	if _, err := fmt.Fprintf(extra, "GET %sstate HTTP/1.1\r\nHost: %s\r\n\r\n", path, host); err != nil {
+	start := time.Now()
+	l.client(t, "behind-idle")
+	if took := time.Since(start); took > 500*time.Millisecond {
+		t.Errorf("initialize behind 200 idle connections took %v", took)
+	}
+	// Each idle connection is closed, unanswered, soon after firstByteWait.
+	for i, c := range idle[:10] {
+		_ = c.SetReadDeadline(time.Now().Add(firstByteWait + 2*time.Second))
+		n, err := c.Read(make([]byte, 1))
+		if n != 0 || isTimeoutErr(err) {
+			t.Fatalf("idle connection %d: read %d bytes, %v", i, n, err)
+		}
+	}
+	if took := time.Since(start); took < firstByteWait/2 {
+		t.Errorf("idle connections were closed after %v, before firstByteWait %v", took, firstByteWait)
+	}
+	// Once a byte has come, the request has the server's own header
+	// timeout, longer than firstByteWait.
+	slow := must(net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", l.port)))(t)
+	defer func() { _ = slow.Close() }()
+	if _, err := io.WriteString(slow, "G"); err != nil {
 		t.Fatal(err)
 	}
-	br := bufio.NewReader(extra)
-	_ = extra.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-	if _, err := br.ReadByte(); err == nil {
-		t.Fatalf("connection %d was served while %d were open", maxConns+1, maxConns)
+	time.Sleep(firstByteWait + 500*time.Millisecond)
+	page := must(url.Parse(strings.TrimSpace(l.stdout.String())))(t)
+	if _, err := fmt.Fprintf(slow, "ET %sstate HTTP/1.1\r\nHost: %s\r\n\r\n", page.Path, page.Host); err != nil {
+		t.Fatal(err)
 	}
-	_ = conns[0].Close()
-	_ = extra.SetReadDeadline(time.Now().Add(5 * time.Second))
-	res, err := http.ReadResponse(br, nil)
+	_ = slow.SetReadDeadline(time.Now().Add(5 * time.Second))
+	res, err := http.ReadResponse(bufio.NewReader(slow), nil)
 	if err != nil {
-		t.Fatalf("connection %d once one closed: %v", maxConns+1, err)
+		t.Fatalf("a request whose first byte came early: %v", err)
 	}
 	_ = res.Body.Close()
 	if res.StatusCode != 200 {
 		t.Errorf("GET state: %d", res.StatusCode)
+	}
+}
+
+func isTimeoutErr(err error) bool {
+	ne, ok := errors.AsType[net.Error](err)
+	return ok && ne.Timeout()
+}
+
+// TestTheConnectionCapHolds: the listener holds at most maxConns
+// connections, a bound on file descriptors; one more waits in the
+// kernel's backlog until others close, here when the idle ones are closed
+// after firstByteWait.
+func TestTheConnectionCapHolds(t *testing.T) {
+	l := startLocal(t)
+	idleConns(t, l, maxConns)
+	time.Sleep(200 * time.Millisecond)
+	start := time.Now()
+	page := must(url.Parse(strings.TrimSpace(l.stdout.String())))(t)
+	extra := must(net.Dial("tcp", page.Host))(t)
+	defer func() { _ = extra.Close() }()
+	if _, err := fmt.Fprintf(extra, "GET %sstate HTTP/1.1\r\nHost: %s\r\n\r\n", page.Path, page.Host); err != nil {
+		t.Fatal(err)
+	}
+	_ = extra.SetReadDeadline(time.Now().Add(firstByteWait + 5*time.Second))
+	res, err := http.ReadResponse(bufio.NewReader(extra), nil)
+	if err != nil {
+		t.Fatalf("connection %d: %v", maxConns+1, err)
+	}
+	_ = res.Body.Close()
+	if took := time.Since(start); took < firstByteWait/2 {
+		t.Errorf("connection %d was served after %v while %d were held", maxConns+1, took, maxConns)
+	}
+	if res.StatusCode != 200 {
+		t.Errorf("GET state: %d", res.StatusCode)
+	}
+}
+
+// TestAnswerWritesAreBoundedInTheHub: the transport is mounted with
+// maxAnswersWriting places for answers being written.
+func TestAnswerWritesAreBoundedInTheHub(t *testing.T) {
+	l := startLocal(t)
+	if got := l.in.tr.Options().MaxAnswersWriting; got != maxAnswersWriting {
+		t.Errorf("MaxAnswersWriting %d, want %d", got, maxAnswersWriting)
+	}
+	if got, want := l.in.tr.Options().MaxAnswerBytes, int64(l.in.srv.MCP().MaxAnswerBytes()); got != want {
+		t.Errorf("MaxAnswerBytes %d, want %d", got, want)
+	}
+}
+
+// A signal while the hub starts is a clean end: exit 0, nothing left.
+func TestASignalDuringStartExitsZero(t *testing.T) {
+	xdgDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", xdgDir)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer func(prev func(string) (net.Listener, error)) { listen = prev }(listen)
+	listen = func(addr string) (net.Listener, error) {
+		cancel()
+		return livehttp.Listen(addr)
+	}
+	var stdout, stderr lockedBuffer
+	code := runServe(ctx, []string{"--profiles", profilesDir(t), "--port", strconv.Itoa(freePort(t))}, &stdout, &stderr)
+	if code != 0 || stdout.String() != "" {
+		t.Errorf("a signal during start: exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+	}
+	ents, err := os.ReadDir(filepath.Join(xdgDir, "perf-agent-mcp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 1 || ents[0].Name() != "hub.lock" {
+		t.Errorf("runtime files after a signal during start: %v", ents)
+	}
+	// Before the lock as well.
+	code = runServe(ctx, []string{"--profiles", profilesDir(t), "--port", "1"}, &stdout, &stderr)
+	if code != 0 {
+		t.Errorf("an already signalled start: exit %d, stderr %q", code, stderr.String())
 	}
 }
 

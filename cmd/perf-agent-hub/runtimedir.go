@@ -127,46 +127,46 @@ func checkRuntimeDir(path string, fi fs.FileInfo) error {
 }
 
 // take takes hub.lock's exclusive flock without waiting. When another
-// server holds it, the error names its pid and port from hub.json, which
-// is also returned. Once taken, it removes the files a dead server left,
+// server holds it, the error names its pid and port from hub.json. Once
+// taken, it removes the files a dead server left,
 // so nothing reads them while this server starts.
-func (d *runtimeDir) take() (hubInfo, error) {
+func (d *runtimeDir) take() error {
 	f, err := d.root.OpenFile(lockFile, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
-		return hubInfo{}, fmt.Errorf("runtime directory: %w", err)
+		return fmt.Errorf("runtime directory: %w", err)
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
 		if !errors.Is(err, syscall.EWOULDBLOCK) {
-			return hubInfo{}, fmt.Errorf("lock %s: %w", filepath.Join(d.path, lockFile), err)
+			return fmt.Errorf("lock %s: %w", filepath.Join(d.path, lockFile), err)
 		}
-		info, rerr := d.info()
+		_, info, rerr := d.info()
 		if rerr != nil {
-			return hubInfo{}, errors.New("perf-agent-hub is already running (it is starting or stopping)")
+			return errors.New("perf-agent-hub is already running (it is starting or stopping)")
 		}
-		return info, fmt.Errorf("perf-agent-hub is already running (pid %d, port %d)", info.PID, info.Port)
+		return fmt.Errorf("perf-agent-hub is already running (pid %d, port %d)", info.PID, info.Port)
 	}
 	d.lock = f
 	for _, name := range runtimeFiles {
 		for _, n := range []string{name, tempName(name)} {
 			if err := d.root.Remove(n); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				d.release()
-				return hubInfo{}, fmt.Errorf("remove the stale %s: %w", n, err)
+				return fmt.Errorf("remove the stale %s: %w", n, err)
 			}
 		}
 	}
-	return hubInfo{}, nil
+	return nil
 }
 
-// info reads hub.json.
-func (d *runtimeDir) info() (hubInfo, error) {
+// info reads hub.json, as written and decoded.
+func (d *runtimeDir) info() ([]byte, hubInfo, error) {
 	var info hubInfo
 	b, err := d.root.ReadFile(infoFile)
 	if err != nil {
-		return info, err
+		return nil, info, err
 	}
 	err = json.Unmarshal(b, &info)
-	return info, err
+	return b, info, err
 }
 
 // tempName is the temporary a runtime file is written to before it takes

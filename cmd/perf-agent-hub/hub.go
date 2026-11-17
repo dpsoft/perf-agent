@@ -31,14 +31,29 @@ const host = "127.0.0.1"
 // inboxRate bounds the page's reports: five a second, five at once.
 var inboxRate = livehttp.Rate{PerSecond: 5, Burst: 5}
 
-// maxConns bounds the connections the listener serves at once; one more
-// waits in the kernel's backlog until another closes. It is a memory
-// bound: an answer the client has not read yet is outside the
-// transport's caps, at most one per connection, each at most
-// MaxAnswerBytes, for at most the transport's WriteBound (10 s). So
-// unread answers hold at most maxConns × MaxAnswerBytes (64 × 2 MiB with
-// the default limits), and only for clients holding the MCP token.
-const maxConns = 64
+// maxConns bounds the connections the listener holds at once, waiting
+// for their first byte or served: a bound on file descriptors only. One
+// more waits in the kernel's backlog until another closes.
+const maxConns = 512
+
+// firstByteWait is how long a new connection may send nothing: then it
+// is closed unanswered. Once a byte has come, the request has the HTTP
+// server's own header timeout (5 s).
+const firstByteWait = 2 * time.Second
+
+// maxAnswersWriting bounds the MCP answers being written at once, which
+// is the memory bound on answers clients have not read: at most this many,
+// each at most srv.MCP().MaxAnswerBytes() (half of stdio's output bound:
+// 2 MiB + 255 B at the default MaxResponseBytes of 1 MiB, so 128 MiB in
+// all), for at most the transport's WriteBound (10 s). Only requests past
+// MCPGuard, from clients holding the MCP token, take these places.
+//
+// What remains: anyone on this machine can still fill a loopback
+// listener, here by opening maxConns connections again and again, each
+// held up to firstByteWait. That is inherent to a TCP port; the hub
+// recovers once they stop, and they never reach a guard, the engine or
+// the answers.
+const maxAnswersWriting = 64
 
 // The shutdown's bounds: httpGrace is what calls that ignore their
 // context, and responses being written, get before their connections are
@@ -115,7 +130,7 @@ func start(ctx context.Context, o options) (_ *instance, err error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := dir.take(); err != nil {
+	if err := dir.take(); err != nil {
 		dir.close()
 		return nil, err
 	}
@@ -165,6 +180,7 @@ func start(ctx context.Context, o options) (_ *instance, err error) {
 		MaxCalls:             hub.MaxCalls,
 		MaxCallsPerSession:   hub.MaxCallsPerSession,
 		MaxRequestBytes:      hub.MaxRequestBytes,
+		MaxAnswersWriting:    maxAnswersWriting,
 		Log:                  log,
 	})
 	if err := ctx.Err(); err != nil {
@@ -181,12 +197,17 @@ func start(ctx context.Context, o options) (_ *instance, err error) {
 		livehttp.MCPGuard(mcpTok, int64(cfg.Limits.MaxMessageBytes), in.tr),
 		livehttp.InboxGuard(pageTok, inboxRate, perfpage.Inbox(in.srv)),
 		livehttp.Guard(pageTok, perfpage.Routes(in.srv, in.events))), log)
-	limited := newLimitListener(ln, maxConns)
+	limited := newConnListener(ln, maxConns, firstByteWait)
 	go func() {
 		if err := in.hs.Serve(limited); !errors.Is(err, http.ErrServerClosed) {
 			in.served <- err
 		}
 	}()
+	// A signal while starting ends the start before anything is
+	// announced: no runtime file, no page URL.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	info := hubInfo{PID: os.Getpid(), Port: o.port, MCPURL: mcpURL, Started: time.Now(), Version: cfg.Version}
 	if err := in.dir.write(info, mcpTok, pageURL); err != nil {
 		return nil, err
@@ -247,45 +268,123 @@ func (in *instance) shutdown() {
 	})
 }
 
-// limitListener accepts at most n connections at once: Accept waits for
-// one of them to close before it takes the next from the backlog.
-type limitListener struct {
-	net.Listener
+// connListener holds at most n connections at once, and hands one to the
+// HTTP server only once its first byte has come: a connection that sends
+// nothing for the first-byte wait is closed unanswered, and never reaches
+// the server.
+type connListener struct {
+	ln    net.Listener
+	wait  time.Duration
 	slots chan struct{}
+	ready chan *slotConn
+	errc  chan error
 	done  chan struct{}
-	close sync.Once
+	once  sync.Once
+
+	mu sync.Mutex
+	// pending are the connections waiting for their first byte, which
+	// Close closes.
+	pending map[*slotConn]struct{}
 }
 
-func newLimitListener(ln net.Listener, n int) *limitListener {
-	return &limitListener{Listener: ln, slots: make(chan struct{}, n), done: make(chan struct{})}
+func newConnListener(ln net.Listener, n int, wait time.Duration) *connListener {
+	l := &connListener{ln: ln, wait: wait, slots: make(chan struct{}, n), ready: make(chan *slotConn),
+		errc: make(chan error, 1), done: make(chan struct{}), pending: map[*slotConn]struct{}{}}
+	go l.acceptLoop()
+	return l
 }
 
-func (l *limitListener) Accept() (net.Conn, error) {
+// acceptLoop takes a slot, then a connection from the backlog, and waits
+// for that connection's first byte on its own goroutine.
+func (l *connListener) acceptLoop() {
+	for {
+		select {
+		case l.slots <- struct{}{}:
+		case <-l.done:
+			return
+		}
+		c, err := l.ln.Accept()
+		if err != nil {
+			<-l.slots
+			select {
+			case l.errc <- err:
+			case <-l.done:
+			}
+			return
+		}
+		sc := &slotConn{Conn: c, release: sync.OnceFunc(func() { <-l.slots })}
+		l.mu.Lock()
+		l.pending[sc] = struct{}{}
+		l.mu.Unlock()
+		go l.awaitFirstByte(sc)
+	}
+}
+
+func (l *connListener) awaitFirstByte(c *slotConn) {
+	var b [1]byte
+	_ = c.SetReadDeadline(time.Now().Add(l.wait))
+	n, _ := c.Conn.Read(b[:])
+	l.mu.Lock()
+	delete(l.pending, c)
+	l.mu.Unlock()
+	if n == 0 {
+		_ = c.Close()
+		return
+	}
+	_ = c.SetReadDeadline(time.Time{})
+	c.first = b[:]
 	select {
-	case l.slots <- struct{}{}:
+	case l.ready <- c:
+	case <-l.done:
+		_ = c.Close()
+	}
+}
+
+func (l *connListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.ready:
+		return c, nil
+	case err := <-l.errc:
+		return nil, err
 	case <-l.done:
 		return nil, net.ErrClosed
 	}
-	c, err := l.Listener.Accept()
-	if err != nil {
-		<-l.slots
-		return nil, err
-	}
-	return &limitConn{Conn: c, release: sync.OnceFunc(func() { <-l.slots })}, nil
 }
 
-func (l *limitListener) Close() error {
-	l.close.Do(func() { close(l.done) })
-	return l.Listener.Close()
+// Close stops accepting and closes the connections still waiting for
+// their first byte; the server closes the ones it was handed.
+func (l *connListener) Close() error {
+	l.once.Do(func() {
+		close(l.done)
+		l.mu.Lock()
+		for c := range l.pending {
+			_ = c.Conn.Close()
+		}
+		l.mu.Unlock()
+	})
+	return l.ln.Close()
 }
 
-// limitConn gives its slot back when it is first closed.
-type limitConn struct {
+func (l *connListener) Addr() net.Addr { return l.ln.Addr() }
+
+// slotConn is a connection holding a slot, which it gives back when it is
+// first closed, and whose first byte was already read.
+type slotConn struct {
 	net.Conn
 	release func()
+	first   []byte
 }
 
-func (c *limitConn) Close() error {
+func (c *slotConn) Read(p []byte) (int, error) {
+	if len(c.first) > 0 {
+		n := copy(p, c.first)
+		c.first = c.first[n:]
+		return n, nil
+	}
+	return c.Conn.Read(p)
+}
+
+func (c *slotConn) Close() error {
 	err := c.Conn.Close()
 	c.release()
 	return err

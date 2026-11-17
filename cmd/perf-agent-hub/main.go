@@ -15,6 +15,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -39,7 +40,7 @@ import (
 var version = "dev"
 
 // DefaultPort is the port the hub listens on without --port.
-const DefaultPort = 7341
+const DefaultPort = 7362
 
 func main() {
 	// A capture's reaper and launcher are this binary re-executed in an
@@ -97,6 +98,11 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 	in, err := start(ctx, options{cfg: cfg, port: *port, runtimeDir: *runtimeDir, getenv: os.Getenv, stdout: out})
 	if err != nil {
+		// A signal while starting is a clean end, as it is once started:
+		// start has undone what it did.
+		if ctx.Err() != nil {
+			return 0
+		}
 		_, _ = fmt.Fprintf(errOut, "%s: %v\n", command, err)
 		return 1
 	}
@@ -163,9 +169,10 @@ func runToken(args []string, getenv func(string) string, stdout, stderr io.Write
 		return fail("%v", err)
 	}
 	defer dir.close()
-	// hub.json is read before and after the token, and the lock tested
-	// last, so the token printed is the running hub's, for its port.
-	before, err := dir.info()
+	// hub.json is read before and after the token, and compared as
+	// written, and the lock tested last, so the token printed is the
+	// running hub's, for its port.
+	raw, info, err := dir.info()
 	if err != nil {
 		return fail("perf-agent-hub is not running (no hub.json in %s); start it with %s --profiles DIR", dir.path, command)
 	}
@@ -174,12 +181,15 @@ func runToken(args []string, getenv func(string) string, stdout, stderr io.Write
 		return fail("perf-agent-hub is not running (no mcp-token in %s)", dir.path)
 	}
 	tok := strings.TrimSuffix(string(b), "\n")
-	after, err := dir.info()
-	if err != nil || after != before || !running(dir.path) {
+	again, _, err := dir.info()
+	if err != nil || !bytes.Equal(again, raw) {
+		return fail("hub.json in %s changed while it was read: perf-agent-hub is starting or stopping; try again", dir.path)
+	}
+	if !running(dir.path) {
 		return fail("perf-agent-hub is not running (its lock in %s is free); start it with %s --profiles DIR", dir.path, command)
 	}
-	if before.Port != want {
-		return fail("perf-agent-hub listens on port %d, not %d; point the client at http://%s:%d/mcp", before.Port, want, host, before.Port)
+	if info.Port != want {
+		return fail("perf-agent-hub listens on port %d, not %d; point the client at http://%s:%d/mcp", info.Port, want, host, info.Port)
 	}
 	if !wellFormedToken(tok) {
 		return fail("mcp-token in %s is not a token perf-agent-hub writes", dir.path)
@@ -194,21 +204,25 @@ func runToken(args []string, getenv func(string) string, stdout, stderr io.Write
 	return 0
 }
 
-// urlPort is the port of an MCP URL a client may hold for the hub:
-// http, host 127.0.0.1 and a port. Any other host is refused, localhost
+// urlPort is the port of the hub's MCP URL as a client holds it, exactly
+// http://127.0.0.1:PORT/mcp: no user information, query or fragment, and a
+// decimal port without leading zeros. Any other host is refused, localhost
 // included: it may resolve to ::1, where the hub does not listen and
 // another program may.
 func urlPort(raw string) (int, error) {
+	shape := fmt.Errorf("the hub's URL is http://%s:PORT/mcp; it listens on %s only", host, host)
 	u, err := url.Parse(raw)
 	if err != nil {
 		return 0, errors.New("not a URL")
 	}
-	if u.Scheme != "http" || u.Hostname() != host || u.Port() == "" {
-		return 0, fmt.Errorf("the hub's URL is http://%s:PORT/mcp; it listens on %s only", host, host)
+	if u.Scheme != "http" || u.User != nil || u.Hostname() != host || u.Path != "/mcp" ||
+		u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" {
+		return 0, shape
 	}
-	p, err := strconv.Atoi(u.Port())
-	if err != nil || p < 1 || p > 65535 {
-		return 0, errors.New("the port is out of range")
+	port := u.Port()
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 1 || p > 65535 || strconv.Itoa(p) != port {
+		return 0, fmt.Errorf("the port %q is not a port from 1 to 65535 written without leading zeros", port)
 	}
 	return p, nil
 }

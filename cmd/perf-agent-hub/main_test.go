@@ -554,13 +554,36 @@ func TestTokenAndURLSubcommands(t *testing.T) {
 		{"token", "--port", "0"},
 		{"token", "--port", "65536"},
 		{"token", "--port", "1", "--url", "http://127.0.0.1:1/mcp"},
-		{"token", "--url", "127.0.0.1:7341"},
+		{"token", "--url", "127.0.0.1:7362"},
+		{"token", "--url", fmt.Sprintf("http://127.0.0.1:%d/", p.port)},
+		{"token", "--url", fmt.Sprintf("http://127.0.0.1:%d/other", p.port)},
+		{"token", "--url", fmt.Sprintf("http://user:pw@127.0.0.1:%d/mcp", p.port)},
+		{"token", "--url", fmt.Sprintf("http://127.0.0.1:0%d/mcp", p.port)},
+		{"token", "--url", fmt.Sprintf("http://127.0.0.1:%d/mcp?x=1", p.port)},
+		{"token", "--url", fmt.Sprintf("https://127.0.0.1:%d/mcp", p.port)},
 		{"token", "extra"},
 		{"url", "extra"},
 	} {
 		code, stdout, stderr := runHub(t, p.env(), args...)
 		if code != 2 || stdout != "" || stderr == "" {
 			t.Errorf("%v: exit %d, stdout %q, stderr %q; want a usage error", args, code, stdout, stderr)
+		}
+	}
+}
+
+// TestTokenAcrossTimeZones: hub.json is compared as written, so a hub
+// started in a zone whose offset is not a whole hour is read alike from
+// any zone.
+func TestTokenAcrossTimeZones(t *testing.T) {
+	p := startHub(t, hubOptions{env: []string{"TZ=Asia/Kolkata"}})
+	if !strings.Contains(p.file("hub.json"), "+05:30") {
+		t.Fatalf("hub.json was not written in Asia/Kolkata: %s", p.file("hub.json"))
+	}
+	want := `{"Authorization":"Bearer ` + p.mcpToken() + `"}` + "\n"
+	for _, tz := range []string{"UTC", "Asia/Kolkata", "America/St_Johns"} {
+		code, stdout, stderr := runHub(t, append(p.env(), "TZ="+tz), "token", "--port", strconv.Itoa(p.port))
+		if code != 0 || stdout != want {
+			t.Errorf("token with TZ=%s: exit %d, stdout %q, stderr %q", tz, code, stdout, stderr)
 		}
 	}
 }
@@ -677,6 +700,9 @@ func TestAStaleHubJSONDoesNotBlockStart(t *testing.T) {
 
 func TestHubHasNoAddressFlag(t *testing.T) {
 	env := []string{"XDG_RUNTIME_DIR=" + t.TempDir()}
+	if code, _, stderr := runHub(t, env, "--help"); code != 0 || !strings.Contains(stderr, "(default 7362)") {
+		t.Errorf("--help: exit %d, the default port is not 7362:\n%s", code, stderr)
+	}
 	for _, flag := range []string{"--addr", "--host", "--listen", "--live"} {
 		code, stdout, stderr := runHub(t, env, "--profiles", t.TempDir(), flag, "127.0.0.1:0")
 		if code != 2 || stdout != "" || !strings.Contains(stderr, "flag provided but not defined") {

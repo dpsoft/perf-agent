@@ -150,15 +150,15 @@ func TestTheLockIsThePresence(t *testing.T) {
 	if running(first.path) {
 		t.Error("running before any take")
 	}
-	if _, err := first.take(); err != nil {
+	if err := first.take(); err != nil {
 		t.Fatal(err)
 	}
 	tok, err := livehttp.NewToken()
 	if err != nil {
 		t.Fatal(err)
 	}
-	info := hubInfo{PID: 4242, Port: 7341, MCPURL: "http://127.0.0.1:7341/mcp", Started: time.Now(), Version: "test"}
-	if err := first.write(info, tok, "http://127.0.0.1:7341/s/x/"); err != nil {
+	info := hubInfo{PID: 4242, Port: 7362, MCPURL: "http://127.0.0.1:7362/mcp", Started: time.Now(), Version: "test"}
+	if err := first.write(info, tok, "http://127.0.0.1:7362/s/x/"); err != nil {
 		t.Fatal(err)
 	}
 	if !running(first.path) {
@@ -169,9 +169,8 @@ func TestTheLockIsThePresence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.close()
-	holder, err := second.take()
-	if err == nil || !strings.Contains(err.Error(), "perf-agent-hub is already running (pid 4242, port 7341)") || holder.PID != 4242 {
-		t.Errorf("a second take: %+v %v", holder, err)
+	if err := second.take(); err == nil || !strings.Contains(err.Error(), "perf-agent-hub is already running (pid 4242, port 7362)") {
+		t.Errorf("a second take: %v", err)
 	}
 	// The refused take removed nothing.
 	if _, err := os.Stat(filepath.Join(first.path, "mcp-token")); err != nil {
@@ -187,7 +186,7 @@ func TestTheLockIsThePresence(t *testing.T) {
 	if len(ents) != 1 || ents[0].Name() != "hub.lock" {
 		t.Errorf("after remove: %v", ents)
 	}
-	if _, err := second.take(); err != nil {
+	if err := second.take(); err != nil {
 		t.Errorf("take after remove: %v", err)
 	}
 }

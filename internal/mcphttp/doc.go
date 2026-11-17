@@ -38,10 +38,12 @@
 // refused with 503; a retry with the id of the call still running gets
 // 400 -32600 at once when there is room. The place is given back before
 // the answer is written, so a client that waits for its answers never
-// meets its own cap. Answers not yet read are therefore outside the caps:
-// at most one per connection, each at most MaxAnswerBytes, for at most
-// WriteBound. The server that mounts the Transport bounds its connections
-// to bound that memory.
+// meets its own cap. An answer is written holding one of MaxAnswersWriting
+// places, which it waits for while it keeps its call's place, so answers
+// not yet read are at most MaxAnswersWriting, each at most MaxAnswerBytes,
+// for at most WriteBound, and only requests past the guard take them.
+// Refusals and the empty answers to notifications take none, and once
+// Close ran an answer takes none, so an ended call answers at once.
 //
 // The Transport sits behind livehttp.Front and livehttp.MCPGuard, which
 // check the Host, refuse browsers, check the bearer token and the headers,

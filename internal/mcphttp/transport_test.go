@@ -634,7 +634,7 @@ func TestNewAppliesTheDefaults(t *testing.T) {
 	want := Options{MaxSessions: 32, MaxMessageBytes: 4 << 20, IngressBodyTimeout: 2 * time.Second,
 		WriteBound: 10 * time.Second, MaxAnswerBytes: 4 << 20,
 		MaxIngressReaders: 16, MaxIngressBytes: 8 << 20, MaxControlInFlight: 32, MaxPageStateInFlight: 4,
-		MaxCalls: 16, MaxCallsPerSession: 4, MaxRequestBytes: 16 << 20}
+		MaxCalls: 16, MaxCallsPerSession: 4, MaxRequestBytes: 16 << 20, MaxAnswersWriting: 64}
 	got := tr.o
 	got.Lifetime, got.Log = nil, nil
 	if got != want {
@@ -665,4 +665,52 @@ func TestABodyThatStallsClosesItsConnection(t *testing.T) {
 		t.Fatalf("the connection closed %v after the body stalled", d)
 	}
 	eventually(t, time.Second, "the reader is released", func() bool { return h.tr.Stats().Readers == 0 })
+}
+
+// TestAnswerWritesAreBounded: with MaxAnswersWriting answers stuck on a
+// client that does not read, the next answer waits for one of them to
+// end (WriteBound), while refusals and notifications, which take no
+// place, are answered at once. So unread answers are at most
+// MaxAnswersWriting × MaxAnswerBytes, whatever the connections.
+func TestAnswerWritesAreBounded(t *testing.T) {
+	const bound = 800 * time.Millisecond
+	h := startHub(t, func(o *Options) { o.WriteBound = bound; o.MaxAnswersWriting = 1 }, nil)
+	sid := h.initialize()
+	eventually(t, time.Second, "initialize's handler returns", func() bool { return h.served.Load() == 1 })
+	c := h.dial()
+	if _, err := c.Write(h.rawRequest(sid, callBody(1, "big", map[string]int{"bytes": 16 << 20}))); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 5*time.Second, "the big answer is being written", func() bool { return h.tr.Stats().Writing == 1 })
+	start := time.Now()
+	if r := h.post(sid, cancelBody(99)); r.status != http.StatusAccepted || time.Since(start) > bound/2 {
+		t.Errorf("a notification while the place is taken: %d after %v", r.status, time.Since(start))
+	}
+	ans := h.callAsync(sid, 2, "slow", map[string]int{"ms": 0})
+	r := await(t, ans, 5*time.Second)
+	took := time.Since(start)
+	if text, isErr := r.toolText(); r.status != http.StatusOK || isErr || text != "slept" {
+		t.Fatalf("the second answer: %d %s", r.status, r.body)
+	}
+	if took < bound/2 {
+		t.Errorf("the second answer was written after %v, while the first held the only place (WriteBound %v)", took, bound)
+	}
+	eventually(t, 5*time.Second, "every place is given back", func() bool { return h.tr.Stats().Writing == 0 })
+}
+
+// With room, answers do not wait on one another.
+func TestAnswerWritesWithRoomDoNotWait(t *testing.T) {
+	const bound = 800 * time.Millisecond
+	h := startHub(t, func(o *Options) { o.WriteBound = bound; o.MaxAnswersWriting = 2 }, nil)
+	sid := h.initialize()
+	c := h.dial()
+	if _, err := c.Write(h.rawRequest(sid, callBody(1, "big", map[string]int{"bytes": 16 << 20}))); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 5*time.Second, "the big answer is being written", func() bool { return h.tr.Stats().Writing == 1 })
+	start := time.Now()
+	await(t, h.callAsync(sid, 2, "slow", map[string]int{"ms": 0}), 5*time.Second)
+	if took := time.Since(start); took > bound/2 {
+		t.Errorf("an answer with a free place took %v", took)
+	}
 }

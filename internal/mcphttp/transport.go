@@ -47,6 +47,7 @@ const (
 	defaultMaxCalls             = 16
 	defaultMaxCallsPerSession   = 4
 	defaultMaxRequestBytes      = 16 << 20
+	defaultMaxAnswersWriting    = 64
 )
 
 // Options configures a Transport.
@@ -93,6 +94,12 @@ type Options struct {
 	MaxCalls             int
 	MaxCallsPerSession   int
 	MaxRequestBytes      int64
+	// MaxAnswersWriting bounds the handlers' answers being written at
+	// once (0 means 64). An answer waits for a place, keeping its call's
+	// place in its class, so answers not yet read are at most this many,
+	// each at most MaxAnswerBytes, for at most WriteBound. Refusals and
+	// the empty answers to notifications take none.
+	MaxAnswersWriting int
 	// Log receives diagnostics; nil discards them. It is called on the
 	// request's goroutine, so it must not block.
 	Log *slog.Logger
@@ -111,6 +118,8 @@ type Stats struct {
 	// class holds, and RequestBytes the arguments the calls hold.
 	Control, PageState, Calls int
 	RequestBytes              int64
+	// Writing is how many answers hold a place to be written.
+	Writing int
 }
 
 // Transport is the MCP endpoint, an http.Handler for POST and DELETE.
@@ -128,6 +137,9 @@ type Transport struct {
 	life  context.Context
 	stop  context.CancelFunc
 	flush func()
+	// writing holds a token per handler answer being written; see
+	// MaxAnswersWriting.
+	writing chan struct{}
 
 	mu       sync.Mutex
 	closed   bool
@@ -185,11 +197,15 @@ func New(h Handler, o Options) *Transport {
 	if o.MaxRequestBytes <= 0 {
 		o.MaxRequestBytes = defaultMaxRequestBytes
 	}
+	if o.MaxAnswersWriting <= 0 {
+		o.MaxAnswersWriting = defaultMaxAnswersWriting
+	}
 	log := o.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	t := &Transport{h: h, o: o, log: log, sessions: map[string]*session{}, flush: sync.OnceFunc(h.FlushWarnings)}
+	t := &Transport{h: h, o: o, log: log, sessions: map[string]*session{}, flush: sync.OnceFunc(h.FlushWarnings),
+		writing: make(chan struct{}, o.MaxAnswersWriting)}
 	t.reserveReaders, t.reserveBytes = ingressReserve(o)
 	t.life, t.stop = context.WithCancel(o.Lifetime)
 	return t
@@ -208,6 +224,9 @@ func (t *Transport) Close() {
 	t.flush()
 }
 
+// Options are t's options, with the defaults New filled in.
+func (t *Transport) Options() Options { return t.o }
+
 // Stats is what t holds now.
 func (t *Transport) Stats() Stats {
 	t.mu.Lock()
@@ -216,6 +235,7 @@ func (t *Transport) Stats() Stats {
 		Sessions: len(t.sessions), InFlight: t.inflight,
 		Readers: t.readers, ReservedBytes: t.reserved,
 		Control: t.control, PageState: t.pageState, Calls: t.calls, RequestBytes: t.requestBytes,
+		Writing: len(t.writing),
 	}
 }
 
@@ -333,14 +353,31 @@ func (t *Transport) post(w http.ResponseWriter, rc *http.ResponseController, r *
 	}
 	t.mu.Unlock()
 
-	out := t.h.Handle(mcpstdio.WithReceived(ctx, received), s.proto, req)
+	out := t.bound(req, t.h.Handle(mcpstdio.WithReceived(ctx, received), s.proto, req))
+	if t.takeWriting() {
+		defer t.doneWriting()
+	}
 
 	t.mu.Lock()
 	t.unregister(s, key)
 	t.release(tk)
 	t.mu.Unlock()
-	t.write(w, rc, http.StatusOK, t.bound(req, out))
+	t.write(w, rc, http.StatusOK, out)
 }
+
+// takeWriting waits for a place to write a handler's answer, and reports
+// whether it took one: once the transport closes, an answer is written
+// without one, so a call ended by Close is answered at once.
+func (t *Transport) takeWriting() bool {
+	select {
+	case t.writing <- struct{}{}:
+		return true
+	case <-t.life.Done():
+		return false
+	}
+}
+
+func (t *Transport) doneWriting() { <-t.writing }
 
 // refuseBusy answers 503 with Retry-After and a JSON-RPC error for id
 // carrying text, for a message that was read.
@@ -391,6 +428,9 @@ func (t *Transport) initialize(w http.ResponseWriter, rc *http.ResponseControlle
 	defer cancel()
 	s := &session{id: newSessionID(), proto: mcpstdio.NewSession(), calls: map[string]context.CancelFunc{}}
 	out := t.bound(req, t.h.Handle(mcpstdio.WithReceived(ctx, received), s.proto, req))
+	if t.takeWriting() {
+		defer t.doneWriting()
+	}
 	t.mu.Lock()
 	t.release(tk)
 	if !s.proto.Initialized() {

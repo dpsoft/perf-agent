@@ -2,19 +2,30 @@
 // state when the stream is down): the state the agent drives, and the
 // count of the user's asks, each at its own revision. It fetches the shown
 // publication's model and rejected history, and draws them with the
-// shared panel. Every request is a relative GET. The only received
-// strings that become part of a request path are publication and node
-// IDs, and only when they have their fixed shapes. Every figure comes
-// from the server: this script formats no number.
+// shared panel. It reports the user's own selections, focus and asks to
+// the inbox. Every request is relative, and every one but the inbox's
+// POST is a GET. The only received strings that become part of a request
+// path are publication and node IDs, and only when they have their fixed
+// shapes. Every figure comes from the server: this script formats no
+// number.
 (() => {
   'use strict';
   const $ = (id) => document.getElementById(id);
+
+  // postHeaders mark a POST as the page's own: the inbox refuses any
+  // other content type, and a request without the custom header.
+  const postHeaders = {'Content-Type': 'application/json', 'X-Perf-Agent-Page': '1'};
 
   const transport = {
     getJSON: async (path) => {
       const r = await fetch(path, {cache: 'no-store'});
       if (!r.ok) throw new Error('request refused: ' + path);
       return r.json();
+    },
+    // post sends body as JSON and resolves to the answer's status.
+    post: async (path, body) => {
+      const r = await fetch(path, {method: 'POST', headers: postHeaders, body: JSON.stringify(body)});
+      return r.status;
     },
     // subscribe opens the event stream. onState gets each envelope; onTrouble
     // gets true when the browser gave the stream up for good (a refusal,
@@ -331,6 +342,7 @@
   const updateButtons = () => {
     $('focus-btn').disabled = !view || !view.selected || view.focus === view.selected;
     $('whole-btn').disabled = !view || !view.focus;
+    $('ask-btn').disabled = !view || !view.selected;
   };
 
   // drawModel draws m, the publication's whole model or a focus of it:
@@ -559,6 +571,36 @@
     toastTimer = setTimeout(() => t.classList.remove('on'), 2200);
   };
 
+  // --- Reports to the inbox ---
+
+  // report tells the server what the user did on the shown publication: a
+  // select (node is the selection, "" for none), a focus (node is the
+  // frame the layout now starts at, "" for the whole view) or an ask
+  // about node. focus is always the layout's current start. It resolves
+  // to the answer's status, or 0 when none came. A report changes nothing
+  // on the page: what the server makes of it comes back, if at all, in a
+  // later envelope.
+  const report = (kind, node) => {
+    if (!view || !isPub(view.pub)) return Promise.resolve(0);
+    const body = {kind, publication: view.pub, node, focus: view.focus};
+    return transport.post('inbox', body).catch(() => 0);
+  };
+
+  const askReplies = {
+    204: 'Sent. Ask your agent to look (it reads page_state).',
+    422: 'That frame is no longer on the page; nothing was sent.',
+    429: 'Too many reports; try again in a moment.',
+  };
+  const NOT_SENT = 'perf-agent did not take the ask; nothing was sent.';
+
+  // askAgent puts the selected frame in the inbox for the user's agent,
+  // and says how that went. It is not navigation, so it is allowed while
+  // an agent's publication switch loads: it asks about what is shown.
+  const askAgent = () => {
+    if (!view || !view.selected) return;
+    report('ask', view.selected).then((status) => toast(askReplies[status] || NOT_SENT));
+  };
+
   // --- The user's own navigation: local until the next agent state ---
 
   const quietly = (p) => p.catch(() => {});
@@ -566,17 +608,24 @@
   // about to go: navigating them would only cancel the switch.
   const agentLoading = () => loadingGen === gen;
 
+  // Each navigation is reported once it is shown; one the page moved on
+  // from first is not. Showing the selection again after a focus change is
+  // not a new selection.
   const localSelect = (id, scroll) => {
     if (!view || !isNode(id) || agentLoading()) return;
     const g = ++gen;
-    quietly(selectIn(id, g, scroll));
+    quietly(selectIn(id, g, scroll).then((f) => f && report('select', f.id)));
   };
 
   const focusHere = () => {
     if (!view || !view.selected || agentLoading()) return;
     const id = view.selected;
     const g = ++gen;
-    quietly(focusOn(id, g).then((ok) => ok && selectIn(id, g, false)));
+    quietly(focusOn(id, g).then((ok) => {
+      if (!ok) return null;
+      report('focus', id);
+      return selectIn(id, g, false);
+    }));
   };
 
   const wholeView = () => {
@@ -585,15 +634,20 @@
     const id = view.selected;
     view.focus = '';
     drawModel(view.whole);
+    report('focus', '');
     if (id) quietly(selectIn(id, g, true));
   };
 
+  // A publication the user chose is reported as a select of its own
+  // selection, or of none.
   const openPub = (id) => {
     if (!isPub(id)) return;
     const g = ++gen;
-    quietly(loadPub(id, g).then((ok) => {
-      const sel = ok && selectedOf(view.whole);
-      return sel && isNode(sel) ? selectIn(sel, g, true) : null;
+    quietly(loadPub(id, g).then(async (ok) => {
+      if (!ok) return;
+      const sel = selectedOf(view.whole);
+      const f = isNode(sel) ? await selectIn(sel, g, true) : null;
+      if (g === gen) report('select', f ? f.id : '');
     }));
   };
 
@@ -738,21 +792,9 @@
     });
   };
 
-  // --- The user's asks ---
+  // --- The inbox's count ---
 
   const strOf = (v) => (typeof v === 'string' ? v : '');
-
-  // inboxCount is the header's count of the user's asks, made once.
-  const inboxCount = () => {
-    let e = $('inbox');
-    if (!e) {
-      e = make('span', 'readout');
-      e.id = 'inbox';
-      e.hidden = true;
-      $('pills').before(e);
-    }
-    return e;
-  };
 
   // applyInbox shows ib, the inbox's state, if its rev is newer than any
   // accepted so far. The reader's label is the client's own name: it is
@@ -762,7 +804,7 @@
     acceptedRev = ib.rev;
     document.body.dataset.rev = acceptedRev;
     const asks = strOf(ib.asks);
-    const e = inboxCount();
+    const e = $('inbox');
     e.hidden = !asks || asks === '0';
     e.textContent = asks + (asks === '1' ? ' ask' : ' asks') + ' · ' + strOf(ib.unread) + ' unread' +
       (strOf(ib.read_by) ? ' · read by ' + ib.read_by : '');
@@ -867,6 +909,15 @@
 
   // --- Wiring ---
 
+  // The ask chip is the live page's own, so it is made here rather than
+  // in the shared panel: the static page has no server to ask.
+  const askBtn = make('button', 'chip', 'Ask my agent about this');
+  askBtn.type = 'button';
+  askBtn.id = 'ask-btn';
+  askBtn.title = "Puts this frame in your agent's inbox; your agent reads it with page_state";
+  askBtn.disabled = true;
+  $('focus-btn').after(askBtn);
+
   panel = perfAgentPanel(panelModel, {
     frameById: (id) => (view ? view.frames.get(id) : undefined),
     elementFor: (id) => (view && view.els.get(id)) || null,
@@ -912,6 +963,7 @@
   });
   $('focus-btn').addEventListener('click', focusHere);
   $('whole-btn').addEventListener('click', wholeView);
+  askBtn.addEventListener('click', askAgent);
   document.addEventListener('click', (ev) => {
     const chip = ev.target.closest('[data-prompt]');
     if (chip) {

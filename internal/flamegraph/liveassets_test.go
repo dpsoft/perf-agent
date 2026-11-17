@@ -53,7 +53,7 @@ func TestLiveShellHasNoInlineScriptOrStyle(t *testing.T) {
 	}
 
 	for _, id := range []string{"chart", "sel-ref", "sel-name", "sel-id", "facts", "exp", "noexp", "path", "chips", "copybox", "toast",
-		"pubs", "banner", "rejected", "pills", "notes", "quality", "rows", "legend", "axis", "export", "focus-btn", "whole-btn"} {
+		"pubs", "banner", "rejected", "pills", "notes", "quality", "rows", "legend", "axis", "export", "focus-btn", "whole-btn", "inbox"} {
 		assert.Equal(t, 1, strings.Count(shell, ` id="`+id+`"`), "region %s", id)
 	}
 	assert.Contains(t, shell, `<link rel="stylesheet" href="assets/live.css">`)
@@ -62,6 +62,8 @@ func TestLiveShellHasNoInlineScriptOrStyle(t *testing.T) {
 	assert.Less(t, strings.Index(shell, "assets/panel.js"), strings.Index(shell, "assets/live.js"), "the panel is defined before the page uses it")
 	assert.Contains(t, shell, "Waiting for your agent to publish a page (page_explain or page_diff).")
 	assert.Regexp(t, `<a [^>]*id="export"[^>]*\bdownload\b`, shell)
+	assert.Regexp(t, `<span [^>]*id="inbox"[^>]*\bhidden\b`, shell, "no count before the first envelope")
+	assert.Less(t, strings.Index(shell, `id="inbox"`), strings.Index(shell, `id="pills"`), "the count sits before the pills")
 }
 
 // fetchArgs are the argument lists of every fetch and EventSource call.
@@ -88,9 +90,24 @@ func TestLiveScriptRules(t *testing.T) {
 	// seq and rev are decimal strings compared by newer; neither ever
 	// becomes a number.
 	for _, s := range []string{"Number(", "parseInt", "BigInt", "+st.seq", "seq -", "seq +", "seq >", "seq <",
-		"+ib.rev", "rev -", "rev +", "rev >", "rev <", "Rev >", "Rev <"} {
+		"+ib.rev", "rev -", "rev +", "rev >", "rev <", "Rev >", "Rev <", "> acceptedRev", "< acceptedRev", "> acceptedSeq", "< acceptedSeq"} {
 		assert.NotContains(t, live, s)
 	}
+	// The page's one write is a POST to its inbox, with the headers the
+	// inbox guard requires. A report is told to the server and forgotten:
+	// it touches no accepted revision and no generation.
+	assert.Equal(t, 1, strings.Count(live, "method: 'POST'"), "one request writes")
+	posts := regexp.MustCompile(`transport\.post\(([^,)]*)`).FindAllStringSubmatch(live, -1)
+	require.Len(t, posts, 1, "one caller posts")
+	assert.Equal(t, "'inbox'", posts[0][1])
+	assert.Contains(t, live, "'Content-Type': 'application/json'")
+	assert.Contains(t, live, "'X-Perf-Agent-Page': '1'")
+	_, reports, ok := strings.Cut(live, "// --- Reports to the inbox ---")
+	require.True(t, ok, "the reports have their own section")
+	reports, _, _ = strings.Cut(reports, "// ---")
+	assert.Contains(t, reports, "transport.post(")
+	assert.NotRegexp(t, `\bgen\b|acceptedSeq|acceptedRev|retrySeq|loadingGen`, reports, "a report changes no state of the page")
+	assert.NotContains(t, panel, "inbox", "the shared panel reports nothing: the static page has no server")
 	assert.Contains(t, live, "newer(ib.rev, acceptedRev)", "the inbox is accepted by its own rev")
 	assert.NotContains(t, live, "innerText", "the reader's label is set as text")
 	assert.Contains(t, live, "cache: 'no-store'")
@@ -349,6 +366,9 @@ type liveDOM struct {
 	InboxHid   bool     `json:"inbox_hidden"`
 	Rev        string   `json:"rev"`
 	Images     int      `json:"images"`
+	AskOff     bool     `json:"ask_disabled"`
+	AskText    string   `json:"ask_text"`
+	Seq        string   `json:"seq"`
 }
 
 const domProbe = `(() => {
@@ -390,6 +410,9 @@ const domProbe = `(() => {
     inbox_hidden: !$('inbox') || $('inbox').hidden,
     rev: document.body.dataset.rev || '',
     images: document.querySelectorAll('img').length,
+    ask_disabled: !$('ask-btn') || $('ask-btn').disabled,
+    ask_text: $('ask-btn') ? $('ask-btn').textContent : '',
+    seq: document.body.dataset.seq || '',
   });
 })()`
 
@@ -469,6 +492,8 @@ type liveServer struct {
 	delay     map[string]time.Duration
 	delayOnce map[string][]time.Duration // per-request delays by path, first request first
 	served    []string
+	reports   []map[string]string // the inbox's reports, in order
+	answer    map[string]int      // node -> the inbox's status for a report about it; 204 otherwise
 	gone      chan struct{}
 	closeOnce sync.Once
 }
@@ -478,7 +503,7 @@ func newLiveServer(t *testing.T) *liveServer {
 	tok, err := livehttp.NewToken()
 	require.NoError(t, err)
 	s := &liveServer{streams: map[chan []byte]bool{}, pubs: map[string]*livePub{}, history: map[string][]byte{},
-		delay: map[string]time.Duration{}, delayOnce: map[string][]time.Duration{}, gone: make(chan struct{})}
+		delay: map[string]time.Duration{}, delayOnce: map[string][]time.Duration{}, answer: map[string]int{}, gone: make(chan struct{})}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		shell := liveAsset(t, "")
@@ -529,7 +554,10 @@ func newLiveServer(t *testing.T) *liveServer {
 		w.Header().Set("Content-Disposition", `attachment; filename="`+r.PathValue("id")+`.html"`)
 		_, _ = w.Write([]byte("<!doctype html>"))
 	})
-	s.srv = httptest.NewServer(livehttp.Guard(tok, mux))
+	// The hub's front door, with the real guards; the inbox guard's own
+	// rate is high, so the scripted answers decide the status.
+	inbox := livehttp.InboxGuard(tok, livehttp.Rate{PerSecond: 1000, Burst: 1000}, http.HandlerFunc(s.inbox))
+	s.srv = httptest.NewServer(livehttp.Front(tok, http.NotFoundHandler(), inbox, livehttp.Guard(tok, mux)))
 	t.Cleanup(s.close)
 	s.url = s.srv.URL + "/s/" + string(tok) + "/"
 	return s
@@ -620,6 +648,30 @@ func (s *liveServer) events(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// inbox records a report, which must be one object of strings, and
+// answers the status set for its node, 204 by default.
+func (s *liveServer) inbox(w http.ResponseWriter, r *http.Request) {
+	var rep map[string]string
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&rep); err != nil || dec.More() {
+		http.Error(w, "not a report", http.StatusUnprocessableEntity)
+		return
+	}
+	s.mu.Lock()
+	s.reports = append(s.reports, rep)
+	code := cmp.Or(s.answer[rep["node"]], http.StatusNoContent)
+	s.mu.Unlock()
+	s.wait(r, "inbox")
+	w.WriteHeader(code)
+}
+
+// reportsSeen are the inbox's reports so far.
+func (s *liveServer) reportsSeen() []map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.reports)
 }
 
 // servedPaths lists the paths the server was asked for, in order.
@@ -1035,6 +1087,7 @@ func TestLivePageInChrome(t *testing.T) {
 		d := tab.dom()
 		assert.True(t, d.Waiting)
 		assert.True(t, d.ExportHid)
+		assert.True(t, d.AskOff, "nothing is selected to ask about")
 		assert.Empty(t, d.Frames)
 		assert.True(t, d.BannerHid)
 		assert.Empty(t, tab.errors())
@@ -1293,6 +1346,166 @@ func TestLivePageReadsTheEnvelopeInChrome(t *testing.T) {
 		assert.Equal(t, 0, d.Images, "the label is text, not markup")
 		assert.Equal(t, 0, d.Violations)
 		assert.Equal(t, "b", d.SelName)
+		assert.Empty(t, tab.errors())
+	})
+}
+
+// The page's answers to an ask, by the inbox's status.
+const (
+	liveAskSent    = "Sent. Ask your agent to look (it reads page_state)."
+	liveAskGone    = "That frame is no longer on the page; nothing was sent."
+	liveAskTooMany = "Too many reports; try again in a moment."
+)
+
+// liveReport is a report as the page sends it: all four members, strings.
+func liveReport(kind, pub string, node, focus profilemodel.NodeID) map[string]string {
+	return map[string]string{"kind": kind, "publication": pub, "node": string(node), "focus": string(focus)}
+}
+
+// waitReports waits until the inbox has n reports and returns them.
+func waitReports(t *testing.T, s *liveServer, n int) []map[string]string {
+	t.Helper()
+	require.Eventually(t, func() bool { return len(s.reportsSeen()) >= n }, 10*time.Second, 20*time.Millisecond, "%d reports", n)
+	return s.reportsSeen()
+}
+
+// clickFrame clicks the drawn frame whose text is name.
+func clickFrame(tab *liveTab, name string) {
+	tab.eval(`[...document.querySelectorAll('#chart .frame')].find((e) => e.textContent === '` + name + `').click(), ''`)
+}
+
+// §D4: the page reports the user's own selections and focus to the inbox,
+// and the "Ask my agent about this" chip posts an ask and says how it went.
+// A report is fire and forget: it touches neither the accepted revisions
+// nor the generation, so an agent chain under way is never cut short by
+// one.
+func TestLivePageInboxInChrome(t *testing.T) {
+	c := startChrome(t)
+	f := newLiveFixture(t)
+	ask := func(tab *liveTab) { tab.eval(`document.getElementById('ask-btn').click(), ''`) }
+
+	t.Run("an ask posts and the toast shows", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), nil)
+		d := tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.AskOff })
+		assert.Equal(t, "Ask my agent about this", d.AskText)
+		assert.Equal(t, "ask-btn", tab.eval(`document.getElementById('focus-btn').nextElementSibling.id`), "the chip sits next to Focus here")
+		assert.Empty(t, d.Toast)
+		assert.Empty(t, s.reportsSeen(), "the agent's own selection is not reported")
+		ask(tab)
+		d = tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast != "" })
+		assert.Equal(t, liveAskSent, d.Toast)
+		assert.Equal(t, []map[string]string{liveReport("ask", "p1", f.b, "")}, s.reportsSeen())
+		assert.Equal(t, "1", d.Seq)
+		assert.Equal(t, "b", d.SelName)
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("the user's navigation is reported", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1", "p2"), nil)
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && len(d.Pubs) == 2 })
+		clickFrame(tab, "a")
+		assert.Equal(t, []map[string]string{liveReport("select", "p1", f.a, "")}, waitReports(t, s, 1))
+		tab.waitFor("a clicked", func(d liveDOM) bool { return d.SelName == "a" && !d.FocusOff })
+		tab.eval(`document.getElementById('focus-btn').click(), ''`)
+		assert.Equal(t, liveReport("focus", "p1", f.a, f.a), waitReports(t, s, 2)[1], "focus names the frame the layout starts at")
+		tab.waitFor("a's focus", func(d liveDOM) bool { return strings.Contains(d.Axis, "relative to a") })
+		ask(tab)
+		assert.Equal(t, liveReport("ask", "p1", f.a, f.a), waitReports(t, s, 3)[2], "an ask carries the focus")
+		tab.eval(`document.getElementById('whole-btn').click(), ''`)
+		assert.Equal(t, liveReport("focus", "p1", "", ""), waitReports(t, s, 4)[3], "the whole view is the empty focus")
+		tab.waitFor("the whole view", func(d liveDOM) bool { return len(d.Frames) == 4 && d.SelName == "a" })
+		tab.eval(`document.querySelector('#rows .exrow').click(), ''`)
+		assert.Equal(t, liveReport("select", "p1", f.b, ""), waitReports(t, s, 5)[4])
+		// A path entry selects its node.
+		tab.eval(`document.querySelector('#path button[data-node="` + string(f.main) + `"]').click(), ''`)
+		assert.Equal(t, liveReport("select", "p1", f.main, ""), waitReports(t, s, 6)[5])
+		tab.eval(`document.querySelector('#pubs button[data-pub="p2"]').click(), ''`)
+		tab.waitFor("p2", func(d liveDOM) bool { return d.Title == "second" && d.SelName == "c" })
+		assert.Equal(t, liveReport("select", "p2", f.c, ""), waitReports(t, s, 7)[6], "the publication the user chose, with its own selection")
+		time.Sleep(300 * time.Millisecond)
+		d := tab.dom()
+		assert.Len(t, s.reportsSeen(), 7, "a selection shown again is not reported again")
+		assert.Equal(t, "1", d.Seq, "no report moved the agent's state")
+		assert.Equal(t, "0", d.Rev, "nor the inbox's: only an envelope does")
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a 422 says nothing was sent", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), func(s *liveServer) {
+			s.answer[string(f.b)] = http.StatusUnprocessableEntity
+		})
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.AskOff })
+		ask(tab)
+		d := tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast != "" })
+		assert.Equal(t, liveAskGone, d.Toast)
+		assert.Len(t, s.reportsSeen(), 1)
+		assert.Equal(t, "b", d.SelName, "the page stays as it was")
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a 429 says try again", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), func(s *liveServer) {
+			s.answer[string(f.b)] = http.StatusTooManyRequests
+		})
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.AskOff })
+		ask(tab)
+		d := tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast != "" })
+		assert.Equal(t, liveAskTooMany, d.Toast)
+		// The answer to a select is not shown: a select is fire and forget.
+		s.mu.Lock()
+		s.answer[string(f.a)] = http.StatusTooManyRequests
+		s.mu.Unlock()
+		tab.eval(`document.getElementById('toast').textContent = '', ''`)
+		clickFrame(tab, "a")
+		waitReports(t, s, 2)
+		time.Sleep(300 * time.Millisecond)
+		d = tab.dom()
+		assert.Equal(t, "a", d.SelName)
+		assert.Empty(t, d.Toast)
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a report during an agent chain's switch keeps the chain", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1", "p2"), func(s *liveServer) {
+			s.setDelay("pub/p2/model", 1500*time.Millisecond)
+			s.setDelay("inbox", 300*time.Millisecond)
+		})
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" })
+		// a's select report is still unanswered when the agent switches.
+		clickFrame(tab, "a")
+		tab.waitFor("a clicked", func(d liveDOM) bool { return d.SelName == "a" })
+		waitReports(t, s, 1)
+		s.push(liveState("2", "p2", f.c, "", "p1", "p2"))
+		time.Sleep(200 * time.Millisecond)
+		// The ask is about what is still shown, and is sent and answered
+		// while p2 loads.
+		ask(tab)
+		d := tab.waitFor("the ask's toast", func(d liveDOM) bool { return d.Toast == liveAskSent })
+		assert.Equal(t, "first look at 3 frames", d.Title, "p2 is still loading")
+		d = tab.waitFor("the agent's p2", func(d liveDOM) bool { return d.Title == "second" && d.SelName == "c" })
+		assert.Equal(t, "2", d.Seq, "the agent's chain finished")
+		assert.True(t, strings.HasPrefix(d.Toast, "Your agent selected "), "the chain ran to its end: %q", d.Toast)
+		assert.Equal(t, []map[string]string{liveReport("select", "p1", f.a, ""), liveReport("ask", "p1", f.a, "")}, s.reportsSeen())
+		s.mu.Lock()
+		assert.Equal(t, 1, countOf(s.served, "pub/p2/model"), "the switch ran once, never cut short and redone")
+		s.mu.Unlock()
+		assert.Empty(t, d.LoadNote)
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("no CSP violation", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), nil)
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.FocusOff })
+		tab.eval(`document.getElementById('focus-btn').click(), ''`)
+		tab.waitFor("b's focus", func(d liveDOM) bool { return strings.Contains(d.Axis, "relative to b") })
+		ask(tab)
+		tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast == liveAskSent })
+		tab.eval(`document.getElementById('whole-btn').click(), ''`)
+		waitReports(t, s, 3)
+		lines := strings.Split(tab.waitText(`(document.getElementById('probe') || {}).textContent || ''`), "\n")
+		require.Len(t, lines, 3)
+		assert.Equal(t, "0", lines[1], "no content-security-policy violation")
+		assert.Equal(t, 0, tab.dom().Violations)
 		assert.Empty(t, tab.errors())
 	})
 }

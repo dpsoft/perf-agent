@@ -1,0 +1,784 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/dpsoft/perf-agent/internal/livehttp"
+	"github.com/dpsoft/perf-agent/internal/mcpflags"
+	"github.com/dpsoft/perf-agent/internal/mcphttp"
+	"github.com/dpsoft/perf-agent/internal/perfmcp"
+)
+
+// The clients of the tests: an MCP client's calls may take a while; a
+// page's reads should not.
+var (
+	mcpHTTP  = &http.Client{Timeout: 60 * time.Second}
+	pageHTTP = &http.Client{Timeout: 30 * time.Second}
+)
+
+// protocolVersion is the MCP revision the test client speaks.
+const protocolVersion = "2025-11-25"
+
+// hubClient is an MCP client of the hub over Streamable HTTP, as Claude
+// Code and Codex send it: POST /mcp with a bearer token, JSON in and out.
+type hubClient struct {
+	t       testing.TB
+	url     string
+	bearer  string
+	session string
+	next    atomic.Int64
+}
+
+func newHubClient(t testing.TB, port int, bearer string) *hubClient {
+	return &hubClient{t: t, url: fmt.Sprintf("http://127.0.0.1:%d/mcp", port), bearer: bearer}
+}
+
+// answer is one HTTP answer of /mcp.
+type answer struct {
+	status int
+	header http.Header
+	body   []byte
+}
+
+// rpcAnswer is a JSON-RPC answer.
+type rpcAnswer struct {
+	ID     json.RawMessage `json:"id"`
+	Result json.RawMessage `json:"result"`
+	Error  *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+// send posts one message, a notification when id is "", without failing
+// the test: it may run on any goroutine.
+func (c *hubClient) send(id, method string, params any) (answer, error) {
+	msg := map[string]any{"jsonrpc": "2.0", "method": method}
+	if id != "" {
+		msg["id"] = json.RawMessage(id)
+	}
+	if params != nil {
+		msg["params"] = params
+	}
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return answer{}, err
+	}
+	req, err := http.NewRequest(http.MethodPost, c.url, bytes.NewReader(b))
+	if err != nil {
+		return answer{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Authorization", "Bearer "+c.bearer)
+	if c.session != "" {
+		req.Header.Set(mcphttp.HeaderSession, c.session)
+		req.Header.Set(mcphttp.HeaderVersion, protocolVersion)
+	}
+	res, err := mcpHTTP.Do(req)
+	if err != nil {
+		return answer{}, err
+	}
+	defer func() { _ = res.Body.Close() }()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return answer{}, err
+	}
+	return answer{status: res.StatusCode, header: res.Header, body: body}, nil
+}
+
+// post is send that fails the test on a transport error.
+func (c *hubClient) post(id, method string, params any) (int, http.Header, []byte) {
+	c.t.Helper()
+	a, err := c.send(id, method, params)
+	if err != nil {
+		c.t.Fatalf("%s: %v", method, err)
+	}
+	return a.status, a.header, a.body
+}
+
+// decode reads a 200 answer to the request with id.
+func decode(a answer, id string) (rpcAnswer, error) {
+	var r rpcAnswer
+	if a.status != http.StatusOK {
+		return r, fmt.Errorf("status %d: %s", a.status, a.body)
+	}
+	if err := json.Unmarshal(a.body, &r); err != nil {
+		return r, fmt.Errorf("%s: %v", a.body, err)
+	}
+	if string(r.ID) != id {
+		return r, fmt.Errorf("answer for id %s to request %s", r.ID, id)
+	}
+	return r, nil
+}
+
+// rpc sends a request and returns its answer, which must be a 200 for
+// its id.
+func (c *hubClient) rpc(method string, params any) rpcAnswer {
+	c.t.Helper()
+	id := strconv.FormatInt(c.next.Add(1), 10)
+	r, err := decode(must(c.send(id, method, params))(c.t), id)
+	if err != nil {
+		c.t.Fatalf("%s: %v", method, err)
+	}
+	return r
+}
+
+// must is v, failing t on err.
+func must[T any](v T, err error) func(testing.TB) T {
+	return func(t testing.TB) T {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+}
+
+// initialize opens a session labelled label.
+func (c *hubClient) initialize(label string) {
+	c.t.Helper()
+	a := must(c.send("0", "initialize", map[string]any{
+		"protocolVersion": protocolVersion,
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": label, "version": "1"},
+	}))(c.t)
+	if _, err := decode(a, "0"); err != nil {
+		c.t.Fatalf("initialize: %v", err)
+	}
+	c.session = a.header.Get(mcphttp.HeaderSession)
+	if c.session == "" {
+		c.t.Fatal("initialize answered no session")
+	}
+	if status, _, body := c.post("", "notifications/initialized", nil); status != http.StatusAccepted {
+		c.t.Fatalf("notifications/initialized: %d %s", status, body)
+	}
+}
+
+// toolResult is a tools/call result.
+type toolResult struct {
+	Content []struct {
+		Text string `json:"text"`
+	} `json:"content"`
+	IsError bool `json:"isError"`
+}
+
+func (r rpcAnswer) tool() (string, bool, error) {
+	if r.Error != nil {
+		return "", false, fmt.Errorf("error %d %s", r.Error.Code, r.Error.Message)
+	}
+	var res toolResult
+	if err := json.Unmarshal(r.Result, &res); err != nil || len(res.Content) != 1 {
+		return "", false, fmt.Errorf("result %s (%v)", r.Result, err)
+	}
+	return res.Content[0].Text, res.IsError, nil
+}
+
+// try calls a tool and returns its text and isError.
+func (c *hubClient) try(name string, args any) (string, bool) {
+	c.t.Helper()
+	text, isErr, err := c.rpc("tools/call", map[string]any{"name": name, "arguments": args}).tool()
+	if err != nil {
+		c.t.Fatalf("%s: %v", name, err)
+	}
+	return text, isErr
+}
+
+// tool calls a tool that must succeed.
+func (c *hubClient) tool(name string, args any) string {
+	c.t.Helper()
+	text, isErr := c.try(name, args)
+	if isErr {
+		c.t.Fatalf("%s: %s", name, text)
+	}
+	return text
+}
+
+// opened is a profile's handle at its default view.
+type opened struct{ handle, view string }
+
+func (c *hubClient) open(path string) opened {
+	c.t.Helper()
+	var out struct {
+		Handle      string `json:"handle"`
+		DefaultView string `json:"default_view"`
+	}
+	if err := json.Unmarshal([]byte(c.tool("open", map[string]any{"path": path})), &out); err != nil {
+		c.t.Fatal(err)
+	}
+	return opened{out.Handle, out.DefaultView}
+}
+
+// publish publishes o's facts on the page and returns the publication.
+func (c *hubClient) publish(o opened) string {
+	c.t.Helper()
+	var out struct{ Publication, URL string }
+	text := c.tool("page_explain", map[string]any{"handle": o.handle, "view": o.view, "explanations": []any{}})
+	if err := json.Unmarshal([]byte(text), &out); err != nil || out.Publication == "" {
+		c.t.Fatalf("page_explain: %s (%v)", text, err)
+	}
+	return out.Publication
+}
+
+// nodeID is the ID of o's first node named name.
+func (c *hubClient) nodeID(o opened, name string) string {
+	c.t.Helper()
+	var out struct {
+		Rows []struct{ Node, Name string } `json:"rows"`
+	}
+	text := c.tool("top", map[string]any{"handle": o.handle, "view": o.view, "rows": "nodes", "limit": 200})
+	if err := json.Unmarshal([]byte(text), &out); err != nil {
+		c.t.Fatal(err)
+	}
+	for _, r := range out.Rows {
+		if r.Name == name {
+			return r.Node
+		}
+	}
+	c.t.Fatalf("no node %q in %s", name, text)
+	return ""
+}
+
+// newPageReport is a report as the live page posts it to its inbox.
+func newPageReport(page *url.URL, body []byte) (*http.Request, error) {
+	req, err := http.NewRequest(http.MethodPost, page.String()+"inbox", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Origin", "http://"+page.Host)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Perf-Agent-Page", "1")
+	return req, nil
+}
+
+// local is an instance started in this process.
+type local struct {
+	in       *instance
+	xdg      string
+	port     int
+	stdout   *lockedBuffer
+	stderr   *lockedBuffer
+	profiles string
+}
+
+// localOptions are start's options for a hub in this process, on a free
+// port, with a temporary XDG_RUNTIME_DIR, and the flags in extra.
+func localOptions(t testing.TB, extra ...string) (options, *local) {
+	t.Helper()
+	l := &local{xdg: t.TempDir(), port: freePort(t), stdout: &lockedBuffer{}, stderr: &lockedBuffer{}, profiles: profilesDir(t)}
+	fs := flag.NewFlagSet("perf-agent-hub", flag.ContinueOnError)
+	vals := mcpflags.Register(fs, mcpflags.Hub)
+	if err := fs.Parse(append([]string{"--profiles", l.profiles}, extra...)); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := vals.Config(fs, l.stderr, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	getenv := func(k string) string {
+		if k == "XDG_RUNTIME_DIR" {
+			return l.xdg
+		}
+		return ""
+	}
+	return options{cfg: cfg, port: l.port, getenv: getenv, stdout: l.stdout}, l
+}
+
+// startLocal starts a hub in this process; the test's cleanup shuts it
+// down.
+func startLocal(t testing.TB, extra ...string) *local {
+	t.Helper()
+	o, l := localOptions(t, extra...)
+	in, err := start(t.Context(), o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.in = in
+	t.Cleanup(in.shutdown)
+	return l
+}
+
+func (l *local) client(t testing.TB, label string) *hubClient {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(l.xdg, "perf-agent-mcp", "mcp-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newHubClient(t, l.port, strings.TrimSpace(string(b)))
+	c.initialize(label)
+	return c
+}
+
+// TestStaleRuntimeFilesGoWhenTheLockIsTaken: the files a hub killed with
+// SIGKILL left are removed as soon as the next one holds the lock, before
+// it listens, so the token helper never prints a dead hub's token while
+// the new one starts.
+func TestStaleRuntimeFilesGoWhenTheLockIsTaken(t *testing.T) {
+	o, l := localOptions(t)
+	dir := filepath.Join(l.xdg, "perf-agent-mcp")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := map[string]string{
+		"hub.json":  fmt.Sprintf(`{"pid":999999,"port":%d,"mcp_url":"http://127.0.0.1:%d/mcp","started":"2026-11-16T00:00:00Z","version":"dev"}`, l.port, l.port),
+		"mcp-token": strings.Repeat("A", 43),
+		"page-url":  "http://127.0.0.1:1/s/" + strings.Repeat("B", 43) + "/",
+	}
+	for name, content := range stale {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	defer func(prev func(string) (net.Listener, error)) { listen = prev }(listen)
+	listen = func(addr string) (net.Listener, error) {
+		close(entered)
+		<-release
+		return livehttp.Listen(addr)
+	}
+	started := make(chan error, 1)
+	var in *instance
+	go func() {
+		var err error
+		in, err = start(t.Context(), o)
+		started <- err
+	}()
+	select {
+	case <-entered:
+	case err := <-started:
+		t.Fatalf("start returned before it listened: %v", err)
+	}
+	for name := range stale {
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s is still there while the hub starts (%v)", name, err)
+		}
+	}
+	var stdout, stderr bytes.Buffer
+	if code := runToken([]string{"--port", strconv.Itoa(l.port)}, o.getenv, &stdout, &stderr); code != 1 || stdout.Len() != 0 {
+		t.Errorf("token while the hub starts: exit %d, stdout %q, stderr %q", code, stdout.String(), stderr.String())
+	}
+	close(release)
+	if err := <-started; err != nil {
+		t.Fatal(err)
+	}
+	defer in.shutdown()
+	stdout.Reset()
+	if code := runToken([]string{"--port", strconv.Itoa(l.port)}, o.getenv, &stdout, &stderr); code != 0 || strings.Contains(stdout.String(), strings.Repeat("A", 43)) {
+		t.Errorf("token once started: exit %d, stdout %q", code, stdout.String())
+	}
+}
+
+// TestShutdownOrder: the captures are killed first; the page's streams
+// end; the transport closes, which ends every call's context; then the
+// HTTP server shuts down, the perfmcp server closes and the files go.
+func TestShutdownOrder(t *testing.T) {
+	l := startLocal(t)
+	var mu sync.Mutex
+	var order []string
+	record := func(name string) {
+		mu.Lock()
+		order = append(order, name)
+		mu.Unlock()
+	}
+	pKill, pEvents, pTransport, pHTTP, pServer, pFiles := killCaptures, closeEvents, closeTransport, shutdownHTTP, closeServer, removeFiles
+	t.Cleanup(func() {
+		killCaptures, closeEvents, closeTransport, shutdownHTTP, closeServer, removeFiles = pKill, pEvents, pTransport, pHTTP, pServer, pFiles
+	})
+	killCaptures = func(s *perfmcp.Server) { record("KillCaptures"); pKill(s) }
+	closeEvents = func(h *livehttp.Hub) { record("events.Close"); pEvents(h) }
+	closeTransport = func(tr *mcphttp.Transport) { record("transport.Close"); pTransport(tr) }
+	shutdownHTTP = func(s *http.Server) { record("http.Shutdown"); pHTTP(s) }
+	closeServer = func(s *perfmcp.Server) error { record("perfmcp.Close"); return pServer(s) }
+	removeFiles = func(d *runtimeDir) error { record("files removed"); return pFiles(d) }
+
+	c := l.client(t, "order")
+	c.tool("open", map[string]any{"path": "cpu.pb.gz"})
+	start := time.Now()
+	l.in.shutdown()
+	if took := time.Since(start); took > 500*time.Millisecond {
+		t.Errorf("an idle shutdown took %v", took)
+	}
+	want := []string{"KillCaptures", "events.Close", "transport.Close", "http.Shutdown", "perfmcp.Close", "files removed"}
+	recorded := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(order)
+	}
+	if got := recorded(); !slices.Equal(got, want) {
+		t.Errorf("shutdown order %v, want %v", got, want)
+	}
+	ents, err := os.ReadDir(filepath.Join(l.xdg, "perf-agent-mcp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 1 || ents[0].Name() != "hub.lock" {
+		t.Errorf("runtime files after shutdown: %v", ents)
+	}
+	// A second shutdown, as the cleanup runs, does nothing.
+	l.in.shutdown()
+	if got := recorded(); len(got) != len(want) {
+		t.Errorf("a second shutdown ran %v", got[len(want):])
+	}
+}
+
+// TestOneCallRunsAtATime (§D7): eight sessions call engine tools at once
+// while two tabs read the page and post to its inbox. The engine admits
+// one holder at a time, and each session's answers carry its own ids.
+func TestOneCallRunsAtATime(t *testing.T) {
+	var holders, maxHolders, holds atomic.Int64
+	defer func(prev func(*perfmcp.Config)) { configHook = prev }(configHook)
+	configHook = func(c *perfmcp.Config) {
+		c.HoldEngine = func(string) {
+			n := holders.Add(1)
+			for {
+				m := maxHolders.Load()
+				if n <= m || maxHolders.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			holds.Add(1)
+			time.Sleep(2 * time.Millisecond)
+			holders.Add(-1)
+		}
+	}
+	l := startLocal(t)
+	setup := l.client(t, "setup")
+	pub := setup.publish(setup.open("cpu.pb.gz"))
+	page := must(url.Parse(strings.TrimSpace(l.stdout.String())))(t)
+
+	const sessions, calls = 8, 6
+	stop := make(chan struct{})
+	var tabs sync.WaitGroup
+	for range 2 {
+		tabs.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				for _, route := range []string{"state", "pub/" + pub + "/model"} {
+					res, err := pageHTTP.Get(page.String() + route)
+					if err != nil {
+						t.Errorf("GET %s: %v", route, err)
+						return
+					}
+					_, _ = io.Copy(io.Discard, res.Body)
+					_ = res.Body.Close()
+					if res.StatusCode != 200 {
+						t.Errorf("GET %s: %d", route, res.StatusCode)
+					}
+				}
+				req, err := newPageReport(page, []byte(`{"kind":"select","publication":"`+pub+`","node":"0"}`))
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				res, err := pageHTTP.Do(req)
+				if err != nil {
+					t.Errorf("POST inbox: %v", err)
+					return
+				}
+				_ = res.Body.Close()
+				if res.StatusCode != 204 && res.StatusCode != 422 && res.StatusCode != 429 {
+					t.Errorf("POST inbox: %d", res.StatusCode)
+				}
+			}
+		})
+	}
+	var wg sync.WaitGroup
+	for s := range sessions {
+		c := l.client(t, fmt.Sprintf("agent-%d", s))
+		wg.Go(func() {
+			for i := range calls {
+				id := fmt.Sprintf(`"s%d-c%d"`, s, i)
+				name, args := "open", map[string]any{"path": "cpu.pb.gz"}
+				if i%2 == 1 {
+					name, args = "facts", map[string]any{"handle": "nope", "view": "nope"}
+				}
+				a, err := c.send(id, "tools/call", map[string]any{"name": name, "arguments": args})
+				if err == nil {
+					_, err = decode(a, id)
+				}
+				if err != nil {
+					t.Errorf("session %d call %d: %v", s, i, err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(stop)
+	tabs.Wait()
+	if m := maxHolders.Load(); m != 1 {
+		t.Errorf("%d calls held the engine at once", m)
+	}
+	if n := holds.Load(); n < sessions*calls {
+		t.Errorf("the engine was held %d times for %d calls", n, sessions*calls)
+	}
+}
+
+// TestConnectionsAreCapped: the listener serves at most maxConns
+// connections at once; one more waits until another closes.
+func TestConnectionsAreCapped(t *testing.T) {
+	l := startLocal(t)
+	page := strings.TrimSpace(l.stdout.String())
+	host := must(url.Parse(page))(t).Host
+	conns := make([]net.Conn, maxConns)
+	for i := range conns {
+		conns[i] = must(net.Dial("tcp", host))(t)
+		defer func() { _ = conns[i].Close() }()
+	}
+	time.Sleep(100 * time.Millisecond)
+	extra := must(net.Dial("tcp", host))(t)
+	defer func() { _ = extra.Close() }()
+	path := must(url.Parse(page))(t).Path
+	if _, err := fmt.Fprintf(extra, "GET %sstate HTTP/1.1\r\nHost: %s\r\n\r\n", path, host); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(extra)
+	_ = extra.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, err := br.ReadByte(); err == nil {
+		t.Fatalf("connection %d was served while %d were open", maxConns+1, maxConns)
+	}
+	_ = conns[0].Close()
+	_ = extra.SetReadDeadline(time.Now().Add(5 * time.Second))
+	res, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("connection %d once one closed: %v", maxConns+1, err)
+	}
+	_ = res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Errorf("GET state: %d", res.StatusCode)
+	}
+}
+
+// TestAnswersAreBoundedAsInStdio: the transport replaces an answer
+// stdio would not send, by the same small answer: the bound follows the
+// limits as stdio's output bound does.
+func TestAnswersAreBoundedAsInStdio(t *testing.T) {
+	small := startLocal(t, "--limit", "MaxResponseBytes=1024")
+	r := small.client(t, "small").rpc("tools/list", map[string]any{})
+	if r.Error == nil || !strings.Contains(r.Error.Message, "result too large for the output bound") {
+		t.Errorf("tools/list under MaxResponseBytes=1024 answered %s %+v", r.Result, r.Error)
+	}
+	def := startLocal(t)
+	if r := def.client(t, "default").rpc("tools/list", map[string]any{}); r.Error != nil {
+		t.Errorf("tools/list: %+v", r.Error)
+	}
+}
+
+func TestHubToolList(t *testing.T) {
+	p := startHub(t, hubOptions{})
+	c := p.client("lister")
+	var list struct {
+		Tools []struct{ Name string } `json:"tools"`
+	}
+	if err := json.Unmarshal(c.rpc("tools/list", map[string]any{}).Result, &list); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, tl := range list.Tools {
+		names = append(names, tl.Name)
+	}
+	want := []string{"open", "top", "path", "facts", "gpu_kernels_for", "sandwich", "diff", "source", "render_flamegraph",
+		"capture", "capture_wait", "capture_cancel", "capture_list",
+		"page_open", "page_explain", "page_show", "page_diff", "page_state"}
+	if !slices.Equal(names, want) {
+		t.Errorf("tools/list %v, want %v", names, want)
+	}
+	var res struct {
+		Resources []struct{ URI string } `json:"resources"`
+	}
+	if err := json.Unmarshal(c.rpc("resources/list", map[string]any{}).Result, &res); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(res.Resources, func(r struct{ URI string }) bool { return r.URI == "perf-agent://page/state" }) {
+		t.Errorf("resources %v lack perf-agent://page/state", res.Resources)
+	}
+	var info struct {
+		ServerInfo struct{ Name string } `json:"serverInfo"`
+	}
+	fresh := newHubClient(t, p.port, p.mcpToken())
+	if err := json.Unmarshal(fresh.rpc("initialize", map[string]any{"protocolVersion": protocolVersion}).Result, &info); err != nil || info.ServerInfo.Name != "perf-agent-hub" {
+		t.Errorf("serverInfo.name %q (%v)", info.ServerInfo.Name, err)
+	}
+}
+
+// rawRequest sends one request on a new connection, with exactly the
+// headers given and a body, and returns the status and the headers.
+func rawRequest(t testing.TB, port int, method, path string, header map[string]string, body string) (int, http.Header) {
+	t.Helper()
+	conn := must(net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second))(t)
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s %s HTTP/1.1\r\n", method, path)
+	if _, ok := header["Host"]; !ok {
+		fmt.Fprintf(&b, "Host: 127.0.0.1:%d\r\n", port)
+	}
+	for k, v := range header {
+		fmt.Fprintf(&b, "%s: %s\r\n", k, v)
+	}
+	if body != "" || method == http.MethodPost {
+		fmt.Fprintf(&b, "Content-Length: %d\r\n", len(body))
+	}
+	b.WriteString("\r\n" + body)
+	if _, err := io.WriteString(conn, b.String()); err != nil {
+		t.Fatal(err)
+	}
+	res, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	_ = res.Body.Close()
+	return res.StatusCode, res.Header
+}
+
+// TestTheChainIsComposedEndToEnd drives the real binary's one listener:
+// Front's Host check and routing, then MCPGuard before the transport,
+// InboxGuard before the inbox, and Guard before the page's routes. Each
+// token opens only its own door.
+func TestTheChainIsComposedEndToEnd(t *testing.T) {
+	p := startHub(t, hubOptions{})
+	mcpTok := p.mcpToken()
+	page := must(url.Parse(p.pageURL()))(t)
+	pageTok := strings.Trim(strings.TrimPrefix(page.Path, "/s/"), "/")
+	hello := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`
+	mcpHeaders := func(extra ...string) map[string]string {
+		h := map[string]string{"Authorization": "Bearer " + mcpTok, "Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+		for i := 0; i+1 < len(extra); i += 2 {
+			if extra[i+1] == "" {
+				delete(h, extra[i])
+				continue
+			}
+			h[extra[i]] = extra[i+1]
+		}
+		return h
+	}
+	report := `{"kind":"select","publication":"p1","node":"0"}`
+	pageHeaders := func(extra ...string) map[string]string {
+		h := map[string]string{"Origin": fmt.Sprintf("http://127.0.0.1:%d", p.port), "Sec-Fetch-Site": "same-origin", "Content-Type": "application/json", "X-Perf-Agent-Page": "1"}
+		for i := 0; i+1 < len(extra); i += 2 {
+			if extra[i+1] == "" {
+				delete(h, extra[i])
+				continue
+			}
+			h[extra[i]] = extra[i+1]
+		}
+		return h
+	}
+	for _, c := range []struct {
+		name         string
+		method, path string
+		header       map[string]string
+		body         string
+		want         int
+	}{
+		{"mcp: initialize", "POST", "/mcp", mcpHeaders(), hello, 200},
+		{"front: a rebinding Host", "POST", "/mcp", mcpHeaders("Host", "evil.example:80"), hello, 403},
+		{"front: an unknown path", "GET", "/", nil, "", 404},
+		{"mcp guard: a browser", "POST", "/mcp", mcpHeaders("Origin", "http://127.0.0.1"), hello, 403},
+		{"mcp guard: GET", "GET", "/mcp", mcpHeaders(), "", 405},
+		{"mcp guard: no bearer", "POST", "/mcp", mcpHeaders("Authorization", ""), hello, 401},
+		{"mcp guard: the page token as bearer", "POST", "/mcp", mcpHeaders("Authorization", "Bearer "+pageTok), hello, 401},
+		{"mcp guard: Accept", "POST", "/mcp", mcpHeaders("Accept", "application/json"), hello, 400},
+		{"transport: no session", "POST", "/mcp", mcpHeaders(), `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`, 400},
+		{"page: the shell", "GET", page.Path, nil, "", 200},
+		{"page: the state", "GET", page.Path + "state", nil, "", 200},
+		{"page: the MCP token as page token", "GET", "/s/" + mcpTok + "/state", nil, "", 404},
+		{"page guard: a cross-site read", "GET", page.Path + "state", map[string]string{"Sec-Fetch-Site": "cross-site"}, "", 403},
+		{"page guard: POST state", "POST", page.Path + "state", pageHeaders(), report, 400},
+		{"inbox: a report", "POST", page.Path + "inbox", pageHeaders(), report, 422},
+		{"inbox guard: no Origin", "POST", page.Path + "inbox", pageHeaders("Origin", ""), report, 403},
+		{"inbox guard: no page mark", "POST", page.Path + "inbox", pageHeaders("X-Perf-Agent-Page", ""), report, 403},
+		{"inbox guard: the MCP token", "POST", "/s/" + mcpTok + "/inbox", pageHeaders(), report, 404},
+	} {
+		if got, h := rawRequest(t, p.port, c.method, c.path, c.header, c.body); got != c.want {
+			t.Errorf("%s: %d, want %d", c.name, got, c.want)
+		} else if got == 401 && h.Get("WWW-Authenticate") != "" {
+			t.Errorf("%s: WWW-Authenticate %q", c.name, h.Get("WWW-Authenticate"))
+		} else if h.Get("Content-Security-Policy") == "" {
+			t.Errorf("%s: no security headers", c.name)
+		}
+	}
+	// With a publication, a report of one of its nodes is recorded, and
+	// page_state reads it.
+	cl := p.client("chain")
+	o := cl.open("cpu.pb.gz")
+	pub := cl.publish(o)
+	node := cl.nodeID(o, "b")
+	if code := postReport(t, p.pageURL(), map[string]string{"kind": "ask", "publication": pub, "node": node}); code != 204 {
+		t.Fatalf("an ask: %d", code)
+	}
+	if state := cl.tool("page_state", map[string]any{}); !strings.Contains(state, `"b"`) {
+		t.Errorf("page_state does not hold the ask of b: %s", state)
+	}
+}
+
+// TestShutdownStopsTheListener: the hub serves the page and a stream;
+// SIGTERM ends the stream, the hub exits 0, and the port accepts no
+// connection afterwards.
+func TestShutdownStopsTheListener(t *testing.T) {
+	p := startHub(t, hubOptions{})
+	c := p.client("listener")
+	c.publish(c.open("cpu.pb.gz"))
+	page := p.pageURL()
+	if code, body := httpGet(t, page); code != 200 || !bytes.HasPrefix(body, []byte("<!doctype html>")) {
+		t.Fatalf("the shell: %d %.80q", code, body)
+	}
+	res, err := pageHTTP.Get(page + "events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = res.Body.Close() }()
+	br := bufio.NewReader(res.Body)
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("stream: %v", err)
+		}
+		if line == "event: state\n" {
+			break
+		}
+	}
+	ended := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, br)
+		ended <- err
+	}()
+	took := p.stop(syscall.SIGTERM, 2*time.Second)
+	// The stream ends before the HTTP server waits for it.
+	if took > 800*time.Millisecond {
+		t.Errorf("SIGTERM with a stream open took %v", took)
+	}
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Error("the stream goes on after the hub exited")
+	}
+	if conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", p.port), time.Second); err == nil {
+		_ = conn.Close()
+		t.Error("the port still accepts connections after the hub exited")
+	}
+}

@@ -20,6 +20,7 @@ import (
 
 	"github.com/dpsoft/perf-agent/internal/capture"
 	"github.com/dpsoft/perf-agent/internal/capture/capturetest"
+	"github.com/dpsoft/perf-agent/internal/mcpflags/binarytest"
 	"github.com/dpsoft/perf-agent/internal/perfmcp"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
 )
@@ -598,24 +599,7 @@ func TestRunRegistersTheProfileAndCaptureTools(t *testing.T) {
 
 // TestTheServerLinksNoProfiler keeps the profiler out of the binary.
 func TestTheServerLinksNoProfiler(t *testing.T) {
-	out, err := exec.Command("go", "list", "-buildvcs=false", "-deps", "-f", "{{.ImportPath}} {{.Standard}}", ".").Output()
-	if err != nil {
-		t.Fatalf("go list: %v", err)
-	}
-	forbidden := []string{"github.com/dpsoft/perf-agent/perfagent", "github.com/cilium/ebpf", "github.com/libbpf/blazesym/go"}
-	allowed := []string{"github.com/dpsoft/perf-agent", "github.com/google/pprof"}
-	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
-		path, std, _ := strings.Cut(line, " ")
-		if slices.Contains(forbidden, path) {
-			t.Errorf("the server links %s", path)
-		}
-		if std == "true" {
-			continue
-		}
-		if !slices.ContainsFunc(allowed, func(m string) bool { return path == m || strings.HasPrefix(path, m+"/") }) {
-			t.Errorf("the server links %s, outside %v", path, allowed)
-		}
-	}
+	binarytest.LinksNoProfiler(t, ".")
 }
 
 // networkingPackages are the packages that open or accept connections.
@@ -662,16 +646,7 @@ func TestPerfmcpImportsNoNetworking(t *testing.T) {
 }
 
 func TestTheServerIsNotShipped(t *testing.T) {
-	for _, f := range []string{"Makefile", "Dockerfile.agent", "Dockerfile.shim", ".github/workflows/release.yml", "scripts/third-party-notices.sh"} {
-		b, err := os.ReadFile(filepath.Join("..", "..", f))
-		if err != nil {
-			t.Errorf("%s: %v", f, err)
-			continue
-		}
-		if bytes.Contains(b, []byte("perf-agent-mcp")) {
-			t.Errorf("%s mentions perf-agent-mcp: the server is source-only", f)
-		}
-	}
+	binarytest.NotShipped(t, "perf-agent-mcp")
 }
 
 func TestRunValidatesResolvedLimits(t *testing.T) {

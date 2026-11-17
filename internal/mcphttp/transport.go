@@ -224,9 +224,6 @@ func (t *Transport) Close() {
 	t.flush()
 }
 
-// Options are t's options, with the defaults New filled in.
-func (t *Transport) Options() Options { return t.o }
-
 // Stats is what t holds now.
 func (t *Transport) Stats() Stats {
 	t.mu.Lock()

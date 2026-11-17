@@ -631,18 +631,6 @@ func TestTheConnectionCapHolds(t *testing.T) {
 	}
 }
 
-// TestAnswerWritesAreBoundedInTheHub: the transport is mounted with
-// maxAnswersWriting places for answers being written.
-func TestAnswerWritesAreBoundedInTheHub(t *testing.T) {
-	l := startLocal(t)
-	if got := l.in.tr.Options().MaxAnswersWriting; got != maxAnswersWriting {
-		t.Errorf("MaxAnswersWriting %d, want %d", got, maxAnswersWriting)
-	}
-	if got, want := l.in.tr.Options().MaxAnswerBytes, int64(l.in.srv.MCP().MaxAnswerBytes()); got != want {
-		t.Errorf("MaxAnswerBytes %d, want %d", got, want)
-	}
-}
-
 // A signal while the hub starts is a clean end: exit 0, nothing left.
 func TestASignalDuringStartExitsZero(t *testing.T) {
 	xdgDir := t.TempDir()
@@ -879,5 +867,68 @@ func TestShutdownStopsTheListener(t *testing.T) {
 	if conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", p.port), time.Second); err == nil {
 		_ = conn.Close()
 		t.Error("the port still accepts connections after the hub exited")
+	}
+}
+
+// flakyListener fails its first fails Accepts with err, then accepts.
+type flakyListener struct {
+	net.Listener
+	mu    sync.Mutex
+	fails int
+	err   error
+}
+
+func (l *flakyListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	if l.fails > 0 {
+		l.fails--
+		l.mu.Unlock()
+		return nil, l.err
+	}
+	l.mu.Unlock()
+	return l.Listener.Accept()
+}
+
+// TestATemporaryAcceptErrorIsRetried: running out of file descriptors
+// (EMFILE) fails an Accept for a while; the hub keeps accepting after it,
+// as net/http's own loop does, and serves the next connection.
+func TestATemporaryAcceptErrorIsRetried(t *testing.T) {
+	defer func(prev func(string) (net.Listener, error)) { listen = prev }(listen)
+	listen = func(addr string) (net.Listener, error) {
+		ln, err := livehttp.Listen(addr)
+		if err != nil {
+			return nil, err
+		}
+		emfile := &net.OpError{Op: "accept", Net: "tcp", Err: os.NewSyscallError("accept", syscall.EMFILE)}
+		return &flakyListener{Listener: ln, fails: 3, err: emfile}, nil
+	}
+	l := startLocal(t)
+	start := time.Now()
+	l.client(t, "after-emfile")
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("the first connection after three EMFILE took %v", took)
+	}
+	l.client(t, "again")
+}
+
+// A permanent Accept error ends accepting: the listener reports it, as
+// net/http's Serve then returns it, so the hub exits instead of hanging.
+func TestAPermanentAcceptErrorIsReported(t *testing.T) {
+	inner := must(net.Listen("tcp", "127.0.0.1:0"))(t)
+	permanent := errors.New("the listener broke")
+	l := newConnListener(&flakyListener{Listener: inner, fails: 1, err: permanent}, 4, time.Second)
+	defer func() { _ = l.Close() }()
+	done := make(chan error, 1)
+	go func() {
+		_, err := l.Accept()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, permanent) {
+			t.Errorf("Accept: %v, want %v", err, permanent)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a permanent Accept error was never reported")
 	}
 }

@@ -128,8 +128,8 @@ func checkRuntimeDir(path string, fi fs.FileInfo) error {
 
 // take takes hub.lock's exclusive flock without waiting. When another
 // server holds it, the error names its pid and port from hub.json. Once
-// taken, it removes the files a dead server left,
-// so nothing reads them while this server starts.
+// taken, it removes the files a dead server left, so nothing reads them
+// while this server starts.
 func (d *runtimeDir) take() error {
 	f, err := d.root.OpenFile(lockFile, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {

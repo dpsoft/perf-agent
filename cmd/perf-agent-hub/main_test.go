@@ -37,6 +37,9 @@ const (
 	// fakeVerifyEnv accepts any --perf-agent, such as the fake perf-agent,
 	// which cannot be setcap'd.
 	fakeVerifyEnv = "PERF_AGENT_HUB_TEST_FAKE_VERIFY"
+	// nofileEnv sets the hub's RLIMIT_NOFILE, soft and hard, to that many
+	// descriptors, so a test can run it out of them.
+	nofileEnv = "PERF_AGENT_HUB_TEST_NOFILE"
 )
 
 // TestMain lets this test binary serve as a capture's reaper and launcher,
@@ -47,6 +50,16 @@ func TestMain(m *testing.M) {
 		os.Exit(code)
 	}
 	if os.Getenv(testMainEnv) == "1" {
+		if v := os.Getenv(nofileEnv); v != "" {
+			n, err := strconv.ParseUint(v, 10, 64)
+			if err == nil {
+				err = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &syscall.Rlimit{Cur: n, Max: n})
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%s=%q: %v\n", nofileEnv, v, err)
+				os.Exit(2)
+			}
+		}
 		configHook = envConfigHook()
 		main()
 		return

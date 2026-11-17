@@ -331,3 +331,26 @@ func TestShutdownDoesNotWaitForLongCalls(t *testing.T) {
 		}
 	}
 }
+
+// TestRunningOutOfDescriptorsIsNotTheEnd: a hub with 48 descriptors meets
+// 80 connections at once, so its Accept fails with EMFILE; once they
+// close, it takes connections again and a client initializes.
+func TestRunningOutOfDescriptorsIsNotTheEnd(t *testing.T) {
+	p := startHub(t, hubOptions{env: []string{nofileEnv + "=48"}})
+	conns := make([]net.Conn, 0, 80)
+	for range 80 {
+		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", p.port), 2*time.Second)
+		if err != nil {
+			break
+		}
+		conns = append(conns, c)
+	}
+	time.Sleep(300 * time.Millisecond)
+	for _, c := range conns {
+		_ = c.Close()
+	}
+	start := time.Now()
+	p.client("after-emfile")
+	t.Logf("initialize %v after %d connections closed", time.Since(start).Round(time.Millisecond), len(conns))
+	p.stop(syscall.SIGTERM, 3*time.Second)
+}

@@ -294,9 +294,27 @@ func newConnListener(ln net.Listener, n int, wait time.Duration) *connListener {
 	return l
 }
 
+// The waits after a temporary Accept error, as net/http's own loop
+// waits: from acceptRetryMin, doubling up to acceptRetryMax, and from the
+// start again after a success.
+const (
+	acceptRetryMin = 5 * time.Millisecond
+	acceptRetryMax = time.Second
+)
+
 // acceptLoop takes a slot, then a connection from the backlog, and waits
-// for that connection's first byte on its own goroutine.
+// for that connection's first byte on its own goroutine. A temporary
+// Accept error, such as running out of file descriptors (EMFILE, ENFILE),
+// is waited out and Accept called again: the server never learns of it,
+// so it would otherwise stop taking connections while it looks alive. A
+// permanent error, a closed listener included, ends the loop and is what
+// the server's Accept returns.
+//
+// The Go runtime raises the soft RLIMIT_NOFILE to the hard limit when the
+// process starts, so maxConns fits a typical limit; past it, the retries
+// above keep the hub serving once descriptors are free again.
 func (l *connListener) acceptLoop() {
+	var wait time.Duration
 	for {
 		select {
 		case l.slots <- struct{}{}:
@@ -306,18 +324,38 @@ func (l *connListener) acceptLoop() {
 		c, err := l.ln.Accept()
 		if err != nil {
 			<-l.slots
+			if temporary(err) && !errors.Is(err, net.ErrClosed) {
+				wait = min(max(2*wait, acceptRetryMin), acceptRetryMax)
+				select {
+				case <-time.After(wait):
+					continue
+				case <-l.done:
+					return
+				}
+			}
 			select {
 			case l.errc <- err:
 			case <-l.done:
 			}
 			return
 		}
+		wait = 0
 		sc := &slotConn{Conn: c, release: sync.OnceFunc(func() { <-l.slots })}
 		l.mu.Lock()
 		l.pending[sc] = struct{}{}
 		l.mu.Unlock()
 		go l.awaitFirstByte(sc)
 	}
+}
+
+// temporary reports an error that says it may pass, as net/http's Serve
+// judges an Accept error.
+func temporary(err error) bool {
+	t, ok := errors.AsType[interface {
+		error
+		Temporary() bool
+	}](err)
+	return ok && t.Temporary()
 }
 
 func (l *connListener) awaitFirstByte(c *slotConn) {

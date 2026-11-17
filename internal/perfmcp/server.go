@@ -426,6 +426,11 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	return s.mcp.Serve(ctx, r, w)
 }
 
+// MCP is the MCP server the tools are registered on, for a transport
+// that answers through its per-message API (Parse and Handle) instead of
+// Serve.
+func (s *Server) MCP() *mcpstdio.Server { return s.mcp }
+
 // Close cancels the capture jobs and kills their captures, waits up to
 // Capture.StopGrace + 1 s for the jobs to roll back and up to
 // maintenanceJoin for the maintenance goroutine to end (neither when a

@@ -89,3 +89,42 @@ func TestALongIDIsRefused(t *testing.T) {
 		t.Fatalf("a 1024-byte id: id %.20s…, error %+v", r.ID, r.Error)
 	}
 }
+
+// MaxAnswerBytes is stdio's own threshold: an answer Handle returns is
+// sent as it is over stdio exactly when it is at most MaxAnswerBytes.
+func TestMaxAnswerBytesIsTheStdioThreshold(t *testing.T) {
+	o := withTools(controlTool())
+	o.MaxToolErrorBytes = 64 << 10
+	s := New(o)
+	n, limit := s.MaxResultBytes(), s.MaxAnswerBytes()
+	if want := s.o.MaxOutBytes/2 - 1; limit != want {
+		t.Fatalf("MaxAnswerBytes = %d, want %d", limit, want)
+	}
+	for _, tc := range []struct {
+		name, text string
+		fits       bool
+	}{
+		{"quotes", strings.Repeat(`"`, n), true},
+		{"control", strings.Repeat("\x01", n), false},
+	} {
+		o.Tools = append(o.Tools, Tool{Name: tc.name, Handler: func(context.Context, json.RawMessage) (Result, error) {
+			return Result{Text: tc.text}, nil
+		}})
+	}
+	s = New(o)
+	ss := NewSession()
+	hello, _ := s.Parse([]byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}`))
+	s.Handle(t.Context(), ss, hello)
+	for i, name := range []string{"quotes", "control"} {
+		req, bad := s.Parse([]byte(callLine(2+i, name, "{}")))
+		if bad != nil {
+			t.Fatalf("%s: %s", name, bad)
+		}
+		out := s.Handle(t.Context(), ss, req)
+		// stdio's rule: the line with its newline fits in half of MaxOutBytes.
+		stdioSends := 2*(len(out)+1) <= s.o.MaxOutBytes
+		if fits := len(out) <= limit; fits != stdioSends || fits != (name == "quotes") {
+			t.Errorf("%s: a %d-byte answer fits MaxAnswerBytes %d: %v; stdio sends it: %v", name, len(out), limit, fits, stdioSends)
+		}
+	}
+}

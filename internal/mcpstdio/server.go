@@ -411,6 +411,14 @@ func (s *Server) MaxResultBytes() int {
 	return max((s.o.MaxOutBytes/2-resultEnvelopeBytes)/2, 0)
 }
 
+// MaxAnswerBytes is the longest answer, as Handle returns it (compact
+// JSON without the newline), that stdio sends as it is: its line, newline
+// included, is at most half of MaxOutBytes. A longer one stdio replaces by
+// a small answer for the same id ("result too large for the output
+// bound"), so a transport that replaces answers longer than this answers
+// as stdio does.
+func (s *Server) MaxAnswerBytes() int { return s.o.MaxOutBytes/2 - 1 }
+
 // runHandler calls the tool and turns a panic into a flag so one bad handler
 // cannot take the server down.
 func (s *Server) runHandler(ctx context.Context, t Tool, args json.RawMessage) (res Result, err error, panicked bool) {

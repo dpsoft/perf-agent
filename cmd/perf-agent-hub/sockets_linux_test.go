@@ -98,11 +98,17 @@ func socketInodes(t *testing.T, pid int) []string {
 
 // TestEverySocketIsLoopback runs perf-agent-hub as go build makes it,
 // drives it as agents and a browser do, and checks every socket the
-// process holds: each is TCP on 127.0.0.1, listening or connected to a
-// loopback peer. An agent speaks MCP over HTTP (initialize, open,
-// page_explain, page_state, DELETE), and the page is read (the shell, a
-// model, the state), streamed and reported to. After SIGTERM the port is
-// closed.
+// process holds: each is TCP on 127.0.0.1, either the listener or a
+// connection it accepted, on the listener's port, from a loopback peer;
+// an outgoing connection, even to 127.0.0.1, is a finding. An agent
+// speaks MCP over HTTP (initialize, open, page_explain, page_state,
+// DELETE), and the page is read (the shell, a model, the state), streamed
+// and reported to. After SIGTERM the port is closed.
+//
+// It reads one snapshot of one process: a socket opened and closed
+// between reads, and the processes a capture starts, are not seen. The
+// source scan (TestNoClientNetworkingInTheServer) and the symbol check
+// (TestTheHubBinaryOpensNoConnection) are the guards for those.
 func TestEverySocketIsLoopback(t *testing.T) {
 	p := startHub(t, hubOptions{built: true})
 	c := p.client("claude")
@@ -145,7 +151,9 @@ func TestEverySocketIsLoopback(t *testing.T) {
 			return !ok && !slices.Contains(held, i)
 		})
 	}
-	loopback := netip.MustParseAddr(host)
+	// The literal, not the hub's own constant: a changed constant is
+	// what this test must catch.
+	loopback := netip.MustParseAddr("127.0.0.1")
 	var listening, connected int
 	for _, inode := range inodes {
 		s, ok := sockets[inode]
@@ -157,8 +165,12 @@ func TestEverySocketIsLoopback(t *testing.T) {
 			t.Errorf("socket %s is UDP (%s, local %v)", inode, s.table, s.local)
 		case s.local.Addr() != loopback:
 			t.Errorf("socket %s is bound to %v, not %v", inode, s.local, loopback)
-		case s.listening:
+		case s.listening && s.local.Port() == uint16(p.port):
 			listening++
+		case s.listening:
+			t.Errorf("socket %s listens on %v, not the hub's port %d", inode, s.local, p.port)
+		case s.local.Port() != uint16(p.port):
+			t.Errorf("socket %s (local %v) is connected to %v but was not accepted on the hub's port %d: an outgoing connection", inode, s.local, s.remote, p.port)
 		case !s.remote.Addr().IsLoopback():
 			t.Errorf("socket %s (local %v) is connected to %v, not loopback", inode, s.local, s.remote)
 		default:
@@ -172,7 +184,7 @@ func TestEverySocketIsLoopback(t *testing.T) {
 	}
 
 	p.stop(syscall.SIGTERM, 5*time.Second)
-	addr := net.JoinHostPort(host, strconv.Itoa(p.port))
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(p.port))
 	if conn, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
 		_ = conn.Close()
 		t.Errorf("%s still accepts connections after the hub exited", addr)

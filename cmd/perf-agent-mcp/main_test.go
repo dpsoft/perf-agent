@@ -615,20 +615,25 @@ var pageServers = []string{
 }
 
 // linksNetworking fails t for every networking package and page server
-// that pkg links, through any import, on this platform.
+// that pkg links, through any import, on any of binarytest.Targets: a
+// file for one target only may import what the host's build leaves out.
 func linksNetworking(t *testing.T, pkg string) {
 	t.Helper()
-	out, err := exec.Command("go", "list", "-buildvcs=false", "-deps", "-f", "{{.ImportPath}}", pkg).Output()
-	if err != nil {
-		t.Fatalf("go list %s: %v", pkg, err)
-	}
-	deps := strings.Fields(string(out))
-	if !slices.Contains(deps, "net/url") || !slices.Contains(deps, "github.com/dpsoft/perf-agent/internal/mcpstdio") {
-		t.Fatalf("go list %s lists %d packages without net/url or mcpstdio: not the server's dependencies", pkg, len(deps))
-	}
-	for _, d := range deps {
-		if slices.Contains(networkingPackages, d) || strings.HasPrefix(d, "net/http/") || slices.Contains(pageServers, d) {
-			t.Errorf("%s links %s", pkg, d)
+	for _, target := range binarytest.Targets {
+		cmd := exec.Command("go", "list", "-buildvcs=false", "-deps", "-f", "{{.ImportPath}}", pkg)
+		cmd.Env = append(os.Environ(), binarytest.TargetEnv(target)...)
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("go list %s for %s: %v", pkg, target, err)
+		}
+		deps := strings.Fields(string(out))
+		if !slices.Contains(deps, "net/url") || !slices.Contains(deps, "github.com/dpsoft/perf-agent/internal/mcpstdio") {
+			t.Fatalf("go list %s for %s lists %d packages without net/url or mcpstdio: not the server's dependencies", pkg, target, len(deps))
+		}
+		for _, d := range deps {
+			if slices.Contains(networkingPackages, d) || strings.HasPrefix(d, "net/http/") || slices.Contains(pageServers, d) {
+				t.Errorf("%s links %s on %s", pkg, d, target)
+			}
 		}
 	}
 }

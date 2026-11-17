@@ -13,6 +13,19 @@ import (
 	"testing"
 )
 
+// Targets are the GOOS/GOARCH pairs the binaries are checked for: what
+// a package links can differ by target, through a file for one target
+// only.
+var Targets = []string{"linux/amd64", "linux/arm64", "darwin/arm64"}
+
+// TargetEnv is the environment that makes go list list target's
+// packages: its GOOS and GOARCH, with cgo enabled, so files that need
+// cgo are listed too.
+func TargetEnv(target string) []string {
+	goos, goarch, _ := strings.Cut(target, "/")
+	return []string{"GOOS=" + goos, "GOARCH=" + goarch, "CGO_ENABLED=1"}
+}
+
 // forbidden are the packages of the profiler itself, which no MCP binary
 // links.
 var forbidden = []string{"github.com/dpsoft/perf-agent/perfagent", "github.com/cilium/ebpf", "github.com/libbpf/blazesym/go"}
@@ -22,14 +35,22 @@ var forbidden = []string{"github.com/dpsoft/perf-agent/perfagent", "github.com/c
 var allowed = []string{"github.com/dpsoft/perf-agent", "github.com/google/pprof"}
 
 // LinksNoProfiler fails t when the main package in dir links the profiler,
-// or any module outside allowed.
+// or any module outside allowed, for any of Targets.
 func LinksNoProfiler(t testing.TB, dir string) {
+	t.Helper()
+	for _, target := range Targets {
+		linksNoProfiler(t, dir, target)
+	}
+}
+
+func linksNoProfiler(t testing.TB, dir, target string) {
 	t.Helper()
 	cmd := exec.Command("go", "list", "-buildvcs=false", "-deps", "-f", "{{.ImportPath}} {{.Standard}}", ".")
 	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), TargetEnv(target)...)
 	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("go list in %s: %v", dir, err)
+		t.Fatalf("go list in %s for %s: %v", dir, target, err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	if !slices.ContainsFunc(lines, func(l string) bool { return strings.HasPrefix(l, "github.com/dpsoft/perf-agent/internal/perfmcp ") }) {
@@ -38,13 +59,13 @@ func LinksNoProfiler(t testing.TB, dir string) {
 	for _, line := range lines {
 		path, std, _ := strings.Cut(line, " ")
 		if slices.Contains(forbidden, path) {
-			t.Errorf("the server links %s", path)
+			t.Errorf("the server links %s on %s", path, target)
 		}
 		if std == "true" {
 			continue
 		}
 		if !slices.ContainsFunc(allowed, func(m string) bool { return path == m || strings.HasPrefix(path, m+"/") }) {
-			t.Errorf("the server links %s, outside %v", path, allowed)
+			t.Errorf("the server links %s on %s, outside %v", path, target, allowed)
 		}
 	}
 }

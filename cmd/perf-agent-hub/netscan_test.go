@@ -40,6 +40,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/dpsoft/perf-agent/internal/mcpflags/binarytest"
 )
 
 // rawCalls are the syscall and x/sys/unix names that open or use a socket,
@@ -51,6 +53,8 @@ var rawCalls = []string{
 	"Syscall", "Syscall6", "RawSyscall", "RawSyscall6",
 	"AllThreadsSyscall", "AllThreadsSyscall6", "SyscallNoError", "RawSyscallNoError",
 	"ForkExec", "StartProcess", "Exec",
+	// A netlink socket, which reads the host's routes and addresses.
+	"NetlinkRIB",
 	"Mount", "Unshare", "Chroot", "PivotRoot",
 	"Setuid", "Setgid", "Setresuid", "Setresgid", "Setreuid", "Setregid", "Setgroups", "Setfsuid", "Setfsgid",
 }
@@ -75,6 +79,8 @@ var clientNames = map[string][]string{
 		// They resolve a hostname through DefaultResolver.
 		"ResolveTCPAddr", "ResolveUDPAddr", "ResolveIPAddr",
 		"ListenPacket", "ListenUDP", "ListenIP", "ListenUnixgram", "ListenMulticastUDP", "FileConn", "FilePacketConn",
+		// They list the host's interfaces and addresses, through netlink.
+		"Interfaces", "InterfaceAddrs", "InterfaceByName", "InterfaceByIndex",
 	},
 	"net/http": {
 		"Get", "Post", "PostForm", "Head", "Client", "DefaultClient", "DefaultTransport", "Transport", "RoundTripper",
@@ -131,8 +137,11 @@ type allowedFiles struct {
 	// reads; an import of another one is a finding. nil checks none.
 	covered map[string]bool
 	// listenCallers are the files allowed one reference each to
-	// livehttp.Listen, a call or a func value; any other is a finding.
+	// livehttp.Listen, and listenFn the function there that may call it:
+	// directly, or through the package-level var whose value the one
+	// reference is, once. Any other reference to either is a finding.
 	listenCallers []string
+	listenFn      string
 }
 
 // helperRule is a process-start helper declared in file, and the only
@@ -272,8 +281,10 @@ type scanned struct {
 	// helpers are the reviewed helper calls seen, as "fn: helper(arg0, …)".
 	helpers []string
 	// listenCallers are the files seen with their one allowed reference
-	// to livehttp.Listen.
+	// to livehttp.Listen, and listenCalls the allowed calls of it or of
+	// its seam, as "fn: callee".
 	listenCallers []string
+	listenCalls   []string
 }
 
 // typeUnit is one package to type-check: its files for one target, the
@@ -446,9 +457,7 @@ func (s *scanner) check(u typeUnit) {
 			s.launchCalls(f, info, pkg, u.files[i], seen)
 		}
 	}
-	for i, f := range files {
-		s.listenRefs(f, info, s.display(u.files[i]), seen)
-	}
+	s.listenRefs(files, u.files, info, seen)
 	for _, helper := range slices.Sorted(maps.Keys(s.allow.helpers)) {
 		rule := s.allow.helpers[helper]
 		fn, ok := pkg.Scope().Lookup(helper).(*types.Func)
@@ -514,11 +523,13 @@ func (s *scanner) helperCalls(files []*ast.File, paths []string, info *types.Inf
 }
 
 // listenAdvice is the finding for a reference to livehttp.Listen
-// outside allow.listenCallers, or past the first in one of them.
+// outside allow.listenCallers, past the first in one of them, or in
+// another form than the two allowed.
 func (s *scanner) listenAdvice() string {
 	only := "no file may"
 	if len(s.allow.listenCallers) > 0 {
-		only = "only " + strings.Join(s.allow.listenCallers, " and ") + " may, once"
+		only = "only " + strings.Join(s.allow.listenCallers, " and ") + " may, once: a call in " + s.allow.listenFn +
+			", or a package-level var's value called once in " + s.allow.listenFn
 	}
 	return "references " + strings.TrimPrefix(listenerPkg, "github.com/dpsoft/perf-agent/") + ".Listen: " + only
 }
@@ -529,37 +540,123 @@ func isListener(obj types.Object) bool {
 	return ok && fn.Pkg() != nil && fn.Pkg().Path() == listenerPkg && fn.Name() == "Listen"
 }
 
-// listenRefs allows, in a file of allow.listenCallers, the first reference
-// to livehttp.Listen, a call or a func value, and reports every other one
-// in f: the selector's name resolved by go/types, so a renamed import and
-// an unqualified use inside livehttp are seen too.
-func (s *scanner) listenRefs(f *ast.File, info *types.Info, name string, seen map[string]bool) {
-	sels := map[*ast.Ident]*ast.SelectorExpr{}
-	ast.Inspect(f, func(n ast.Node) bool {
-		if sel, ok := n.(*ast.SelectorExpr); ok {
-			sels[sel.Sel] = sel
+// listenRef is one reference to livehttp.Listen or its seam: the
+// expression naming it, its file, the function it is in ("" at package
+// level), the call it is the callee of, and the package-level var whose
+// whole value it is.
+type listenRef struct {
+	id   *ast.Ident
+	expr ast.Expr
+	file string
+	fn   string
+	call *ast.CallExpr
+	seam *types.Var
+}
+
+// listenRefs holds the references to livehttp.Listen in one type-checked
+// package, the selector's name resolved by go/types, so a renamed import
+// and an unqualified use inside livehttp are seen too. In a file of
+// allow.listenCallers the first one is allowed when it is a call in
+// allow.listenFn, or the value of a package-level var, the seam tests
+// replace; then the first call of that var in allow.listenFn of the same
+// file is allowed too. Every other reference to either, a call, a func
+// value or an assignment, is a finding.
+func (s *scanner) listenRefs(files []*ast.File, paths []string, info *types.Info, seen map[string]bool) {
+	// refs are the references to obj in files, in source order.
+	refs := func(obj func(types.Object) bool) []listenRef {
+		var out []listenRef
+		for i, f := range files {
+			name := s.display(paths[i])
+			callee := map[ast.Expr]*ast.CallExpr{}
+			sels := map[*ast.Ident]*ast.SelectorExpr{}
+			ast.Inspect(f, func(n ast.Node) bool {
+				switch n := n.(type) {
+				case *ast.CallExpr:
+					callee[ast.Unparen(n.Fun)] = n
+				case *ast.SelectorExpr:
+					sels[n.Sel] = n
+				}
+				return true
+			})
+			for _, d := range f.Decls {
+				fn := ""
+				if fd, ok := d.(*ast.FuncDecl); ok {
+					fn = fd.Name.Name
+				}
+				// whole are the package-level vars whose one value is
+				// exactly a name, by that name.
+				whole := map[ast.Expr]*types.Var{}
+				if gd, ok := d.(*ast.GenDecl); ok && gd.Tok == token.VAR {
+					for _, spec := range gd.Specs {
+						vs := spec.(*ast.ValueSpec)
+						if len(vs.Names) == 1 && len(vs.Values) == 1 {
+							if v, ok := info.Defs[vs.Names[0]].(*types.Var); ok {
+								whole[ast.Unparen(vs.Values[0])] = v
+							}
+						}
+					}
+				}
+				ast.Inspect(d, func(n ast.Node) bool {
+					id, ok := n.(*ast.Ident)
+					if !ok || !obj(info.Uses[id]) {
+						return true
+					}
+					var e ast.Expr = id
+					if sel := sels[id]; sel != nil {
+						e = sel
+					}
+					out = append(out, listenRef{id: id, expr: e, file: name, fn: fn, call: callee[e], seam: whole[e]})
+					return true
+				})
+			}
 		}
-		return true
-	})
-	ast.Inspect(f, func(n ast.Node) bool {
-		id, ok := n.(*ast.Ident)
-		if !ok || !isListener(info.Uses[id]) {
-			return true
+		return out
+	}
+	callerFile := func(name string) bool { return slices.Contains(s.allow.listenCallers, name) }
+	record := func(file, call string) {
+		if !slices.Contains(s.out.listenCallers, file) {
+			s.out.listenCallers = append(s.out.listenCallers, file)
 		}
-		key := "livehttp.Listen in " + name
-		if slices.Contains(s.allow.listenCallers, name) && !seen[key] {
+		if call != "" && !slices.Contains(s.out.listenCalls, call) {
+			s.out.listenCalls = append(s.out.listenCalls, call)
+		}
+	}
+	type seamOf struct {
+		v    *types.Var
+		file string
+	}
+	var seams []seamOf
+	for _, r := range refs(isListener) {
+		key := "livehttp.Listen in " + r.file
+		allowedForm := r.seam != nil || r.call != nil && r.fn == s.allow.listenFn
+		if !callerFile(r.file) || seen[key] || !allowedForm {
+			s.report(r.id, "%s", s.listenAdvice())
+			continue
+		}
+		seen[key] = true
+		if sel, ok := r.expr.(*ast.SelectorExpr); ok {
+			s.allowed[sel] = true
+		}
+		if r.seam != nil {
+			seams = append(seams, seamOf{r.seam, r.file})
+			record(r.file, "")
+			continue
+		}
+		record(r.file, r.fn+": "+types.ExprString(r.expr))
+	}
+	for _, sm := range seams {
+		advice := fmt.Sprintf("references %s, which is %s.Listen: only one call of it in %s (%s) may",
+			sm.v.Name(), strings.TrimPrefix(listenerPkg, "github.com/dpsoft/perf-agent/"), s.allow.listenFn, sm.file)
+		for _, r := range refs(func(o types.Object) bool { return o == sm.v }) {
+			key := "the call of " + sm.v.Name() + " in " + sm.file
+			if r.file != sm.file || r.fn != s.allow.listenFn || r.call == nil || seen[key] {
+				s.report(r.id, "%s", advice)
+				continue
+			}
 			seen[key] = true
-			if sel := sels[id]; sel != nil {
-				s.allowed[sel] = true
-			}
-			if !slices.Contains(s.out.listenCallers, name) {
-				s.out.listenCallers = append(s.out.listenCallers, name)
-			}
-			return true
+			record(r.file, r.fn+": "+types.ExprString(r.expr))
 		}
-		s.report(id, "%s", s.listenAdvice())
-		return true
-	})
+	}
 }
 
 // ownArgument says why arg, a variable or a field of one, is not fd's own
@@ -1073,8 +1170,9 @@ func otherNative(p listedPackage) []string {
 	})
 }
 
-// scanTargets are the GOOS/GOARCH pairs whose packages the scan reads.
-var scanTargets = []string{"linux/amd64", "linux/arm64", "darwin/arm64"}
+// scanTargets are the GOOS/GOARCH pairs whose packages the scan reads,
+// the ones every binary check covers.
+var scanTargets = binarytest.Targets
 
 // targetListing is what listTargets found over scanTargets.
 type targetListing struct {
@@ -1169,11 +1267,13 @@ func scanFiles(t *testing.T, dirs map[string]string) []string {
 // networking at all.
 const scanPattern = ". ../perf-agent-mcp"
 
-// listenerPkg is the package of the one listening call, and listenCaller
-// the one file allowed to reference it, once.
+// listenerPkg is the package of the one listening call, listenCaller the
+// one file allowed to reference it, once, and listenFn the one function
+// there allowed to call it, or the var that holds it, once.
 const (
 	listenerPkg  = "github.com/dpsoft/perf-agent/internal/livehttp"
 	listenCaller = "cmd/perf-agent-hub/hub.go"
+	listenFn     = "start"
 )
 
 // TestNoClientNetworkingInTheServer reads the source of every non-standard
@@ -1235,7 +1335,7 @@ func TestNoClientNetworkingInTheServer(t *testing.T) {
 	}
 	got := scanNetworking(t, files, listed.units, display, allowedFiles{
 		listen: listenFile, exec: execRules, launch: launchFile, noShell: shellFreeDir,
-		helpers: helperRules, covered: listed.covered(), listenCallers: []string{listenCaller},
+		helpers: helperRules, covered: listed.covered(), listenCallers: []string{listenCaller}, listenFn: listenFn,
 	})
 	for _, f := range got.findings {
 		t.Error(f)
@@ -1249,6 +1349,11 @@ func TestNoClientNetworkingInTheServer(t *testing.T) {
 	}
 	if !slices.Equal(got.listenCallers, []string{listenCaller}) {
 		t.Errorf("livehttp.Listen is referenced, as allowed, in %v, want exactly once in %s", got.listenCallers, listenCaller)
+	}
+	// hub.go holds livehttp.Listen in the var listen, the seam tests
+	// replace, and calls that once, in start.
+	if want := []string{listenFn + ": listen"}; !slices.Equal(got.listenCalls, want) {
+		t.Errorf("calls of livehttp.Listen or its seam = %v, want exactly %v", got.listenCalls, want)
 	}
 	for _, file := range slices.Sorted(maps.Keys(execRules)) {
 		if !got.exec[file] {
@@ -1797,12 +1902,16 @@ func TestTheScanListsEveryTarget(t *testing.T) {
 	})
 }
 
-// livehttp.Listen is referenced once, in the hub's hub.go, whether called
-// or taken as a func value: a reference anywhere else, a second one in
-// hub.go, and any in a file no unit type-checks are findings.
+// livehttp.Listen is referenced once, in the hub's hub.go: called in
+// start, or as the value of a package-level var, the seam tests replace,
+// which is in turn called once in start. A reference anywhere else, a
+// second one in hub.go, a call of the seam outside start or a second one
+// in it, the seam used as a value or assigned, and a reference in a file
+// no unit type-checks are findings.
 func TestTheNetworkScanPinsTheListenCaller(t *testing.T) {
-	allow := allowedFiles{listen: "listen.go", exec: gitOnly, listenCallers: []string{"cmd/perf-agent-hub/hub.go"}}
-	only := "references internal/livehttp.Listen: only cmd/perf-agent-hub/hub.go may, once"
+	allow := allowedFiles{listen: "listen.go", exec: gitOnly, listenCallers: []string{"cmd/perf-agent-hub/hub.go"}, listenFn: "start"}
+	only := "references internal/livehttp.Listen: only cmd/perf-agent-hub/hub.go may, once: a call in start, or a package-level var's value called once in start"
+	seam := "references listen, which is internal/livehttp.Listen: only one call of it in start (cmd/perf-agent-hub/hub.go) may"
 	scan := func(t *testing.T, files map[string]string, typed bool) scanned {
 		t.Helper()
 		dir := t.TempDir()
@@ -1820,33 +1929,102 @@ func TestTheNetworkScanPinsTheListenCaller(t *testing.T) {
 		display := func(f string) string { rel, _ := filepath.Rel(dir, f); return filepath.ToSlash(rel) }
 		return scanNetworking(t, paths, units, display, allow)
 	}
-	hubOnce := "package main\nimport \"github.com/dpsoft/perf-agent/internal/livehttp\"\nvar listen = livehttp.Listen\n"
+	const head = "package main\nimport \"github.com/dpsoft/perf-agent/internal/livehttp\"\n" // lines 1-2
+	const seamVar = "var listen = livehttp.Listen\n"                                          // line 3
+	const startOnce = "func start() { _, _ = listen(\"127.0.0.1:0\") }\n"                       // line 4
+	hub := func(files map[string]string) map[string]string { return files }
 
-	t.Run("once in hub.go", func(t *testing.T) {
-		got := scan(t, map[string]string{"cmd/perf-agent-hub/hub.go": hubOnce}, true)
-		checkFindings(t, got.findings, nil)
-		if want := []string{"cmd/perf-agent-hub/hub.go"}; !slices.Equal(got.listenCallers, want) {
-			t.Errorf("listen callers = %v, want %v", got.listenCallers, want)
-		}
+	for _, c := range []struct {
+		name     string
+		files    map[string]string
+		typed    bool
+		findings []string
+		callers  []string
+		calls    []string
+	}{
+		{name: "a seam called once in start",
+			files: hub(map[string]string{"cmd/perf-agent-hub/hub.go": head + seamVar + startOnce}), typed: true,
+			callers: []string{"cmd/perf-agent-hub/hub.go"}, calls: []string{"start: listen"}},
+		{name: "a direct call in start",
+			files: hub(map[string]string{"cmd/perf-agent-hub/hub.go": head + "func start() { _, _ = livehttp.Listen(\"127.0.0.1:0\") }\n"}), typed: true,
+			callers: []string{"cmd/perf-agent-hub/hub.go"}, calls: []string{"start: livehttp.Listen"}},
+		{name: "a seam never called",
+			files: hub(map[string]string{"cmd/perf-agent-hub/hub.go": head + seamVar}), typed: true,
+			callers: []string{"cmd/perf-agent-hub/hub.go"}},
+		{name: "called in perfpage",
+			files: map[string]string{
+				"cmd/perf-agent-hub/hub.go":  head + seamVar + startOnce,
+				"internal/perfpage/serve.go": "package perfpage\nimport lh \"github.com/dpsoft/perf-agent/internal/livehttp\"\nfunc serve() { _, _ = lh.Listen(\"127.0.0.1:0\") }\n",
+			}, typed: true,
+			findings: []string{"internal/perfpage/serve.go:3: " + only},
+			callers:  []string{"cmd/perf-agent-hub/hub.go"}, calls: []string{"start: listen"}},
+		{name: "twice in hub.go",
+			files:    map[string]string{"cmd/perf-agent-hub/hub.go": head + seamVar + startOnce + "func again() { _, _ = livehttp.Listen(\"127.0.0.1:0\") }\n"},
+			typed:    true,
+			findings: []string{"cmd/perf-agent-hub/hub.go:5: " + only},
+			callers:  []string{"cmd/perf-agent-hub/hub.go"}, calls: []string{"start: listen"}},
+		{name: "a direct call outside start",
+			files:    map[string]string{"cmd/perf-agent-hub/hub.go": head + "func other() { _, _ = livehttp.Listen(\"127.0.0.1:0\") }\n"},
+			typed:    true,
+			findings: []string{"cmd/perf-agent-hub/hub.go:3: " + only}},
+		{name: "a func value outside a package-level var",
+			files:    map[string]string{"cmd/perf-agent-hub/hub.go": head + "func start() { f := livehttp.Listen; _, _ = f(\"127.0.0.1:0\") }\n"},
+			typed:    true,
+			findings: []string{"cmd/perf-agent-hub/hub.go:3: " + only}},
+		{name: "the seam called twice in start",
+			files: map[string]string{"cmd/perf-agent-hub/hub.go": head + seamVar +
+				"func start(x bool) {\n\t_, _ = listen(\"127.0.0.1:0\")\n\tif x {\n\t\t_, _ = listen(\"127.0.0.1:0\")\n\t}\n}\n"},
+			typed:    true,
+			findings: []string{"cmd/perf-agent-hub/hub.go:7: " + seam},
+			callers:  []string{"cmd/perf-agent-hub/hub.go"}, calls: []string{"start: listen"}},
+		{name: "the seam called outside start, in another file",
+			files: map[string]string{
+				"cmd/perf-agent-hub/hub.go":   head + seamVar + startOnce,
+				"cmd/perf-agent-hub/other.go": "package main\nfunc other() { _, _ = listen(\"127.0.0.1:0\") }\n",
+			}, typed: true,
+			findings: []string{"cmd/perf-agent-hub/other.go:2: " + seam},
+			callers:  []string{"cmd/perf-agent-hub/hub.go"}, calls: []string{"start: listen"}},
+		{name: "the seam as a value or assigned",
+			files: map[string]string{"cmd/perf-agent-hub/hub.go": head + seamVar + startOnce +
+				"var again = listen\nfunc use(f func(string) (any, error)) {}\nfunc pass() { use(nil); _ = listen; listen = nil }\n"},
+			typed: true,
+			findings: []string{
+				"cmd/perf-agent-hub/hub.go:5: " + seam,
+				"cmd/perf-agent-hub/hub.go:7: " + seam,
+			},
+			callers: []string{"cmd/perf-agent-hub/hub.go"}, calls: []string{"start: listen"}},
+		{name: "in a file no unit type-checks",
+			files:    map[string]string{"cmd/perf-agent-hub/hub.go": head + seamVar + startOnce},
+			findings: []string{"cmd/perf-agent-hub/hub.go:3: " + only}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := scan(t, c.files, c.typed)
+			checkFindings(t, got.findings, c.findings)
+			if !slices.Equal(got.listenCallers, c.callers) {
+				t.Errorf("listen callers = %v, want %v", got.listenCallers, c.callers)
+			}
+			if !slices.Equal(got.listenCalls, c.calls) {
+				t.Errorf("listen calls = %v, want %v", got.listenCalls, c.calls)
+			}
+		})
+	}
+}
+
+// Listing the host's interfaces and addresses, and a netlink request,
+// read the machine's network through a socket other than the listener:
+// each is a finding, through a renamed import too.
+func TestTheNetworkScanSeesInterfacesAndNetlink(t *testing.T) {
+	files := writeFixtures(t, map[string]string{
+		"a.go": "package x\nimport n \"net\"\n" +
+			"var _, _ = n.Interfaces()\nvar _, _ = n.InterfaceAddrs()\nvar _, _ = n.InterfaceByName(\"lo\")\nvar _, _ = n.InterfaceByIndex(1)\n",
+		"b.go": "package x\nimport sc \"syscall\"\nvar _, _ = sc.NetlinkRIB(0, 0)\n",
 	})
-	t.Run("called in perfpage", func(t *testing.T) {
-		got := scan(t, map[string]string{
-			"cmd/perf-agent-hub/hub.go":  hubOnce,
-			"internal/perfpage/serve.go": "package perfpage\nimport lh \"github.com/dpsoft/perf-agent/internal/livehttp\"\nfunc serve() { _, _ = lh.Listen(\"127.0.0.1:0\") }\n",
-		}, true)
-		checkFindings(t, got.findings, []string{"internal/perfpage/serve.go:3: " + only})
-	})
-	t.Run("twice in hub.go", func(t *testing.T) {
-		got := scan(t, map[string]string{
-			"cmd/perf-agent-hub/hub.go": hubOnce + "func again() { _, _ = livehttp.Listen(\"127.0.0.1:0\") }\n",
-		}, true)
-		checkFindings(t, got.findings, []string{"cmd/perf-agent-hub/hub.go:4: " + only})
-	})
-	t.Run("in a file no unit type-checks", func(t *testing.T) {
-		got := scan(t, map[string]string{"cmd/perf-agent-hub/hub.go": hubOnce}, false)
-		checkFindings(t, got.findings, []string{"cmd/perf-agent-hub/hub.go:3: " + only})
-		if len(got.listenCallers) != 0 {
-			t.Errorf("listen callers = %v, want none", got.listenCallers)
-		}
+	got := scanNetworking(t, files, []typeUnit{fixtureUnit(files...)}, filepath.Base, allowedFiles{listen: "listen.go", exec: gitOnly})
+	checkFindings(t, got.findings, []string{
+		"a.go:3: uses net.Interfaces",
+		"a.go:4: uses net.InterfaceAddrs",
+		"a.go:5: uses net.InterfaceByName",
+		"a.go:6: uses net.InterfaceByIndex",
+		"b.go:3: uses syscall.NetlinkRIB",
 	})
 }

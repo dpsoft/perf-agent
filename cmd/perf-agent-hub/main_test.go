@@ -183,6 +183,7 @@ func hubCommand(t testing.TB, env []string, args ...string) *exec.Cmd {
 	}
 	cmd := exec.Command(exe, args...)
 	cmd.Env = append(append(os.Environ(), testMainEnv+"=1"), env...)
+	killWithTest(cmd)
 	return cmd
 }
 
@@ -299,6 +300,7 @@ func startHub(t testing.TB, o hubOptions) *hubProc {
 		}
 		p.cmd = exec.Command(bin, args...)
 		p.cmd.Env = append(append(os.Environ(), "XDG_RUNTIME_DIR="+o.xdg), o.env...)
+		killWithTest(p.cmd)
 	} else {
 		p.cmd = hubCommand(t, append([]string{"XDG_RUNTIME_DIR=" + o.xdg}, o.env...), args...)
 	}

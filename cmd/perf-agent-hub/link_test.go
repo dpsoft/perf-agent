@@ -1,10 +1,13 @@
 package main
 
 import (
+	"os"
 	"os/exec"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/dpsoft/perf-agent/internal/mcpflags/binarytest"
 )
 
 // The hub is the one binary with a network. The source scan
@@ -66,12 +69,15 @@ var liveSymbols = []string{
 	mcphttpPkg + ".(*Transport).ServeHTTP",
 }
 
-// hubImports are the hub's non-standard packages, each with its imports.
-func hubImports(t *testing.T) map[string][]string {
+// hubImports are the hub's non-standard packages on target, one of
+// binarytest.Targets, each with its imports.
+func hubImports(t *testing.T, target string) map[string][]string {
 	t.Helper()
-	out, err := exec.Command("go", "list", "-buildvcs=false", "-deps", "-f", `{{if not .Standard}}{{.ImportPath}}: {{join .Imports " "}}{{end}}`, ".").Output()
+	cmd := exec.Command("go", "list", "-buildvcs=false", "-deps", "-f", `{{if not .Standard}}{{.ImportPath}}: {{join .Imports " "}}{{end}}`, ".")
+	cmd.Env = append(os.Environ(), binarytest.TargetEnv(target)...)
+	out, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("go list: %v", err)
+		t.Fatalf("go list for %s: %v", target, err)
 	}
 	pkgs := map[string][]string{}
 	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
@@ -79,26 +85,29 @@ func hubImports(t *testing.T) map[string][]string {
 		pkgs[path] = strings.Fields(imports)
 	}
 	if _, ok := pkgs[hubPkg]; !ok {
-		t.Fatalf("go list lists %d packages without %s: not the hub's dependencies", len(pkgs), hubPkg)
+		t.Fatalf("go list for %s lists %d packages without %s: not the hub's dependencies", target, len(pkgs), hubPkg)
 	}
 	return pkgs
 }
 
 // TestTheHubBinaryOpensNoConnection is a layer under the source scan
 // (TestNoClientNetworkingInTheServer) and the socket test
-// (TestEverySocketIsLoopback): only the packages of networkImports import
-// a networking package, each only those it names, and the built binary
+// (TestEverySocketIsLoopback): on every target, only the packages of
+// networkImports import a networking package, each only those it names,
+// and the binary built for this host
 // has none of the client symbols while it links the hub's handlers. It
 // cannot replace either: a call of (*net.Dialer).DialContext, which
 // tls.Dial makes too, is linked by the server side as well, so nm cannot
 // tell it apart. It replaces the stdio server's
 // TestTheServerOpensNoConnection, from before the network moved here.
 func TestTheHubBinaryOpensNoConnection(t *testing.T) {
-	for path, imports := range hubImports(t) {
-		for _, imp := range imports {
-			networking := slices.Contains(networkingPackages, imp) || strings.HasPrefix(imp, "net/http/")
-			if networking && !slices.Contains(networkImports[path], imp) {
-				t.Errorf("%s imports %s; only %v may", path, imp, networkImports)
+	for _, target := range binarytest.Targets {
+		for path, imports := range hubImports(t, target) {
+			for _, imp := range imports {
+				networking := slices.Contains(networkingPackages, imp) || strings.HasPrefix(imp, "net/http/")
+				if networking && !slices.Contains(networkImports[path], imp) {
+					t.Errorf("%s imports %s on %s; only %v may", path, imp, target, networkImports)
+				}
 			}
 		}
 	}
@@ -133,10 +142,12 @@ func TestTheHubBinaryOpensNoConnection(t *testing.T) {
 // the hub links the page's routes, the listener and the MCP transport,
 // so the stdio binary's not linking them is not a test that cannot fail.
 func TestTheHubBinaryLinksThePageAndTransport(t *testing.T) {
-	pkgs := hubImports(t)
-	for _, want := range []string{perfpagePkg, livehttpPkg, mcphttpPkg} {
-		if _, ok := pkgs[want]; !ok {
-			t.Errorf("the hub does not link %s", want)
+	for _, target := range binarytest.Targets {
+		pkgs := hubImports(t, target)
+		for _, want := range []string{perfpagePkg, livehttpPkg, mcphttpPkg} {
+			if _, ok := pkgs[want]; !ok {
+				t.Errorf("the hub does not link %s on %s", want, target)
+			}
 		}
 	}
 }

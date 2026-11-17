@@ -562,43 +562,106 @@
     applyHistory(await transport.getJSON(pubPath(id, 'history')));
   };
 
+  // TOAST_MS is how long a toast shows; ASK_TOAST_MS is longer, for the
+  // answer to an ask, which says what to do next.
+  const TOAST_MS = 2200;
+  const ASK_TOAST_MS = 5000;
   let toastTimer = 0;
-  const toast = (msg) => {
+  const toast = (msg, ms = TOAST_MS) => {
     const t = $('toast');
     t.textContent = msg;
     t.classList.add('on');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => t.classList.remove('on'), 2200);
+    toastTimer = setTimeout(() => t.classList.remove('on'), ms);
   };
 
   // --- Reports to the inbox ---
 
-  // report tells the server what the user did on the shown publication: a
-  // select (node is the selection, "" for none), a focus (node is the
-  // frame the layout now starts at, "" for the whole view) or an ask
-  // about node. focus is always the layout's current start. It resolves
-  // to the answer's status, or 0 when none came. A report changes nothing
-  // on the page: what the server makes of it comes back, if at all, in a
-  // later envelope.
+  // A report tells the server what the user did on the shown publication:
+  // a select (node is the selection, "" for none), a focus (node is the
+  // frame the layout now starts at, "" for the whole view) or an ask about
+  // node. focus is always the layout's current start. A report changes
+  // nothing on the page: what the server makes of it comes back, if at
+  // all, in a later envelope.
+
+  // RETRY_AFTER_MS is the inbox's Retry-After on a 429, which is always
+  // one second; a refused report is tried again once, after it.
+  const RETRY_AFTER_MS = 1000;
+  // REPORT_QUIET_MS is how long selections and focus must settle before
+  // the newest is reported, so a burst of clicks costs one report.
+  const REPORT_QUIET_MS = 150;
+
+  const later = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  // post sends body to the inbox and resolves to the answer's status, or
+  // 0 when none came.
+  const post = (body) => transport.post('inbox', body).catch(() => 0);
+  const postOrRetry = async (body) => {
+    const status = await post(body);
+    if (status !== 429) return status;
+    await later(RETRY_AFTER_MS);
+    return post(body);
+  };
+
+  // Selections and focus are reported one at a time, so they reach the
+  // server in order. While one is in flight, or the clicks have not
+  // settled, only the newest waits (navNext). A report that replaces one
+  // never recorded, or follows one the server did not record, is sent as
+  // a select of the whole user view (publication, selection and focus),
+  // so nothing the server missed is lost. navLost says the last report
+  // was not recorded and nothing waits to carry the whole view.
+  let navNext = null;
+  let navBusy = false;
+  let navTimer = 0;
+  let navLost = false;
+
   const report = (kind, node) => {
-    if (!view || !isPub(view.pub)) return Promise.resolve(0);
-    const body = {kind, publication: view.pub, node, focus: view.focus};
-    return transport.post('inbox', body).catch(() => 0);
+    if (!view || !isPub(view.pub)) return;
+    const whole = {kind: 'select', publication: view.pub, node: view.selected, focus: view.focus};
+    const own = {kind, publication: view.pub, node, focus: view.focus};
+    navNext = {body: navNext || navLost ? whole : own, whole};
+    navLost = false;
+    clearTimeout(navTimer);
+    navTimer = setTimeout(() => {
+      navTimer = 0;
+      sendNext();
+    }, REPORT_QUIET_MS);
+  };
+
+  const sendNext = async () => {
+    if (navBusy || navTimer || !navNext) return;
+    const n = navNext;
+    navNext = null;
+    navBusy = true;
+    let status = await post(n.body);
+    if (status === 429) {
+      await later(RETRY_AFTER_MS);
+      // A newer report stands for this one rather than follow it.
+      if (!navNext) status = await post(n.body);
+    }
+    if (status !== 204) {
+      if (navNext) navNext.body = navNext.whole;
+      else navLost = true;
+    }
+    navBusy = false;
+    sendNext();
   };
 
   const askReplies = {
+    0: 'Could not reach perf-agent; nothing was sent.',
     204: 'Sent. Ask your agent to look (it reads page_state).',
     422: 'That frame is no longer on the page; nothing was sent.',
     429: 'Too many reports; try again in a moment.',
   };
   const NOT_SENT = 'perf-agent did not take the ask; nothing was sent.';
 
-  // askAgent puts the selected frame in the inbox for the user's agent,
-  // and says how that went. It is not navigation, so it is allowed while
-  // an agent's publication switch loads: it asks about what is shown.
+  // askAgent puts the selected frame in the inbox for the user's agent at
+  // once, and says how that went. It is not navigation, so it is allowed
+  // while an agent's publication switch loads: it asks about what is
+  // shown.
   const askAgent = () => {
-    if (!view || !view.selected) return;
-    report('ask', view.selected).then((status) => toast(askReplies[status] || NOT_SENT));
+    if (!view || !view.selected || !isPub(view.pub)) return;
+    const body = {kind: 'ask', publication: view.pub, node: view.selected, focus: view.focus};
+    postOrRetry(body).then((status) => toast(askReplies[status] || NOT_SENT, ASK_TOAST_MS));
   };
 
   // --- The user's own navigation: local until the next agent state ---
@@ -614,7 +677,9 @@
   const localSelect = (id, scroll) => {
     if (!view || !isNode(id) || agentLoading()) return;
     const g = ++gen;
-    quietly(selectIn(id, g, scroll).then((f) => f && report('select', f.id)));
+    quietly(selectIn(id, g, scroll).then((f) => {
+      if (f) report('select', f.id);
+    }));
   };
 
   const focusHere = () => {
@@ -634,6 +699,8 @@
     const id = view.selected;
     view.focus = '';
     drawModel(view.whole);
+    // The focus report keeps the selection on the server, so showing it
+    // again is not reported as a select.
     report('focus', '');
     if (id) quietly(selectIn(id, g, true));
   };

@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -115,7 +116,16 @@ func TestSelectionsCoalesce(t *testing.T) {
 	if u := c.pageState(nil).User; u.Selected != p1Node(t, s, "b") || u.Name != "b" || u.Focus != p1Node(t, s, "a") {
 		t.Errorf("a select under a focus %+v", u)
 	}
-	if got := envelopeNow(t, s).Inbox; got.Rev != "7" || got.Asks != "0" {
+	// The same select again changes nothing, not even its time.
+	at := c.pageState(nil).User.At
+	if err := s.Report(PageReport{Kind: "select", Publication: "p1", Node: p1Node(t, s, "b"), Focus: p1Node(t, s, "a")}); err != nil {
+		t.Fatal(err)
+	}
+	if u := c.pageState(nil).User; u.At != at {
+		t.Errorf("a repeated select moved the time from %s to %s", at, u.At)
+	}
+	// None of it is in the envelope, so none of it was sent to the page.
+	if got := envelopeNow(t, s).Inbox; got.Rev != "0" || got.Asks != "0" {
 		t.Errorf("seven reports, no ask: %+v", got)
 	}
 }
@@ -139,8 +149,28 @@ func TestTheAskRingDropsTheOldest(t *testing.T) {
 			t.Errorf("%v: the rows name %v", args, names)
 		}
 	}
-	if got := c.pageState(map[string]any{"limit": 2}); !slices.Equal(got.ids(), askIDs(s, 3, 4)) {
-		t.Errorf("limit 2: %v", got.ids())
+	if got := c.pageState(map[string]any{"limit": 2}); !slices.Equal(got.ids(), askIDs(s, 3, 4)) || got.Note != "" {
+		t.Errorf("limit 2: %v, note %q", got.ids(), got.Note)
+	}
+	// A cursor the ring moved past: the asks after it that it let go are
+	// said to be lost.
+	for _, tc := range []struct {
+		since int
+		note  string
+	}{
+		{1, "1 ask after since was dropped"},
+		{0, ""},
+		{2, ""},
+		{3, ""},
+	} {
+		args := map[string]any{}
+		if tc.since > 0 {
+			args["since"] = askIDs(s, tc.since)[0]
+		}
+		got := c.pageState(args)
+		if !strings.Contains(got.Note, tc.note) || tc.note == "" && got.Note != "" {
+			t.Errorf("since %d: note %q, want one saying %q", tc.since, got.Note, tc.note)
+		}
 	}
 	for _, limit := range []any{0, -1} {
 		text, isErr := c.call(t.Context(), "page_state", map[string]any{"limit": limit})
@@ -220,7 +250,7 @@ func TestPageStateCursors(t *testing.T) {
 	}
 }
 
-// Review Focus 5: an ask ID carries a per-process nonce, so a cursor kept
+// An ask ID carries a per-process nonce, so a cursor kept
 // across a restart, i40 of the run before, hides none of this run's asks:
 // they all come back, with a note saying why.
 func TestACursorFromAnEarlierServerReturnsEveryRetainedAsk(t *testing.T) {
@@ -249,6 +279,11 @@ func TestACursorFromAnEarlierServerReturnsEveryRetainedAsk(t *testing.T) {
 	// Another run's cursor after the newest of this run's still sees them.
 	if got := c.pageState(map[string]any{"since": "i3-00000000"}); len(got.ids()) != 3 {
 		t.Errorf("another run's i3: %v", got.ids())
+	}
+	// A cursor of this run's nonce past its newest ask was never given by
+	// it: it is taken for another run's, not for "nothing new".
+	if got := c.pageState(map[string]any{"since": "i9-3f9a01c2"}); len(got.ids()) != 3 || got.Note != foreignCursorNote {
+		t.Errorf("a cursor past the newest ask: %v, note %q", got.ids(), got.Note)
 	}
 	for _, since := range []string{"i7", "7", "i0-3f9a01c2", "i07-3f9a01c2", "i7-3F9A01C2", "i7-3f9a01c", "x7-3f9a01c2", "i-3f9a01c2", "i99999999999999999999-3f9a01c2"} {
 		text, isErr := c.call(t.Context(), "page_state", map[string]any{"since": since})
@@ -292,6 +327,43 @@ func TestReadsAreMarkedOnce(t *testing.T) {
 	claude.pageState(map[string]any{"since": later.Asks.Next})
 	if got := envelopeNow(t, s).Inbox; got.Rev != "4" {
 		t.Errorf("an empty read moved rev: %+v", got)
+	}
+}
+
+// Two sessions reading at once never both claim the first read of an
+// ask: each answer names the one reader the inbox records.
+func TestTwoReadersNeverBothClaimARead(t *testing.T) {
+	s, _, _, _ := hubPage(t, nil, nil)
+	stepClock(s, 3*time.Second)
+	codex, claude := newMCPSession(t, s, "codex"), newMCPSession(t, s, "claude-code")
+	for i := range 50 {
+		askEach(t, s, []string{"main", "a", "b", "c"}[i%4])
+		id := askIDs(s, i+1)[0]
+		var wg sync.WaitGroup
+		var got [2]string
+		for j, c := range []*mcpSession{codex, claude} {
+			wg.Go(func() {
+				text, isErr := c.call(context.Background(), "page_state", map[string]any{"since": askIDs(s, max(i, 1))[0]})
+				var out pageStateJSON
+				if isErr || json.Unmarshal([]byte(text), &out) != nil {
+					t.Errorf("page_state: %s", text)
+					return
+				}
+				for _, r := range out.Asks.Rows {
+					if r.ID == id {
+						got[j] = r.ReadBy
+					}
+				}
+			})
+		}
+		wg.Wait()
+		if i == 0 {
+			continue // since i1 lists nothing; i1 was read below
+		}
+		recorded := s.live.inbox.asks[len(s.live.inbox.asks)-1].readBy
+		if got[0] != recorded || got[1] != recorded {
+			t.Fatalf("ask %s: codex was told %q, claude-code %q, the inbox recorded %q", id, got[0], got[1], recorded)
+		}
 	}
 }
 

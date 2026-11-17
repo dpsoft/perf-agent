@@ -1223,8 +1223,8 @@ func TestLivePageOrderingInChrome(t *testing.T) {
 	})
 }
 
-// §D4 and SRV-R3: the page accepts the envelope's two parts each by its
-// own revision. An inbox update with an old seq moves only the count, and
+// §D4: the page accepts the envelope's two parts each by its own
+// revision. An inbox update with an old seq moves only the count, and
 // keeps the generation, so the user's own fetch in flight still lands; an
 // engine state with an old rev leaves the count. The reader's label is
 // the client's own choice and is shown as text.

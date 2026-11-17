@@ -87,9 +87,10 @@ func TestTheEnvelopeHasTwoRevisions(t *testing.T) {
 	}
 }
 
-// A commit moves only engine.seq and leaves the inbox part as it was; a
-// report moves only inbox.rev and leaves the engine part byte for byte.
-// Every change is notified once, in order.
+// A commit moves only engine.seq and leaves the inbox part as it was; an
+// ask moves only inbox.rev and leaves the engine part byte for byte. A
+// select or focus changes nothing the envelope shows, so it notifies
+// nothing. Every other change is notified once, in order.
 func TestACommitBumpsOnlySeqAndAReportOnlyRev(t *testing.T) {
 	var log stateLog
 	s := newLiveServer(t, func(c *Config) { c.Page.Notify = log.notify }, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
@@ -98,36 +99,42 @@ func TestACommitBumpsOnlySeqAndAReportOnlyRev(t *testing.T) {
 	b, c := string(o.node(t, "b")), string(o.node(t, "c"))
 	type parts struct{ seq, rev, asks, unread string }
 	steps := []struct {
-		what string
-		do   func()
-		want parts
+		what   string
+		do     func()
+		notify bool
+		want   parts
 	}{
-		{"page opened", func() { liveURL(t, s) }, parts{"1", "0", "0", "0"}},
-		{"facts published", func() { o.facts(t, s) }, parts{"2", "0", "0", "0"}},
-		{"an ask", func() { ask(t, s, "p1", b) }, parts{"2", "1", "1", "1"}},
+		{"page opened", func() { liveURL(t, s) }, true, parts{"1", "0", "0", "0"}},
+		{"facts published", func() { o.facts(t, s) }, true, parts{"2", "0", "0", "0"}},
+		{"an ask", func() { ask(t, s, "p1", b) }, true, parts{"2", "1", "1", "1"}},
 		{"a select", func() {
 			if err := s.Report(PageReport{Kind: "select", Publication: "p1", Node: c}); err != nil {
 				t.Fatal(err)
 			}
-		}, parts{"2", "2", "1", "1"}},
-		{"a publication", func() { o.publish(t, s, o.explained(t, s, "b", "0.411"), "") }, parts{"3", "2", "1", "1"}},
+		}, false, parts{"2", "1", "1", "1"}},
+		{"a publication", func() { o.publish(t, s, o.explained(t, s, "b", "0.411"), "") }, true, parts{"3", "1", "1", "1"}},
 		{"a focus", func() {
 			if err := s.Report(PageReport{Kind: "focus", Publication: "p2", Node: b}); err != nil {
 				t.Fatal(err)
 			}
-		}, parts{"3", "3", "1", "1"}},
+		}, false, parts{"3", "1", "1", "1"}},
+		{"a second ask", func() { ask(t, s, "p2", c) }, true, parts{"3", "2", "2", "2"}},
 	}
 	prev := envelopeNow(t, s)
-	for i, st := range steps {
+	notified := 0
+	for _, st := range steps {
 		st.do()
+		if st.notify {
+			notified++
+		}
 		all := log.all()
-		if len(all) != i+1 {
-			t.Fatalf("%s: %d envelopes notified, want %d", st.what, len(all), i+1)
+		if len(all) != notified {
+			t.Fatalf("%s: %d envelopes notified, want %d", st.what, len(all), notified)
 		}
-		if !bytes.Equal(all[i], s.PageSnapshot().State()) {
-			t.Errorf("%s: the envelope notified is not the state's", st.what)
+		if !bytes.Equal(all[notified-1], s.PageSnapshot().State()) {
+			t.Errorf("%s: the last envelope notified is not the state's", st.what)
 		}
-		env := envelopeOf(t, all[i])
+		env := envelopeNow(t, s)
 		if got := (parts{env.Engine.Seq, env.Inbox.Rev, env.Inbox.Asks, env.Inbox.Unread}); got != st.want {
 			t.Errorf("%s: %+v, want %+v", st.what, got, st.want)
 		}
@@ -191,7 +198,7 @@ func p1Node(t *testing.T, s *Server, name string) string {
 	return found[0]
 }
 
-// SRV-R3: a report is recorded and notified while a tool holds the
+// §D4: a report is recorded and notified while a tool holds the
 // engine, and a commit while the inbox's lock is held: neither writer
 // waits for the other's lock.
 func TestNeitherWriterWaitsForTheOther(t *testing.T) {
@@ -295,8 +302,12 @@ func TestReportsAreValidatedAgainstTheSnapshot(t *testing.T) {
 	if err := s.Report(PageReport{Kind: "select", Publication: "p1", Focus: b}); err != nil {
 		t.Errorf("a select of nothing under a focus: %v", err)
 	}
-	if got := envelopeNow(t, s).Inbox; got.Rev != "4" || got.Asks != "2" {
-		t.Errorf("after two asks and two reports: %+v", got)
+	// Only a select keeps its focus: the other kinds do not look at it.
+	if err := s.Report(PageReport{Kind: "focus", Publication: "p1", Node: b, Focus: "0123456789abcdef"}); err != nil {
+		t.Errorf("a focus whose focus field it does not use: %v", err)
+	}
+	if got := envelopeNow(t, s).Inbox; got.Rev != "2" || got.Asks != "2" {
+		t.Errorf("after two asks and three other reports: %+v", got)
 	}
 	row := in.asks[0]
 	if row.publication != "p2" || row.node != union || row.name != "b" || row.view != o.view || row.digest != "" {
@@ -369,7 +380,7 @@ func TestNoPageRequestMutatesEngineState(t *testing.T) {
 	if s.attempts.next != attempts {
 		t.Errorf("reports recorded attempts: %d, then %d", attempts, s.attempts.next)
 	}
-	if got := envelopeNow(t, s).Inbox.Rev; got != "40" {
-		t.Errorf("40 accepted reports moved rev to %s", got)
+	if got := envelopeNow(t, s).Inbox.Rev; got != "20" {
+		t.Errorf("20 accepted asks moved rev to %s", got)
 	}
 }

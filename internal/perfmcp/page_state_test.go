@@ -10,7 +10,7 @@ import (
 	"github.com/dpsoft/perf-agent/internal/mcpstdio"
 )
 
-// SRV-R3b: page_state, the tool and the resource, never takes the engine:
+// §D2.4: page_state, the tool and the resource, never takes the engine:
 // while another session's tool holds it, both answer at once with the
 // current snapshot and inbox, and record the reader.
 func TestPageStateNeverTakesTheEngine(t *testing.T) {

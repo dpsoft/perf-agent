@@ -68,8 +68,9 @@ type pageStateOut struct {
 	Note    string    `json:"note,omitzero"`
 }
 
-// foreignCursorNote is page_state's note when since is another run's ask.
-const foreignCursorNote = "since names an ask of another run of this server, which has restarted since: these are the asks it keeps, oldest first"
+// foreignCursorNote is page_state's note when since is not one of this
+// run's asks: another run's, or one past the newest.
+const foreignCursorNote = "since names no ask of this run of the server, which has restarted since it was given: these are the asks it keeps, oldest first"
 
 func (s *Server) pageStateTool() mcpstdio.Tool {
 	return mcpstdio.Tool{
@@ -120,37 +121,37 @@ func (s *Server) readPageState(ctx context.Context) (string, error) {
 // since). It never takes the engine: it reads the snapshot, which any
 // goroutine may load, and the inbox under its own lock. Once the answer
 // fits in MaxResponseBytes, the asks it returns that no session read yet
-// are recorded as read by the calling session.
+// are recorded as read by the calling session, under the same hold of the
+// inbox's lock.
 func (s *Server) pageState(ctx context.Context, since string, limit int, newest bool) (string, error) {
 	l := s.live
 	if l.isClosed() {
 		return "", errLiveClosed
 	}
 	label := cmp.Or(mcpstdio.ClientLabel(ctx), "client")
-	got, err := l.inbox.read(since, limit, newest, label)
-	if err != nil {
-		return "", fmt.Errorf("invalid arguments to page_state: %v", err)
-	}
-	snap := l.snapshot()
-	out := pageStateOut{
-		Viewers: s.viewers(),
-		Agent:   pageAgent{Seq: strconv.FormatInt(snap.seq, 10), Current: snap.current, Selected: snap.selected, Focus: snap.focus, By: snap.by},
-		User:    got.user,
-		Asks:    pageAsks{Rows: got.rows, Dropped: strconv.FormatInt(got.dropped, 10)},
-	}
-	switch {
-	case len(got.rows) > 0:
-		out.Asks.Next = got.rows[len(got.rows)-1].ID
-	case !got.foreign && !newest:
-		out.Asks.Next = since
-	}
-	if got.foreign {
-		out.Note = foreignCursorNote
-	}
-	res, err := s.respond("page_state", shrinkWithLimit, out)
-	if err != nil {
-		return "", err
-	}
-	l.inbox.markRead(got.ns, label)
-	return res.Text, nil
+	return l.inbox.read(since, limit, newest, label, func(got inboxRead) (string, error) {
+		snap := l.snapshot()
+		out := pageStateOut{
+			Viewers: s.viewers(),
+			Agent:   pageAgent{Seq: strconv.FormatInt(snap.seq, 10), Current: snap.current, Selected: snap.selected, Focus: snap.focus, By: snap.by},
+			User:    got.user,
+			Asks:    pageAsks{Rows: got.rows, Dropped: strconv.FormatInt(got.dropped, 10)},
+		}
+		switch {
+		case len(got.rows) > 0:
+			out.Asks.Next = got.rows[len(got.rows)-1].ID
+		case !got.foreign && !newest:
+			out.Asks.Next = since
+		}
+		switch {
+		case got.foreign:
+			out.Note = foreignCursorNote
+		case got.lost == 1:
+			out.Note = "1 ask after since was dropped before this call: the inbox keeps the newest " + strconv.Itoa(s.lim.Hub.MaxInboxEntries)
+		case got.lost > 1:
+			out.Note = strconv.FormatInt(got.lost, 10) + " asks after since were dropped before this call: the inbox keeps the newest " + strconv.Itoa(s.lim.Hub.MaxInboxEntries)
+		}
+		res, err := s.respond("page_state", shrinkWithLimit, out)
+		return res.Text, err
+	})
 }

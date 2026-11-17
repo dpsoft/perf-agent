@@ -6,6 +6,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
 	"github.com/dpsoft/perf-agent/internal/livehttp"
@@ -95,18 +96,43 @@ func (rt *routes) ServeHTTP(w http.ResponseWriter, r *http.Request) { rt.mux.Ser
 
 // bounded serves h only while one of the heavy slots is free, and
 // otherwise answers 503 at once: a few tabs asking for exports cannot
-// hold many page-sized buffers between them.
+// hold many page-sized buffers between them. The slot is let go before
+// the last byte of the answer is written (see lastByteWriter), so the
+// buffer is held under the slot until all but one byte of it is sent,
+// and a client holding the whole answer never finds its slot taken.
 func (rt *routes) bounded(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		select {
 		case rt.heavy <- struct{}{}:
-			defer func() { <-rt.heavy }()
-			h(w, r)
+			lw := &lastByteWriter{ResponseWriter: w, release: sync.OnceFunc(func() { <-rt.heavy })}
+			defer lw.release()
+			h(lw, r)
 		default:
 			w.Header().Set("Retry-After", "1")
 			http.Error(w, "busy building another export or focus; retry in a moment", http.StatusServiceUnavailable)
 		}
 	}
+}
+
+// lastByteWriter calls release, once, before it writes the last byte of a
+// Write. Every answer of a heavy route is written whole in one Write, so
+// the slot is held until all but the answer's last byte is written.
+type lastByteWriter struct {
+	http.ResponseWriter
+	release func()
+}
+
+func (w *lastByteWriter) Write(b []byte) (int, error) {
+	if len(b) == 0 {
+		return w.ResponseWriter.Write(b)
+	}
+	n, err := w.ResponseWriter.Write(b[:len(b)-1])
+	w.release()
+	if err != nil {
+		return n, err
+	}
+	m, err := w.ResponseWriter.Write(b[len(b)-1:])
+	return n + m, err
 }
 
 // cleanPathsOnly answers 404 for a path that is not clean or that holds

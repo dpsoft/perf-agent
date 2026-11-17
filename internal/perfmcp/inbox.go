@@ -35,8 +35,9 @@ const askNonceBytes = 4
 // select, focus or ask. Publication is the publication the page showed.
 // Node is the frame the report is about: the frame selected for select
 // ("" for none), the frame the layout now starts at for focus ("" for
-// the whole view), and the frame asked about for ask. Focus is the frame
-// the page's layout started at, "" for the whole view.
+// the whole view), and the frame asked about for ask. Focus is, for
+// select, the frame the page's layout started at, "" for the whole view;
+// the other kinds do not use it.
 type PageReport struct {
 	Kind, Publication, Node, Focus string
 }
@@ -51,9 +52,12 @@ var ErrBadReport = errors.New("invalid page report")
 // node a node of it, looked up as PageView.Frame looks it up. Every value
 // the inbox keeps is the server's own: the IDs and the frame's name (cut
 // to 1 KiB) from the publication, its view and digest, and the time. A
-// select or focus replaces the user's last one; an ask joins the ask ring,
-// unless one of the same publication and node was kept less than 2 s ago,
-// when it is taken for the same click and Report returns nil. It never
+// select or focus replaces the user's last one, which page_state reads;
+// the envelope does not show it, so the page is sent nothing, and one that
+// repeats the last changes nothing. An ask joins the ask ring and is sent
+// to the page, unless one of the same publication and node was kept less
+// than 2 s ago, when it is taken for the same click and Report returns
+// nil. It never
 // takes the engine, so it answers while a tool holds it. Any goroutine
 // may call it.
 func (s *Server) Report(r PageReport) error {
@@ -101,7 +105,7 @@ func resolveReport(snap *liveSnapshot, r PageReport) (reported, error) {
 			return bad("the frame is not in the publication; the page will refresh")
 		}
 	}
-	if r.Focus != "" {
+	if r.Kind == reportSelect && r.Focus != "" {
 		if out.focus, _, ok = p.lookup(r.Focus); !ok {
 			return bad("the focused frame is not in the publication; the page will refresh")
 		}
@@ -153,8 +157,10 @@ type inboxAsk struct {
 
 // inbox is what the user reported from the page: the last select or
 // focus, and a ring of the newest asks. Everything is behind mu, which is
-// never held while waiting for anything but the state bus; each change
-// bumps rev and hands the inbox's state to the bus.
+// never held while waiting for anything but the state bus. A change the
+// envelope shows (the asks kept, how many are unread, the newest one's
+// reader) bumps rev and hands the inbox's state to the bus; the user's
+// select or focus is read by page_state only, and moves neither.
 type inbox struct {
 	mu  sync.Mutex
 	bus *stateBus
@@ -221,14 +227,21 @@ func (in *inbox) record(r reported, now time.Time) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	switch r.kind {
-	case reportSelect:
-		in.user = &userView{publication: r.publication, selected: r.node, name: r.name, focus: r.focus, at: now}
-	case reportFocus:
-		u := &userView{publication: r.publication, focus: r.node, at: now}
-		if in.user != nil && in.user.publication == r.publication {
-			u.selected, u.name = in.user.selected, in.user.name
+	case reportSelect, reportFocus:
+		u := userView{publication: r.publication, selected: r.node, name: r.name, focus: r.focus, at: now}
+		if r.kind == reportFocus {
+			u.selected, u.name, u.focus = "", "", r.node
+			if in.user != nil && in.user.publication == r.publication {
+				u.selected, u.name = in.user.selected, in.user.name
+			}
 		}
-		in.user = u
+		if in.user != nil {
+			if was := *in.user; was.publication == u.publication && was.selected == u.selected && was.focus == u.focus {
+				return
+			}
+		}
+		in.user = &u
+		return
 	case reportAsk:
 		if slices.ContainsFunc(in.asks, func(a inboxAsk) bool {
 			d := now.Sub(a.at)
@@ -294,70 +307,70 @@ type userRow struct {
 func stamp(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 
 // inboxRead is what one page_state read takes from the inbox: up to limit
-// asks, the user's last report (nil for none), the asks dropped, and
-// whether since named another run's ask. ns are the asks' numbers, for
-// markRead.
+// asks, the user's last report (nil for none), the asks dropped, whether
+// since was not one of this run's asks, and how many asks after since the
+// ring let go before this read.
 type inboxRead struct {
 	rows    []askRow
-	ns      []int64
 	user    *userRow
 	dropped int64
 	foreign bool
+	lost    int64
 }
 
-// read takes up to limit kept asks: with newest, the newest ones;
-// otherwise the oldest ones after since, an ask ID of this run, or from
-// the oldest kept one when since is "" or another run's. Each row's
-// read_by is label when no session read it yet, as markRead will record
-// it. It marks nothing.
-func (in *inbox) read(since string, limit int, newest bool, label string) (inboxRead, error) {
+// read takes up to limit kept asks, and once answer has made its answer
+// from them, records label as the reader of those no session read yet,
+// all under one hold of the lock: each row's read_by is the reader the
+// inbox keeps, so two sessions reading at once never both claim the first
+// read. With newest it takes the newest asks; otherwise the oldest after
+// since. A since this run never gave, another run's or one past its
+// newest ask, is read from the oldest kept ask. When answer fails,
+// nothing is marked.
+func (in *inbox) read(since string, limit int, newest bool, label string, answer func(inboxRead) (string, error)) (string, error) {
 	var after int64
-	var foreign bool
+	var nonce string
 	if since != "" {
-		n, nonce, ok := parseAskID(since)
-		if !ok {
-			return inboxRead{}, fmt.Errorf("since must be an ask ID as page_state returned it, such as i7-%s", strings.Repeat("0", 2*askNonceBytes))
-		}
-		if nonce == in.nonce {
-			after = n
-		} else {
-			foreign = true
+		var ok bool
+		if after, nonce, ok = parseAskID(since); !ok {
+			return "", fmt.Errorf("invalid arguments to page_state: since must be an ask ID as page_state returned it, such as i7-%s", strings.Repeat("0", 2*askNonceBytes))
 		}
 	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
+	out := inboxRead{rows: []askRow{}, dropped: in.dropped}
+	if since != "" && (nonce != in.nonce || after > in.next) {
+		out.foreign, after = true, 0
+	}
 	asks := in.asks
 	if newest {
 		asks = asks[max(0, len(asks)-limit):]
 	} else {
 		i, _ := slices.BinarySearchFunc(asks, after+1, func(a inboxAsk, n int64) int { return cmp.Compare(a.n, n) })
 		asks = asks[i:min(len(asks), i+limit)]
+		if since != "" && !out.foreign && len(in.asks) > 0 {
+			out.lost = max(0, in.asks[0].n-(after+1))
+		}
 	}
-	out := inboxRead{rows: []askRow{}, dropped: in.dropped, foreign: foreign}
 	for _, a := range asks {
 		out.rows = append(out.rows, askRow{ID: in.askID(a.n), Publication: a.publication, Node: a.node, Name: a.name,
 			View: a.view, Digest: a.digest, At: stamp(a.at), ReadBy: cmp.Or(a.readBy, label)})
-		out.ns = append(out.ns, a.n)
 	}
 	if u := in.user; u != nil {
 		out.user = &userRow{Publication: u.publication, Selected: u.selected, Name: u.name, Focus: u.focus, At: stamp(u.at)}
 	}
-	return out, nil
-}
-
-// markRead records label as the reader of the asks numbered ns that are
-// still kept and that no session read yet; a change bumps rev once.
-func (in *inbox) markRead(ns []int64, label string) {
-	in.mu.Lock()
-	defer in.mu.Unlock()
+	text, err := answer(out)
+	if err != nil {
+		return "", err
+	}
+	// asks is a window of in.asks, so this marks the kept asks themselves.
 	moved := false
-	for i := range in.asks {
-		if a := &in.asks[i]; a.readBy == "" && slices.Contains(ns, a.n) {
-			a.readBy = label
-			moved = true
+	for i := range asks {
+		if asks[i].readBy == "" {
+			asks[i].readBy, moved = label, true
 		}
 	}
 	if moved {
 		in.changed()
 	}
+	return text, nil
 }

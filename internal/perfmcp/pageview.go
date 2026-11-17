@@ -89,9 +89,10 @@ func (s *Server) ClaimPage() error {
 // State is the page's state envelope when the view was taken,
 // {"engine":<state>,"inbox":<inbox state>}: engine is the committed state,
 // what the page shows and the publications it can switch to, at its seq;
-// inbox counts the user's asks, at its own rev. engine may be a commit
-// older than the view's other methods read: the page fetches from the
-// state it holds, and a publication that is gone since answers
+// inbox counts the user's asks, at its own rev. The two parts are written
+// independently, so either may be newer than the other. engine may also
+// be a commit older than the view's other methods read: the page fetches
+// from the state it holds, and a publication that is gone since answers
 // ErrPageNotFound.
 func (v PageView) State() []byte {
 	if v.snap == nil {

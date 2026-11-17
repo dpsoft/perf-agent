@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -523,6 +524,41 @@ func TestAnotherServersTokenIs404(t *testing.T) {
 
 // The export and focus routes, the ones that build a page or a model per
 // request, run at most heavySlots at a time; one more is told to retry.
+// slotProbe is a ResponseWriter that records how many heavy slots are
+// taken when the last byte of the answer is written.
+type slotProbe struct {
+	*httptest.ResponseRecorder
+	heavy      chan struct{}
+	atLastByte int
+}
+
+func (w *slotProbe) Write(b []byte) (int, error) {
+	n, err := w.ResponseRecorder.Write(b)
+	if want, _ := strconv.Atoi(w.Header().Get("Content-Length")); w.Body.Len() == want {
+		w.atLastByte = len(w.heavy)
+	}
+	return n, err
+}
+
+// A heavy route lets go of its slot before the last byte of its answer is
+// written, so a client that has the whole answer never finds the slot
+// still taken: a test that counts the slots right after an answer reads
+// a settled count.
+func TestAHeavySlotIsFreeOnceTheAnswerArrives(t *testing.T) {
+	p, o := published1(t, nil)
+	a := o.nodeID("a")
+	for _, route := range []string{"/pub/p1/export", "/pub/p1/focus/" + a} {
+		w := &slotProbe{ResponseRecorder: httptest.NewRecorder(), heavy: p.routes.heavy, atLastByte: -1}
+		p.routes.ServeHTTP(w, httptest.NewRequest(http.MethodGet, route, nil))
+		if w.Code != http.StatusOK || w.atLastByte != 0 {
+			t.Errorf("%s: status %d, %d slots taken at the last byte", route, w.Code, w.atLastByte)
+		}
+		if n := len(p.routes.heavy); n != 0 {
+			t.Errorf("%s: %d slots taken after the answer", route, n)
+		}
+	}
+}
+
 func TestHeavyRoutesAreBounded(t *testing.T) {
 	p, o := published1(t, nil)
 	a, b := o.nodeID("a"), o.nodeID("b")

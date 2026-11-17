@@ -81,7 +81,8 @@ func TestInboxHandlerAnswers204And422(t *testing.T) {
 	if code, _ := report(h, http.MethodGet, ""); code != http.StatusMethodNotAllowed {
 		t.Errorf("GET inbox: %d", code)
 	}
-	if got := p.envelope().Inbox; got != (inboxJSON{Rev: "2", Asks: "1", Unread: "1"}) {
+	// The select is not in the envelope; the refusals changed nothing.
+	if got := p.envelope().Inbox; got != (inboxJSON{Rev: "1", Asks: "1", Unread: "1"}) {
 		t.Errorf("refused reports moved the inbox: %+v", got)
 	}
 }
@@ -104,7 +105,7 @@ func (h *engineHolder) hold(tool string) {
 	}
 }
 
-// SRV-R3 with two tabs: an ask, and page_state recording its reader,
+// §D4 with two tabs: an ask, and page_state recording its reader,
 // reach both tabs as new inbox revisions with no commit, and again while
 // a tool of another session holds the engine.
 func TestTwoTabsSeeInboxRevisionsWithoutCommits(t *testing.T) {
@@ -167,21 +168,23 @@ func TestTwoTabsSeeInboxRevisionsWithoutCommits(t *testing.T) {
 	<-topDone
 }
 
-// SRV-R3: commits and reports interleaved from two goroutines reach each
-// tab in an order where neither engine.seq nor inbox.rev ever goes back.
+// §D4: commits and inbox changes interleaved from two goroutines reach
+// each tab in an order where neither engine.seq nor inbox.rev ever goes
+// back.
 func TestInterleavedCommitsAndReportsNeverGoBack(t *testing.T) {
 	p := newPage(t, nil)
 	o := p.c.open("cpu.pb.gz")
 	o.explain(nil)
 	o.explain(nil)
-	b := o.nodeID("b")
+	nodes := []string{o.nodeID("main"), o.nodeID("a"), o.nodeID("b"), o.nodeID("c")}
 	h := Inbox(p.srv)
+	agent := p.session()
 	tabs := []*eventsClient{openEvents(t, p.url), openEvents(t, p.url)}
 
-	// The readers stop at the envelope whose rev is last, set once every
+	// The readers stop at the envelope at seq and rev, set once every
 	// change is made.
-	var last atomic.Int64
-	last.Store(-1)
+	var seq, rev atomic.Int64
+	seq.Store(-1)
 	seen := make([][]envelopeJSON, len(tabs))
 	var readers sync.WaitGroup
 	for i, tab := range tabs {
@@ -193,7 +196,9 @@ func TestInterleavedCommitsAndReportsNeverGoBack(t *testing.T) {
 					return
 				}
 				seen[i] = append(seen[i], env)
-				if rev, _ := strconv.ParseInt(env.Inbox.Rev, 10, 64); rev == last.Load() {
+				s, _ := strconv.ParseInt(env.Engine.Seq, 10, 64)
+				r, _ := strconv.ParseInt(env.Inbox.Rev, 10, 64)
+				if s == seq.Load() && r == rev.Load() {
 					return
 				}
 			}
@@ -207,22 +212,32 @@ func TestInterleavedCommitsAndReportsNeverGoBack(t *testing.T) {
 			p.c.try("page_show", map[string]any{"publication": "p" + strconv.Itoa(1+i%2)})
 		}
 	})
+	// Asks, each read by the agent; an ask that repeats one of the last
+	// 2 s is ignored, so some of them change nothing.
 	writers.Go(func() {
-		for range each {
-			if code, body := report(h, http.MethodPost, `{"kind":"select","publication":"p1","node":"`+b+`"}`); code != http.StatusNoContent {
-				t.Errorf("select: %d %s", code, body)
+		for i := range each {
+			pub := "p" + strconv.Itoa(1+i%2)
+			if code, body := report(h, http.MethodPost, askBody(pub, nodes[i/2%len(nodes)])); code != http.StatusNoContent {
+				t.Errorf("ask: %d %s", code, body)
 				return
 			}
+			agent.try("page_state", map[string]any{"limit": 32})
 		}
 	})
 	writers.Wait()
-	last.Store(each + 1)
-	if code, _ := report(h, http.MethodPost, `{"kind":"focus","publication":"p1"}`); code != http.StatusNoContent {
-		t.Fatalf("the last report: %d", code)
-	}
+	// One more commit, whose envelope is the last.
+	end := p.envelope()
+	s, _ := strconv.ParseInt(end.Engine.Seq, 10, 64)
+	r, _ := strconv.ParseInt(end.Inbox.Rev, 10, 64)
+	rev.Store(r)
+	seq.Store(s + 1)
+	p.call("page_show", map[string]any{"publication": "p1"})
 	readers.Wait()
 
 	final := p.envelope()
+	if r < 8 {
+		t.Errorf("only %d inbox changes were made", r)
+	}
 	for i, envs := range seen {
 		var seq, rev int64
 		for j, env := range envs {

@@ -1,10 +1,11 @@
 // The live page. It reads the state envelope (the event stream, and GET
-// state when the stream is down): the state the agent drives, and the count
-// of the user's asks, each at its own revision. It fetches the shown
-// publication's model and rejected history, and draws them with the shared
-// panel. Every request is a relative GET. The only received strings that become part of a request
-// path are publication and node IDs, and only when they have their fixed
-// shapes. Every figure comes from the server: this script formats no number.
+// state when the stream is down): the state the agent drives, and the
+// count of the user's asks, each at its own revision. It fetches the shown
+// publication's model and rejected history, and draws them with the
+// shared panel. Every request is a relative GET. The only received
+// strings that become part of a request path are publication and node
+// IDs, and only when they have their fixed shapes. Every figure comes
+// from the server: this script formats no number.
 (() => {
   'use strict';
   const $ = (id) => document.getElementById(id);

@@ -538,9 +538,12 @@ holder".
   - If its context ends while it waits, it leaves the queue and runs
     nothing.
   - After `MaxEngineWait` (default 45 s, under Codex's default 60 s tool
-    timeout) it returns `isError`: `perf-agent-mcp is busy with <tool>
-    from <client label> (running Ns); call again`. The other client's
-    label and tool name are the user's own information.
+    timeout) it returns `isError`: `<command> is busy with <tool> from
+    "<label>" (running Ns); call again`, where `<command>` is the binary
+    (`perf-agent-hub`, or `perf-agent-mcp` on stdio) and the label is
+    quoted, being the client's own text (`another session` when there is
+    none). The other client's label and tool name are the user's own
+    information.
 - **The inbox is not engine state.** It has its own mutex, held only for
   appends and copies (§D4), so a page click never waits on a tool call.
 - **Why not finer locks.** `store.view` caches views lazily, and `touch`
@@ -591,11 +594,19 @@ states it:
   - every later outcome, cross-process `busy` included, appears as the
     job's state through `capture_wait`.
 - **Page publication of results.** In serve, a committed capture's
-  post-commit derivations include the facts-only publication (capture
-  design §4.0, `done` row), made under the engine slot with `by` set to
-  the label of the session that started the job. A derivation failure,
-  the publication's included, is reported (`derived: failed`) and never
-  rolls files back.
+  post-commit derivations include its publication (capture design §4.0,
+  `done` row), made under the engine slot with `by` set to the label of
+  the session that started the job: a facts-only page of the first
+  mode's default view and, with `compare_with`, also a diff against the
+  baseline. `capture`'s `show` (default true) steers the page to the
+  diff when there is one, else to the facts page; `show: false` only
+  lists them. **The facts page is the server's, not an attempt
+  (SRV-R17):** the agent never sees an attempt it did not make, and it
+  takes no place in `MaxAttemptViews`. The recompute recipe's
+  `page_explain`, which the agent runs, is an attempt. A derivation
+  failure, the publication's included, is reported (`derived: failed`)
+  and never rolls files back; when only the diff fails, the facts page
+  stays.
 - **Multi-session waits (SRV-R7).** Jobs are the server's. Any session
   holding the MCP token may `capture_wait` or `capture_cancel` any job,
   and several sessions may wait on one job at once, each bounded by its
@@ -801,8 +812,11 @@ Instead:
   - `engine` is written only by `commit()`, under the slot, exactly as in
     M2b.
   - `inbox` is written only by inbox changes (an append, or `page_state`
-    marking `read_by`), under the inbox mutex. Each change bumps `rev`
-    and never `seq`.
+    marking `read_by`), under the inbox mutex. **Only a change the
+    envelope shows (the asks, `unread`, `read_by`) bumps `rev` and is
+    broadcast (SRV-R14)**, never `seq`. A select or focus updates
+    `page_state`'s `user` without a broadcast, and one that repeats the
+    last changes nothing.
 - **The state bus combines them.** It is a small struct with its own
   mutex, holding the latest bytes of each part. Each writer replaces its
   part, then builds the envelope and publishes it to the events hub (`livehttp.Hub`) while
@@ -852,7 +866,7 @@ Sampling lets a server ask the client's model for a completion.
 | 2. SSE hub | **Kept** unchanged | serves page streams; MCP has no stream in v1 |
 | 3. Shared panel script and CSS | **Kept** unchanged | — |
 | 4. Live models (JSON) | **Kept** | the state becomes an envelope with `engine` (the M2b state, plus `by`) and `inbox` (its own `rev`) (SRV-R3) |
-| 5. Live shell, CSS and script | **Kept, extended** | `transport.post(path, body)`; local select and focus report to `inbox`; the "Ask my agent about this" chip; the inbox count. `onState` reads the envelope: `engine` through the unchanged R1/R9..R12 logic, `inbox` by its own `rev` (SRV-R3). Reports are fire-and-forget and never touch `acceptedSeq` or the generation |
+| 5. Live shell, CSS and script | **Kept, extended** | `transport.post(path, body)`; local select and focus report to `inbox`; the "Ask my agent about this" chip; the inbox count. `onState` reads the envelope: `engine` through the unchanged R1/R9..R12 logic, `inbox` by its own `rev` (SRV-R3). Reports are coalesced (SRV-R15): select and focus have at most one report in flight, sent once the clicks have settled for 150 ms, the newest replacing any waiting; one answered 429 is retried once after `Retry-After` unless a newer one waits. An ask answered 429 is retried once before the page shows a toast. They never touch `acceptedSeq` or the generation |
 | 6. Publications and snapshot | **Kept** | the ownership comments move from "request goroutine" to "engine slot holder"; `by` recorded |
 | 7. Listener lifecycle and routes | **Routes moved; lifecycle moved** | `perfmcp` no longer listens: `live.start`, `ensureLive`'s listener branch and `live.srv/ln/mu` go, and the hub becomes a notifier. `liveroutes.go` moves, unchanged in behaviour, to `internal/perfpage`, which reads `Server.PageSnapshot()`. `perf-agent-hub` mounts it with the inbox handler, and `page_open` returns the URL the serve binary gives it |
 | 8. `page_open`, `page_explain`, `page_show` | **Kept; serve-only** | registered only when `Config.Page` is set (decision 8.4). Stdio does not list the page tools, so a headless agent's tool list and context are M2's |
@@ -902,7 +916,7 @@ authority over TCP**, and accepts **one kind of browser write**.
 | A **web page** in the user's browser | send requests to `127.0.0.1:*`, including a cross-site navigation to the page shell (M2b-R6) | **MCP:** it has no bearer token, cannot set `Authorization` cross-origin without a CORS preflight that never succeeds, and any request it makes carries `Origin` and `Sec-Fetch-Site`, which `/mcp` refuses. **Inbox:** it lacks the page token; with a leaked token it still fails the `Origin`, `Sec-Fetch-Site`, content-type and custom-header checks |
 | A **DNS-rebinding** page | reach the port under its own hostname | pass `Front`'s Host check |
 | Someone **with the page URL** (history, screen share) | read the page and append `select`, `focus` and `ask` reports | call a tool, or inject text: reports are validated IDs, and names come from the engine (§D4). Rotation: restart `perf-agent-hub` |
-| A **misbehaving agent** | flood tool calls, steer the page, evict others' handles | exhaust memory or goroutines: `MaxCalls`, `MaxCallsPerSession` and `MaxRequestBytes` refuse excess at once (SRV-R4). It also cannot starve the page (snapshot reads), delay a parsed control message behind calls or the engine (SRV-R4b), or hold the slot forever (`MaxEngineWait`); every tool keeps M2's bounds. **With the token it can flood slow bodies:** while `MaxIngressReaders` are busy, new requests, controls included, get `503` until readers free, within `IngressBodyTimeout` (SRV-R4c, stated conditionally). The flood holds no engine state, and capture jobs keep running |
+| A **misbehaving agent** | flood tool calls, steer the page, evict others' handles | exhaust memory or goroutines: `MaxCalls`, `MaxCallsPerSession` and `MaxRequestBytes` refuse excess at once (SRV-R4). It also cannot starve the page (snapshot reads), delay a parsed control message behind calls or the engine (SRV-R4b), or hold the slot forever (`MaxEngineWait`); every tool keeps M2's bounds. **With the token it can flood slow bodies:** while `MaxIngressReaders` are busy, new requests, controls included, get `503` until readers free, within `IngressBodyTimeout` (SRV-R4c, stated conditionally). One reader and 64 KiB stay reserved for bodies of at most 64 KiB, so only stalled bodies of at most 64 KiB can shut controls out (SRV-R13). The flood holds no engine state, and capture jobs keep running |
 | **Hostile profile content** | as in M2b | as in M2b; the inbox stores no page-supplied text |
 
 **Connections (SRV-R11b).**
@@ -1079,8 +1093,10 @@ authority over TCP**, and accepts **one kind of browser write**.
     and it still completes once the slot frees (reconciliation row 6).
     A blocked hash or fsync in `committing` never holds the slot;
   - **page publication:** a committed capture is published facts-only
-    with `by`, and a publication failure leaves the capture committed
-    with `derived: failed`;
+    with `by`, not as an attempt (SRV-R17), and with `compare_with` also
+    as a diff; `show: false` changes nothing the page shows; a
+    publication failure leaves the capture committed with
+    `derived: failed`, and a failed diff keeps the facts page;
   - **multi-session waits (SRV-R7):** `capture` from session A, then A's
     eviction or `DELETE`, then `capture_wait` from sessions B and C at
     once and `capture_cancel` from B. The job is untouched by A's end,
@@ -1479,3 +1495,7 @@ written where it applies:
 | Task 10 (the token helper) | The helper names the client's port, and client URLs write `127.0.0.1`, not `localhost` | §D1.1, §D2.3, §D6 |
 | Task 14 | The two configurations' tool names do not collide (clients name tools by server); configuring both still shows the tools twice and splits the work | §D1.3 |
 | **Reconciliation row 2** | A cross-process `busy` job creates no entry; the directory and its `.owner` exist before the lease, as they must for another process to hold it | §2, §D2.5, §D7 |
+| **SRV-R14** | The inbox's `rev` bumps, and the bus broadcasts, only on changes the envelope shows (asks, `unread`, `read_by`); a select or focus updates `page_state`'s `user` without a broadcast | §D4 |
+| **SRV-R15** | The page coalesces its reports: one select or focus in flight, the newest wins, and a 429 is retried once after `Retry-After`. They are no longer fire-and-forget | §D5's row 5 |
+| **SRV-R17** | A capture's server-made facts page is not an attempt (the recipe's `page_explain` is); a capture's publication is that facts page plus, with `compare_with`, a diff | §D2.5, §D7 |
+| Task 5 (the engine's holder) | The busy text names the binary and quotes the label: `<command> is busy with <tool> from "<label>"` | §D2.4 |

@@ -262,7 +262,7 @@ It takes the stdio server's flags (`--profiles`, `--source`, `--source-manifest`
 | Flag | Meaning |
 |---|---|
 | `--port N` | The port, default 7362. The hub listens on `127.0.0.1` only; there is no address flag. A port in use exits 1, naming `--port`. |
-| `--runtime-dir DIR` | The runtime directory, default `$XDG_RUNTIME_DIR/perf-agent-mcp`, created when missing; without `XDG_RUNTIME_DIR` it must be given, and exist. It must be a directory of yours with mode 0700, not a symbolic link, or the hub refuses to start. |
+| `--runtime-dir DIR` | The runtime directory. The default, `$XDG_RUNTIME_DIR/perf-agent-mcp`, is created when missing; without `XDG_RUNTIME_DIR` this flag must be given, and a directory given with `--runtime-dir` must exist. It must be a directory of yours with mode 0700, not a symbolic link, or the hub refuses to start. |
 
 It runs in the foreground until SIGINT or SIGTERM. It prints the page URL once on stdout and logs to stderr; no log line carries a token. The URL holds the page's token: open it in your browser and give it to nobody. `perf-agent-hub url` prints it again. A second hub exits 1 with `perf-agent-hub is already running (pid N, port P)`: one runs per user.
 
@@ -300,7 +300,7 @@ http_headers_helper = "perf-agent-hub token --port 7362"
 - Write `127.0.0.1`, never `localhost`, which may resolve to `::1`, where the hub does not listen; `token --url` refuses it.
 - Name `perf-agent-hub` by its absolute path when it is not in the client's PATH, and pass the helper `--runtime-dir DIR` when the hub was started with one.
 
-**A port the hub is not on.** Any local user can listen on a loopback port the hub is not using. The helper never sends the token there: it prints the token only when the running hub holds its lock and its `hub.json` names the port asked for; otherwise it exits 1 and prints nothing. But a client whose URL names such a port talks to an impostor, which can feed the agent false results and instructions: a prompt-injection channel. Keep the client's URL and `--port` in step, and when a client fails to connect, check `perf-agent-hub url`, which names the running hub's port, before changing anything.
+**A port the hub is not on.** Any local user can listen on a loopback port the hub is not using. The helper never sends the token there: it prints the token only when the running hub holds its lock and its `hub.json` names the port asked for; otherwise it exits 1 and prints nothing on stdout (the reason goes to stderr). But a client whose URL names such a port talks to an impostor, which can feed the agent false results and instructions: a prompt-injection channel. Keep the client's URL and `--port` in step, and when a client fails to connect, check `perf-agent-hub url`, which names the running hub's port, before changing anything.
 
 **Do not configure both in one session.** The stdio entry and the hub entry do not collide: clients name each tool by its server (`mcp__perf-agent__open`, `mcp__perf-agent-live__open`). But the same tools appear twice, and the two servers keep separate handles, pages and capture directories, so the agent's work is split between them. Use the hub entry where a human watches, and stdio for headless loops.
 
@@ -350,7 +350,7 @@ The page's reports are the only thing a browser can send the hub: a POST from th
 The hub carries tool-calling authority over TCP, lives long and accepts one kind of browser write. What guards it:
 
 - **Loopback only.** It listens on `127.0.0.1` and opens no outgoing connection: the source scan covers its packages too, and a test checks that every socket of a running hub is on loopback. A request whose `Host` is not a loopback name or address gets 403, which stops DNS rebinding.
-- **`/mcp`** refuses, from the headers alone and before any body byte is read: a request with `Origin`, `Sec-Fetch-Site` or `Sec-Fetch-Dest` (403: no browser is a client; `Sec-Fetch-Mode` alone passes, since Node clients send it); a missing or wrong bearer token (401, compared in constant time, with no `WWW-Authenticate`, so no client starts an OAuth flow); a `Content-Type` other than JSON; a body without `Content-Length` (411); and one over `MaxMessageBytes` (413). There is no CORS.
+- **`/mcp`** refuses, from the headers alone and before any body byte is read: a request with `Origin`, `Sec-Fetch-Site` or `Sec-Fetch-Dest` (403: no browser is a client; `Sec-Fetch-Mode` alone passes, since Node clients send it); a missing or wrong bearer token (401, compared in constant time, with no `WWW-Authenticate`, so no client starts an OAuth flow); an `Accept` that does not admit both `application/json` and `text/event-stream`, or a `Content-Type` other than `application/json` (400); a body without `Content-Length` (411); and one over `MaxMessageBytes` (413). There is no CORS.
 - **The page token** reads the page and sends reports, and nothing else: no tool call follows from a leaked page URL. A restart makes new tokens.
 - **Another local user** can connect, but cannot read the 0600 token files in your 0700 runtime directory, nor guess a 256-bit token. It can listen on a port the hub is not on (see A port the hub is not on). It can fill the listener: the hub holds at most 512 connections, and closes one that sends nothing for 2 s; it recovers once they stop. That is inherent to a TCP port on a shared machine.
 - **A process running as you** can read `mcp-token` and call every tool, `capture` included; it could run your setcap'd perf-agent itself. That is why headless use stays on stdio.
@@ -359,7 +359,7 @@ The hub carries tool-calling authority over TCP, lives long and accepts one kind
 
 ### Hub limits
 
-Set with `--limit Hub.Name=Value`, on the hub only: stdio refuses them (exit 2). A value that makes another unreachable is refused at start-up: `Hub.MaxCallsPerSession` over `Hub.MaxCalls`, `Hub.MaxIngressBytes` or `Hub.MaxRequestBytes` under `MaxMessageBytes`, and `Hub.IngressBodyTimeout` over 30s. `MaxEngineWait` (see Limits) applies to the hub's agents too.
+Set with `--limit Hub.Name=Value`, on the hub only: stdio refuses them (exit 2). A zero, negative or unparsable value exits 2. A value over its ceiling, or one that makes another unreachable, is refused at start-up with exit 1: `Hub.MaxCallsPerSession` over `Hub.MaxCalls`, `Hub.MaxIngressBytes` or `Hub.MaxRequestBytes` under `MaxMessageBytes`, and `Hub.IngressBodyTimeout` over 30s. `MaxEngineWait` (see Limits) applies to the hub's agents too.
 
 | Name | Default | Meaning |
 |---|---|---|
@@ -401,7 +401,7 @@ mkdir -p ~/.agents/skills && ln -s "$PWD/skills/perf-agent-mcp" ~/.agents/skills
 
 ## Limits
 
-Defaults; override with `--limit Name=Value`. Sizes are bytes. Every limit must be positive (`Source.MaxContext` and `Capture.TTL` may be 0); a zero, negative or out-of-range value exits 2 and names the limit. The capture limits are in their own table below.
+Defaults; override with `--limit Name=Value`. Sizes are bytes. Every limit must be positive (`Source.MaxContext` and `Capture.TTL` may be 0); a zero, negative or unparsable value, or one out of its type's range, exits 2 and names the limit. A value over its ceiling (`MaxEngineWait` over 55s) or that does not fit another limit (`MaxRetainedBytes` under `MaxPageBytes` on the hub) is refused at start-up with exit 1, naming both. The capture limits are in their own table below.
 
 | Name | Default |
 |---|---|

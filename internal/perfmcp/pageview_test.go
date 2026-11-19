@@ -40,7 +40,7 @@ func goldenPublications(t *testing.T, edit func(*Config)) (*Server, liveOpened, 
 	n := openLive(t, s, "new.pb.gz")
 	q := diffQuery{BaseHandle: o.e.prof.Handle, BaseView: o.view, NewHandle: n.e.prof.Handle, NewView: n.view}
 	bs, ns := mustBoth(s.diffSides(q))(t)
-	p2 := must(s.publishDiff(must(s.compare(q, bs, ns))(t), bs, ns, "golden diff", "", ""))(t)
+	p2 := must(s.publishDiff(must(s.compare(q, bs, ns))(t), bs, ns, "golden diff", "", "", true))(t)
 	return s, o, unionNamed(t, p2.diff, "b")
 }
 
@@ -504,7 +504,7 @@ func TestADiffPinsBothSides(t *testing.T) {
 	o, n := openLive(t, s, "cpu.pb.gz"), openLive(t, s, "new.pb.gz")
 	q := diffQuery{BaseHandle: o.e.prof.Handle, BaseView: o.view, NewHandle: n.e.prof.Handle, NewView: n.view}
 	bs, ns := mustBoth(s.diffSides(q))(t)
-	p := must(s.publishDiff(must(s.compare(q, bs, ns))(t), bs, ns, "", "", ""))(t)
+	p := must(s.publishDiff(must(s.compare(q, bs, ns))(t), bs, ns, "", "", "", true))(t)
 	if p.prof == p.newProf || p.v == p.newV {
 		t.Fatal("the sides are one profile")
 	}
@@ -750,7 +750,7 @@ func TestADiffIsChargedForItsDerivedUnits(t *testing.T) {
 	if d.RetainedBytes() < unitBytes {
 		t.Errorf("the diff is estimated at %d bytes while its %d derived unit strings hold %d", d.RetainedBytes(), len(units), unitBytes)
 	}
-	if _, err := s.publishDiff(d, b, n, "", "", ""); err != nil {
+	if _, err := s.publishDiff(d, b, n, "", "", "", true); err != nil {
 		t.Errorf("one shared derived unit fits the budget: %v", err)
 	}
 }

@@ -49,7 +49,8 @@ type listArgs struct {
 
 // listJob is a job of this server as capture_list shows it: its state,
 // with its number in the series (id) and its capture id (capture,
-// series/NNN), as the history's rows name them.
+// series/NNN), as the history's rows name them, and by, the label of the
+// session that started it ("" for none).
 type listJob struct {
 	Job     string `json:"job"`
 	ID      string `json:"id,omitzero"`
@@ -61,6 +62,7 @@ type listJob struct {
 	Derived string `json:"derived,omitzero"`
 	Series  string `json:"series"`
 	Label   string `json:"label"`
+	By      string `json:"by,omitzero"`
 }
 
 // seriesRow is a series of the capture directory: its captures (marker-
@@ -184,7 +186,7 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 				v := j.view()
 				_, num, _ := strings.Cut(v.ID, "/")
 				out.Jobs = append(out.Jobs, listJob{Job: v.Job, ID: num, Capture: v.ID, Status: v.Status, Phase: v.Phase,
-					Elapsed: v.Elapsed, ETA: v.ETA, Derived: v.Derived, Series: js, Label: label})
+					Elapsed: v.Elapsed, ETA: v.ETA, Derived: v.Derived, Series: js, Label: label, By: j.by})
 			}
 		}
 	}

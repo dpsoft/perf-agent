@@ -45,6 +45,14 @@ type publication struct {
 	// label of the session that made it ("" for none).
 	attempt string
 	by      string
+	// files are the files the publication's profiles were read from, by
+	// device and inode, as the store opened them, and for a capture's
+	// publication the capture's own files too (a profile whose bytes equal
+	// one open already shares its entry, opened from the other file):
+	// retention keeps them while the publication is kept. Unlike the rest,
+	// they are read only under the engine, which may add the capture's
+	// before it lets go.
+	files []fileKey
 
 	prof   *profilemodel.Profile
 	v      *profilemodel.View
@@ -265,7 +273,9 @@ type live struct {
 	snap atomic.Pointer[liveSnapshot]
 
 	// pubs are the kept publications, least recently shown first; the
-	// current one is last. history is the history of each explained one.
+	// current one, the last shown, is last. A publication kept without
+	// being shown goes just before the current one. history is the
+	// history of each explained one.
 	pubs    []*publication
 	history map[string]*liveHistory
 	// next is the number of the last publication made.
@@ -379,10 +389,9 @@ func (l *live) show(id, node string, focus bool, by string) error {
 // passing check r, titled title, made for attempt by the session labelled
 // by. The model is built
 // within the page limits; one that cannot be built publishes nothing. An
-// admitted publication becomes current with its first explained node
-// selected (none for a facts-only page) and no focus, and the page is
-// told. A model that cannot be built is a *modelError.
-func (s *Server) publishExplained(e *entry, v *profilemodel.View, view string, r explain.Result, title, attempt, by string) (*publication, error) {
+// admitted publication is steered to as admit says, and the page is told.
+// A model that cannot be built is a *modelError.
+func (s *Server) publishExplained(e *entry, v *profilemodel.View, view string, r explain.Result, title, attempt, by string, steer bool) (*publication, error) {
 	opts := flamegraph.LiveOptions{
 		Title: title, ProfileName: e.name, Digest: e.prof.Digest.String(), Attempt: attempt,
 		MaxNodes: s.lim.MaxPageNodes, MaxBytes: s.lim.MaxPageBytes,
@@ -393,16 +402,47 @@ func (s *Server) publishExplained(e *entry, v *profilemodel.View, view string, r
 	}
 	p := &publication{
 		kind: pubExplained, title: title, titleSegs: flamegraph.LiveTitleSegments(title, e.name),
-		view: view, digest: e.prof.Digest, attempt: attempt, by: by,
+		view: view, digest: e.prof.Digest, attempt: attempt, by: by, files: filesOf(e),
 		prof: e.prof, v: v, result: r, resultSize: resultBytes(r), opts: opts, model: model,
 	}
-	if err := s.admit(p); err != nil {
+	if err := s.admit(p, steer); err != nil {
 		return nil, err
 	}
-	l := s.live
-	l.selected, l.focus, l.by = p.firstSelected(), "", p.by
 	s.commit()
 	return p, nil
+}
+
+// filesOf is the files es were read from, by device and inode, each once.
+func filesOf(es ...*entry) []fileKey {
+	var out []fileKey
+	for _, e := range es {
+		for _, fi := range e.opened {
+			if st, ok := statOf(fi); ok {
+				out = addFiles(out, fileKey{st.dev, st.ino})
+			}
+		}
+	}
+	return out
+}
+
+// addFiles is files with each of keys it does not hold yet.
+func addFiles(files []fileKey, keys ...fileKey) []fileKey {
+	for _, k := range keys {
+		if !slices.Contains(files, k) {
+			files = append(files, k)
+		}
+	}
+	return files
+}
+
+// publishedFiles is the files of every kept publication, which retention
+// keeps. It runs under the engine, as retention's protection does.
+func (s *Server) publishedFiles() []fileKey {
+	var out []fileKey
+	for _, p := range s.live.pubs {
+		out = append(out, p.files...)
+	}
+	return out
 }
 
 // publishDiff publishes d, the comparison of base's view with next's,
@@ -411,9 +451,9 @@ func (s *Server) publishExplained(e *entry, v *profilemodel.View, view string, r
 // union once and measures it once, for every model and export the page
 // asks for later. A node that is not in the union publishes nothing, and
 // neither does a model that cannot be built within the page limits (a
-// *modelError). An admitted publication becomes current, unfocused, and
+// *modelError). An admitted publication is steered to as admit says, and
 // the page is told.
-func (s *Server) publishDiff(d *profilemodel.Diff, base, next diffSide, title, node, by string) (*publication, error) {
+func (s *Server) publishDiff(d *profilemodel.Diff, base, next diffSide, title, node, by string, steer bool) (*publication, error) {
 	ix := profilemodel.NewDiffIndex(d)
 	if node != "" {
 		if _, ok := ix.Node(profilemodel.UnionID(node)); !ok {
@@ -432,14 +472,12 @@ func (s *Server) publishDiff(d *profilemodel.Diff, base, next diffSide, title, n
 	}
 	p := &publication{
 		kind: pubDiff, title: title, titleSegs: flamegraph.LiveTitleSegments(title, "Diff of "+base.e.name+" and "+next.e.name),
-		view: d.View, by: by, prof: base.e.prof, v: base.v, model: model,
+		view: d.View, by: by, files: filesOf(base.e, next.e), prof: base.e.prof, v: base.v, model: model,
 		diff: d, index: ix, newProf: next.e.prof, newV: next.v, node: node, diffOpts: opts, export: export,
 	}
-	if err := s.admit(p); err != nil {
+	if err := s.admit(p, steer); err != nil {
 		return nil, err
 	}
-	l := s.live
-	l.selected, l.focus, l.by = p.firstSelected(), "", p.by
 	s.commit()
 	return p, nil
 }
@@ -460,14 +498,21 @@ type modelError struct{ err error }
 func (e *modelError) Error() string { return e.err.Error() }
 func (e *modelError) Unwrap() error { return e.err }
 
-// admit keeps p as the current publication, with its history. It first
-// tries the change on a copy: it drops the least recently shown other
-// publications while more than MaxPublications would be kept, or while
-// the estimated memory of what is kept and p goes over MaxRetainedBytes.
-// Only if that fits does it drop them, number p and hold its pins. A
-// publication that does not fit even alone is refused, and nothing
-// changes.
-func (s *Server) admit(p *publication) error {
+// admit keeps p, with its history. It first tries the change on a copy:
+// it drops the least recently shown other publications while more than
+// MaxPublications would be kept, or while the estimated memory of what is
+// kept and p goes over MaxRetainedBytes. Only if that fits does it drop
+// them, number p and hold its pins. A publication that does not fit even
+// alone is refused, and nothing changes.
+//
+// With steer, p becomes current, with its first explained node selected
+// (none for a facts-only page; for a diff the node it selects), no focus,
+// and by its maker. Without steer, current, selected and focus stay as
+// they were and p goes just before the current one, so it is dropped
+// before anything shown more recently; only when the current one had to
+// be dropped to make room is p shown in its place, since the page must
+// show a kept publication.
+func (s *Server) admit(p *publication, steer bool) error {
 	l := s.live
 	n := l.next + 1
 	id := "p" + strconv.Itoa(n)
@@ -507,8 +552,21 @@ func (s *Server) admit(p *publication) error {
 	if h != nil {
 		l.history[id] = h
 	}
-	l.pubs = append(slices.Clone(kept), p)
-	l.current = id
+	cur := slices.IndexFunc(kept, func(k *publication) bool { return k.id == l.current })
+	if !steer && l.current != "" && cur < 0 {
+		// The current one was dropped: p is all the page has to show.
+		steer = true
+	}
+	switch {
+	case steer:
+		l.pubs = append(slices.Clone(kept), p)
+		l.current, l.selected, l.focus, l.by = id, p.firstSelected(), "", p.by
+	case cur < 0:
+		// Nothing is shown yet.
+		l.pubs = append(slices.Clone(kept), p)
+	default:
+		l.pubs = slices.Insert(slices.Clone(kept), cur, p)
+	}
 	return nil
 }
 

@@ -130,10 +130,10 @@ func (s *Server) captureTool() mcpstdio.Tool {
     "series": {"type": "string", "description": "The series this capture belongs to, one per loop: 1-%d bytes of [A-Za-z0-9._-], not starting with a dot. Default adhoc."},
     "label": {"type": "string", "description": "Names the capture in its series, as base or cand3: 1-%d bytes of [A-Za-z0-9._-], not starting with a dot. Default run."},
     "compare_with": {"type": "string", "description": "A capture id of this series, such as 001: the capture inherits its settings and the result carries the diff with it."},
-    "keep": {"type": "boolean", "description": "Exempt this capture from retention, as for a loop's baseline. Default false."}
+    "keep": {"type": "boolean", "description": "Exempt this capture from retention, as for a loop's baseline. Default false."}%s
   },
   "additionalProperties": false
-}`, maxPID, c.MaxDuration, c.MaxSampleRate, maxSeriesName, maxLabel)
+}`, maxPID, c.MaxDuration, c.MaxSampleRate, maxSeriesName, maxLabel, s.showSchema())
 	return mcpstdio.Tool{
 		Name:  "capture",
 		Title: "Capture a profile",
@@ -147,8 +147,19 @@ func (s *Server) captureTool() mcpstdio.Tool {
 	}
 }
 
+// showSchema is the show argument's schema, after a comma, on a server
+// with the live page; "" without it, where capture takes no show.
+func (s *Server) showSchema() string {
+	if s.live == nil {
+		return ""
+	}
+	return `,
+    "show": {"type": "boolean", "description": "Make the capture's publication on the live page current: the diff with compare_with, else the facts page. false only lists it, leaving what the page shows as it is. Default true."}`
+}
+
 // captureArgs are capture's arguments; a setting is a pointer so a passed
-// one is told from a default.
+// one is told from a default. Show is an argument only on a server with
+// the live page.
 type captureArgs struct {
 	PID          *int     `json:"pid"`
 	Command      []string `json:"command"`
@@ -162,6 +173,7 @@ type captureArgs struct {
 	Label        *string  `json:"label"`
 	CompareWith  string   `json:"compare_with"`
 	Keep         bool     `json:"keep"`
+	Show         *bool    `json:"show"`
 }
 
 // acceptedAnswer is capture's answer.
@@ -174,7 +186,7 @@ type acceptedAnswer struct {
 // handleCapture admits a capture job: every check is on the arguments,
 // the cached binary and owner, the slot and the windows, in memory only.
 // The job then runs on its own, and every later failure is its state.
-func (s *Server) handleCapture(_ context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
+func (s *Server) handleCapture(ctx context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
 	if s.captureDisabled != "" {
 		return s.toolError(s.disabledError(), nil), nil
 	}
@@ -185,7 +197,7 @@ func (s *Server) handleCapture(_ context.Context, raw json.RawMessage) (mcpstdio
 	if e != nil {
 		return s.toolError(e, nil), nil
 	}
-	j, e := s.startJob(req)
+	j, e := s.startJob(req, mcpstdio.ClientLabel(ctx))
 	if e != nil {
 		return s.toolError(e, nil), nil
 	}
@@ -203,10 +215,14 @@ var unwinds = []string{"auto", "fp", "dwarf"}
 // limits and capabilities, the series and label, then compare_with.
 func (s *Server) captureRequestOf(raw json.RawMessage) (captureRequest, *capture.Error) {
 	var a captureArgs
-	if err := decodeArgs("capture", raw, &a); err != nil {
+	var hidden []string
+	if s.live == nil {
+		hidden = []string{"show"}
+	}
+	if err := decodeArgsHiding("capture", raw, &a, hidden...); err != nil {
 		return captureRequest{}, invalidArgument(argsNext, "%s", err.Error())
 	}
-	req := captureRequest{Cwd: a.Cwd, Explicit: map[string]bool{}, Keep: a.Keep, Series: defaultSeries, Label: defaultLabel}
+	req := captureRequest{Cwd: a.Cwd, Explicit: map[string]bool{}, Keep: a.Keep, Series: defaultSeries, Label: defaultLabel, Show: a.Show == nil || *a.Show}
 	if e := checkTarget(a); e != nil {
 		return req, e
 	}
@@ -1255,7 +1271,7 @@ func (s *Server) cutResult(b []byte, max int) []byte {
 		}
 	}
 	minimal := map[string]json.RawMessage{"notes": mustRaw([]string{cutMinimalNote})}
-	for _, k := range []string{"job", "status", "derived", "derive_error", "handles", "cancel", "recompute"} {
+	for _, k := range []string{"job", "status", "derived", "derive_error", "handles", "cancel", "recompute", "publication", "diff_publication"} {
 		if v, ok := top[k]; ok {
 			minimal[k] = v
 		}

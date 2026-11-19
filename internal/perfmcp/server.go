@@ -126,7 +126,8 @@ type Server struct {
 	// /proc).
 	selfStartTime func() (uint64, error)
 	// captureProtect, when set, names files retention must keep besides
-	// the ones this server knows of (serve's publications); nil in stdio.
+	// the ones the store has open: the kept publications' files, with the
+	// live page; nil in stdio. It runs under the engine.
 	captureProtect func() []fileKey
 	// ownerSeen is the capture directory's owner kind once it was read,
 	// so a mismatch is refused without I/O.
@@ -270,6 +271,9 @@ func New(cfg Config) (_ *Server, err error) {
 	s.store = newStore(s.profiles, lim.Model, lim.MaxOpenHandles, s.pins)
 	if cfg.Page != nil {
 		s.live = newLive(lim, s.pins, *cfg.Page)
+		// A capture the page shows keeps its files: its recipe reopens
+		// them, and the user may read them while the page is on screen.
+		s.captureProtect = s.publishedFiles
 	}
 	if err := s.setupCapture(cfg.Capture); err != nil {
 		return nil, err
@@ -549,7 +553,14 @@ func (s *Server) respond(tool, shrink string, v any) (mcpstdio.Result, error) {
 // arguments, taken from v's JSON names, and repeats the agent's text only
 // cut short.
 func decodeArgs(tool string, raw json.RawMessage, v any) error {
-	names := argNames(v)
+	return decodeArgsHiding(tool, raw, v)
+}
+
+// decodeArgsHiding is decodeArgs for a tool that does not take the
+// arguments hidden on this server, though v has fields for them: each is
+// refused, and named nowhere, as one v has no field for.
+func decodeArgsHiding(tool string, raw json.RawMessage, v any, hidden ...string) error {
+	names := slices.DeleteFunc(argNames(v), func(n string) bool { return slices.Contains(hidden, n) })
 	takes := "its arguments are: " + strings.Join(names, ", ")
 	if len(names) == 0 {
 		takes = "it takes no arguments"

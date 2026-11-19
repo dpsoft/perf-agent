@@ -66,7 +66,10 @@ const phaseUndecided = "undecided"
 // and Command is set; Cwd is the command's directory as the agent gave it
 // ("" for the default). Settings holds every setting, defaults filled in;
 // Explicit names the ones the agent passed (modes, duration, sample_rate,
-// unwind, kernel_stacks), so that compare_with inherits the others.
+// unwind, kernel_stacks), so that compare_with inherits the others. Show
+// says whether the live page is steered to the capture's publication
+// (true unless the agent passed show false); without the page it does
+// nothing.
 type captureRequest struct {
 	PID                        int
 	Command                    []string
@@ -75,6 +78,7 @@ type captureRequest struct {
 	Explicit                   map[string]bool
 	Series, Label, CompareWith string
 	Keep                       bool
+	Show                       bool
 }
 
 // jobView is a job's state as capture_wait shows it; empty values are left
@@ -103,6 +107,10 @@ type job struct {
 	// job reconciles it with the effective duration.
 	reserve time.Duration
 	req     captureRequest
+	// by is the label of the session that started the job ("" for none):
+	// capture_list shows it, the engine names it while the job holds it,
+	// and the job's publications record it.
+	by string
 	// began is when admission ran by the wall clock, which elapsed and eta
 	// count from (created is on the server's clock, which tests move).
 	began time.Time

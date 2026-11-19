@@ -44,8 +44,9 @@ const (
 // passed, else Capture.MaxDuration when it is to be inherited from a
 // baseline, else the default; the job reconciles it once it knows. A busy
 // slot or full windows refuse the job; otherwise it runs on its own
-// goroutine and every later failure is the job's state.
-func (s *Server) startJob(req captureRequest) (*job, *capture.Error) {
+// goroutine and every later failure is the job's state. by is the label of
+// the session that asked for it.
+func (s *Server) startJob(req captureRequest, by string) (*job, *capture.Error) {
 	if s.captureDisabled != "" {
 		return nil, capture.Errorf(capture.CodeDisabled, "", "%s", s.captureDisabled)
 	}
@@ -60,7 +61,7 @@ func (s *Server) startJob(req captureRequest) (*job, *capture.Error) {
 	}
 	now := s.clock()
 	j := newJob(s.registry.newJobID(), now, reserve)
-	j.req, j.began = req, time.Now()
+	j.req, j.by, j.began = req, by, time.Now()
 	if e := s.registry.admit(j, now); e != nil {
 		return nil, e
 	}
@@ -484,7 +485,7 @@ func (r *jobRun) retain(p protection) error {
 func (r *jobRun) engineSection() (protection, error) {
 	s, j := r.s, r.j
 	// The capture has no id yet: the job holds the engine by its own.
-	if err := s.engine.acquire(r.ctx, holder{tool: "capture " + j.id}); err != nil {
+	if err := s.engine.acquire(r.ctx, holder{tool: "capture " + j.id, by: j.by}); err != nil {
 		return protection{}, cancelledError()
 	}
 	defer s.engine.release()
@@ -1015,16 +1016,24 @@ func (r *jobRun) end(status jobStatus, e *capture.Error) {
 }
 
 // done is a committed capture: it derives the open and compare results
-// under the engine, records them, and lets go of its pins.
+// under the engine, publishes them on the live page when there is one,
+// records them, and lets go of its pins.
 func (r *jobRun) done() {
 	s, j := r.s, r.j
 	m := r.txn.manifestOf(r.m, captureOK, nil)
 	j.set(func() { j.status, j.phase, j.derived, j.err = jobDone, "deriving", derivedPending, nil })
 	var res captureResult
-	if err := s.engine.acquire(s.ctx, holder{tool: "capture " + cmp.Or(j.captureIDNow(), j.id)}); err != nil {
+	if err := s.engine.acquire(s.ctx, holder{tool: "capture " + cmp.Or(j.captureIDNow(), j.id), by: j.by}); err != nil {
 		res = s.underived(m, r.base, "the server is shutting down")
 	} else {
 		res = s.derive(j, m, r.base)
+		if s.live != nil && res.Derived == "" {
+			if err := s.capturePublish(j, m, &res); err != nil {
+				res.Derived, res.DeriveError = derivedFailed, "publication: "+err.Error()
+				res.Recompute = new(s.recomputeFor(m, r.base, ""))
+				s.log.Warn("capture publication failed; the capture stays committed", "job", j.id, "err", res.DeriveError)
+			}
+		}
 		s.pins.release(j)
 		s.engine.release()
 	}

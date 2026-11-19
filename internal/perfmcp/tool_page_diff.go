@@ -101,7 +101,7 @@ func (s *Server) handlePageDiff(ctx context.Context, raw json.RawMessage) (mcpst
 	if err != nil {
 		return mcpstdio.Result{}, err
 	}
-	p, err := s.publishDiff(d, base, next, a.Title, node, mcpstdio.ClientLabel(ctx))
+	p, err := s.publishDiff(d, base, next, a.Title, node, mcpstdio.ClientLabel(ctx), true)
 	if _, ok := errors.AsType[*modelError](err); ok {
 		return mcpstdio.Result{}, fmt.Errorf("the diff cannot be drawn within this server's MaxPageBytes=%d: %v; "+
 			"%s; nothing was published", s.lim.MaxPageBytes, err, s.raiseAdvice("MaxPageBytes"))

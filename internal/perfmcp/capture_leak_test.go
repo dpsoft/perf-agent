@@ -227,7 +227,7 @@ func TestStartJobAfterCloseAndCloseTwice(t *testing.T) {
 	if err := e.s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_, ce := e.s.startJob(e.request(300 * time.Millisecond))
+	_, ce := e.s.startJob(e.request(300*time.Millisecond), "")
 	if ce == nil || ce.Code != capture.CodeClosing || ce.Retryable {
 		t.Fatalf("startJob after Close: %v", ce)
 	}

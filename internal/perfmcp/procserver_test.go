@@ -127,6 +127,9 @@ type procEnv struct {
 	// plain is a fake in the normal mode, for the servers that capture
 	// after the one under test.
 	plain func() string
+	// owner is the owner kind the servers run as, "" for stdio; their
+	// captures directory is that kind's default.
+	owner string
 }
 
 func newProcEnv(t *testing.T, fo capturetest.FakeOptions) *procEnv {
@@ -142,7 +145,7 @@ func newProcEnv(t *testing.T, fo capturetest.FakeOptions) *procEnv {
 
 // config is a server over the env with the job tests' limits.
 func (e *procEnv) config() procConfig {
-	return procConfig{Profiles: e.profiles, PerfAgent: e.fake, Capture: jobLimits().Capture}
+	return procConfig{Profiles: e.profiles, PerfAgent: e.fake, Owner: e.owner, Capture: jobLimits().Capture}
 }
 
 // plainConfig is config with a fake perf-agent in the normal mode.
@@ -163,7 +166,13 @@ func (e *procEnv) args(d string) map[string]any {
 	}
 }
 
-func (e *procEnv) captures() string { return filepath.Join(e.profiles, defaultStdioCaptures) }
+func (e *procEnv) captures() string {
+	dir := defaultStdioCaptures
+	if e.owner == ownerHub {
+		dir = defaultHubCaptures
+	}
+	return filepath.Join(e.profiles, dir)
+}
 
 func (e *procEnv) series() string { return filepath.Join(e.captures(), defaultSeries) }
 

@@ -210,7 +210,7 @@ func (s *Server) handlePageExplain(ctx context.Context, raw json.RawMessage) (mc
 
 	id := s.attempts.add(c.e.prof, a.View, a.Attempt, outcomePublished, nil)
 	s.recorded()
-	p, err := s.publishExplained(c.e, c.v, a.View, c.r, a.Title, id, mcpstdio.ClientLabel(ctx))
+	p, err := s.publishExplained(c.e, c.v, a.View, c.r, a.Title, id, mcpstdio.ClientLabel(ctx), true)
 	if err != nil {
 		s.attempts.setOutcome(id, outcomeFailed)
 		s.recorded()

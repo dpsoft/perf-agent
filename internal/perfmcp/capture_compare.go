@@ -17,18 +17,21 @@ import (
 // memory: Derived says "failed" (DeriveError says why; the capture stays
 // committed) or, for an answer read back from a manifest, "recompute" with
 // the calls that make them again. Handles is "reopen" when the handles are
-// not this server's open ones.
+// not this server's open ones. Publication and DiffPublication are the
+// capture's pages on the live page, on a server that has one.
 type captureResult struct {
-	Capture     captureInfo     `json:"capture"`
-	Profiles    []profileResult `json:"profiles"`
-	Compare     *compareResult  `json:"compare,omitzero"`
-	Evicted     []string        `json:"evicted,omitzero"`
-	Notes       []string        `json:"notes,omitzero"`
-	Cancel      string          `json:"cancel,omitzero"`
-	Derived     string          `json:"derived,omitzero"`
-	DeriveError string          `json:"derive_error,omitzero"`
-	Handles     string          `json:"handles,omitzero"`
-	Recompute   *recompute      `json:"recompute,omitzero"`
+	Capture         captureInfo     `json:"capture"`
+	Profiles        []profileResult `json:"profiles"`
+	Compare         *compareResult  `json:"compare,omitzero"`
+	Evicted         []string        `json:"evicted,omitzero"`
+	Notes           []string        `json:"notes,omitzero"`
+	Cancel          string          `json:"cancel,omitzero"`
+	Derived         string          `json:"derived,omitzero"`
+	DeriveError     string          `json:"derive_error,omitzero"`
+	Handles         string          `json:"handles,omitzero"`
+	Recompute       *recompute      `json:"recompute,omitzero"`
+	Publication     string          `json:"publication,omitzero"`
+	DiffPublication string          `json:"diff_publication,omitzero"`
 }
 
 // captureInfo is the capture itself, as its manifest records it.
@@ -327,7 +330,9 @@ func short(id string) string {
 // baseline's opens first, then m's, each bound by name, then a diff per
 // mode through the bindings, with CompareRows rows. A baseline that is
 // gone (baseGone says why) is left out with its diffs; without
-// compare_with there is none.
+// compare_with there is none. With the live page the recipe publishes
+// again as the capture did: the first mode's facts page, then, with the
+// baseline, its diff.
 func (s *Server) recomputeFor(m manifest, base *manifest, baseGone string) recompute {
 	r := recompute{Steps: []toolCall{}, Baseline: "none"}
 	modes := modesOf(m)
@@ -352,15 +357,27 @@ func (s *Server) recomputeFor(m manifest, base *manifest, baseGone string) recom
 		opens(*base, "base")
 	}
 	opens(m, "new")
-	if r.Baseline != "present" {
+	if r.Baseline == "present" {
+		for _, mode := range modes {
+			b, n := "base_"+string(mode), "new_"+string(mode)
+			r.Steps = append(r.Steps, toolCall{Tool: "diff", Arguments: map[string]any{
+				"base_handle": "${" + b + ".handle}", "base_view": "${" + n + ".default_view}",
+				"new_handle": "${" + n + ".handle}", "new_view": "${" + n + ".default_view}",
+				"limit": s.lim.Capture.CompareRows,
+			}})
+		}
+	}
+	if s.live == nil || len(modes) == 0 {
 		return r
 	}
-	for _, mode := range modes {
-		b, n := "base_"+string(mode), "new_"+string(mode)
-		r.Steps = append(r.Steps, toolCall{Tool: "diff", Arguments: map[string]any{
+	b, n := "base_"+string(modes[0]), "new_"+string(modes[0])
+	r.Steps = append(r.Steps, toolCall{Tool: "page_explain", Arguments: map[string]any{
+		"handle": "${" + n + ".handle}", "view": "${" + n + ".default_view}", "explanations": []any{},
+	}})
+	if r.Baseline == "present" {
+		r.Steps = append(r.Steps, toolCall{Tool: "page_diff", Arguments: map[string]any{
 			"base_handle": "${" + b + ".handle}", "base_view": "${" + n + ".default_view}",
 			"new_handle": "${" + n + ".handle}", "new_view": "${" + n + ".default_view}",
-			"limit": s.lim.Capture.CompareRows,
 		}})
 	}
 	return r

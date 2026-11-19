@@ -106,15 +106,17 @@ func descendantsOf(root int) []procRef {
 
 // captureCgroupsOf lists the capture cgroups the server pid made that are
 // still there: they are made in the cgroup the server was started in,
-// this test's own, and their names carry the server's pid.
-func captureCgroupsOf(pid int) []string {
+// this test's own, and their names carry the server's pid. Without a
+// delegated cgroup there is nothing to check, which is an error: these
+// tests capture, and a capture then runs without one.
+func captureCgroupsOf(pid int) ([]string, error) {
 	b, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	parent, _ := capture.DelegatedCgroup(b, "/sys/fs/cgroup")
+	parent, why := capture.DelegatedCgroup(b, "/sys/fs/cgroup")
 	if parent == "" {
-		return nil
+		return nil, errors.New(why)
 	}
 	mark := "-" + strconv.Itoa(pid) + "-"
 	var left []string
@@ -124,7 +126,21 @@ func captureCgroupsOf(pid int) []string {
 		}
 		return nil
 	})
-	return left
+	return left, nil
+}
+
+// cgroupProcs are the processes in the cgroup at path now.
+func cgroupProcs(path string) []procRef {
+	b, _ := os.ReadFile(filepath.Join(path, "cgroup.procs"))
+	var out []procRef
+	for f := range strings.FieldsSeq(string(b)) {
+		if pid, err := strconv.Atoi(f); err == nil {
+			if r, ok := procOf(pid); ok {
+				out = append(out, r)
+			}
+		}
+	}
+	return out
 }
 
 // eventually polls cond every 10 ms until it holds or d passes.
@@ -139,49 +155,88 @@ func eventually(d time.Duration, cond func() bool) bool {
 	}
 }
 
-// procWatch records the processes under the servers a test starts, so
-// that at the end of the test it can check each is gone, and that none of
-// those servers left a capture cgroup. A process still there is killed
-// by its PID, once its start time says it is the same process.
+// procWatch records, every watchEvery for the whole test, the processes
+// under the servers a test starts and those in their capture cgroups, so
+// that a process reparented away from a server is still known. At the end
+// of the test it checks each is gone, killing one still there by its PID
+// once its start time says it is the same process, and that none of
+// those servers left a capture cgroup: one still there is reported with
+// its processes, killed through cgroup.kill, and removed.
 type procWatch struct {
 	t       *testing.T
 	mu      sync.Mutex
-	roots   []int
+	roots   []procRef
 	watched []procRef
+	stop    chan struct{}
+	done    chan struct{}
 }
+
+const watchEvery = 50 * time.Millisecond
 
 // newProcWatch registers the check first, so it runs after the cleanups
 // that stop the servers.
 func newProcWatch(t *testing.T) *procWatch {
-	w := &procWatch{t: t}
+	w := &procWatch{t: t, stop: make(chan struct{}), done: make(chan struct{})}
+	go func() {
+		defer close(w.done)
+		tick := time.NewTicker(watchEvery)
+		defer tick.Stop()
+		for {
+			select {
+			case <-w.stop:
+				return
+			case <-tick.C:
+				w.watch()
+			}
+		}
+	}()
 	t.Cleanup(w.check)
 	return w
 }
 
 // add watches what runs under the server pid from now on.
 func (w *procWatch) add(pid int) {
+	r, ok := procOf(pid)
+	if !ok {
+		w.t.Fatalf("server pid %d is not running", pid)
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.roots = append(w.roots, pid)
+	w.roots = append(w.roots, r)
 }
 
-// watch records every process under the servers now and returns them.
+// watch records every process under the servers, and in their capture
+// cgroups, now and returns them. A server that is gone, whose PID may
+// hold another process, has nothing under it.
 func (w *procWatch) watch() []procRef {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	var now []procRef
 	for _, root := range w.roots {
-		now = append(now, descendantsOf(root)...)
+		if !root.gone() {
+			now = append(now, descendantsOf(root.pid)...)
+		}
+		cgs, _ := captureCgroupsOf(root.pid)
+		for _, cg := range cgs {
+			now = append(now, cgroupProcs(cg)...)
+		}
 	}
+	var out []procRef
 	for _, r := range now {
+		if !slices.Contains(out, r) {
+			out = append(out, r)
+		}
 		if !slices.Contains(w.watched, r) {
 			w.watched = append(w.watched, r)
 		}
 	}
-	return now
+	return out
 }
 
 func (w *procWatch) check() {
+	close(w.stop)
+	<-w.done
+	w.watch()
 	w.mu.Lock()
 	watched, roots := slices.Clone(w.watched), slices.Clone(w.roots)
 	w.mu.Unlock()
@@ -194,11 +249,25 @@ func (w *procWatch) check() {
 		}
 	}
 	for _, root := range roots {
-		var left []string
-		if !eventually(15*time.Second, func() bool { left = captureCgroupsOf(root); return len(left) == 0 }) {
-			w.t.Errorf("capture cgroups of server pid %d are left: %v", root, left)
-			for _, p := range left {
-				_ = os.Remove(p) // only an empty one goes
+		var (
+			left []string
+			err  error
+		)
+		if !eventually(15*time.Second, func() bool { left, err = captureCgroupsOf(root.pid); return err == nil && len(left) == 0 }) {
+			if err != nil {
+				w.t.Errorf("the capture cgroups of server pid %d cannot be checked: %v", root.pid, err)
+				continue
+			}
+			w.t.Errorf("capture cgroups of server pid %d are left: %v", root.pid, left)
+			for _, cg := range left {
+				if procs := cgroupProcs(cg); len(procs) > 0 {
+					w.t.Errorf("cgroup %s still holds %+v", cg, procs)
+					_ = os.WriteFile(filepath.Join(cg, "cgroup.kill"), []byte("1"), 0)
+					eventually(5*time.Second, func() bool { return len(cgroupProcs(cg)) == 0 })
+				}
+				if err := os.Remove(cg); err != nil {
+					w.t.Errorf("remove cgroup %s: %v", cg, err)
+				}
 			}
 		}
 	}
@@ -230,10 +299,10 @@ func startCaptureHub(t *testing.T, fake string, o hubOptions) *capHub {
 }
 
 // kill9 SIGKILLs the hub, after watching what runs under it, and reaps
-// it.
-func (h *capHub) kill9() {
+// it. It returns the processes under the hub just before the kill.
+func (h *capHub) kill9() []procRef {
 	h.t.Helper()
-	h.procs.watch()
+	under := h.procs.watch()
 	if err := h.cmd.Process.Kill(); err != nil {
 		h.t.Fatal(err)
 	}
@@ -245,6 +314,7 @@ func (h *capHub) kill9() {
 	if ee, ok := errors.AsType[*exec.ExitError](h.waitErr); !ok || ee.ExitCode() != -1 {
 		h.t.Fatalf("perf-agent-hub ended %v, not by the kill", h.waitErr)
 	}
+	return under
 }
 
 // sigterm sends SIGTERM and waits up to d for an exit 0, returning how
@@ -495,6 +565,27 @@ func dirNames(t testing.TB, dir string) []string {
 	return names
 }
 
+// publications are the ids of the publications the page lists now.
+func publications(t testing.TB, pageURL string) []string {
+	t.Helper()
+	var state struct {
+		Engine struct {
+			Publications []struct {
+				ID string `json:"id"`
+			} `json:"publications"`
+		} `json:"engine"`
+	}
+	code, body := httpGet(t, pageURL+"state")
+	if code != http.StatusOK || json.Unmarshal(body, &state) != nil {
+		t.Fatalf("GET state: %d %.200s", code, body)
+	}
+	ids := []string{}
+	for _, p := range state.Engine.Publications {
+		ids = append(ids, p.ID)
+	}
+	return ids
+}
+
 // TestHubCapturesOverHTTP: a capture over HTTP is accepted, ends done
 // with its derivations ready and a publication, which the page serves.
 func TestHubCapturesOverHTTP(t *testing.T) {
@@ -581,12 +672,17 @@ func TestDeleteAndEvictionNeverCancelAJob(t *testing.T) {
 					t.Errorf("%s's wait took %v, want [%v, %v]", w.name, w.got.took, w.min, w.max)
 				}
 			}
+			pubs := publications(t, h.pageURL())
 			if s := b.cancelCapture(job); s != "cancelling" {
 				t.Errorf("B's cancel: %q", s)
 			}
 			text, isErr := c.captureEnd(job)
 			if e := capErrorOf(t, text); !isErr || e.Code != string(capture.CodeCancelled) || e.Status != "cancelled" {
 				t.Errorf("C's wait after B's cancel: %s", text)
+			}
+			// A cancelled capture publishes nothing.
+			if after := publications(t, h.pageURL()); !slices.Equal(after, pubs) {
+				t.Errorf("the page lists %v after the cancel, %v before", after, pubs)
 			}
 
 			series := filepath.Join(h.profiles, hubCaptures, "adhoc")
@@ -822,14 +918,32 @@ func TestAnotherHubHoldsTheLease(t *testing.T) {
 	}
 }
 
+// The bound on a killed hub's capture being recorded interrupted by the
+// next hub. The dead hub's reaper ends its children and lets the captures
+// lock go within the stop grace. A recovery pass that finds the lock held
+// is run again after the busy retry (at most 5 s); one that finds the
+// dead hub's heartbeat younger than its stale bound (10 s) cannot judge
+// the owner gone and is run again a stale bound later; the slack is for a
+// loaded machine.
+const (
+	busyRetry     = 5 * time.Second
+	staleAfter    = 10 * time.Second
+	recoverySlack = 9 * time.Second
+	recoveryBound = stopGrace + busyRetry + staleAfter + recoverySlack
+)
+
 // TestAKilledHubIsRecoveredByTheNext: a hub SIGKILLed while it profiles,
 // and another started at once on the same runtime directory, port and
-// profiles root. Its reaper may still hold the captures lock for a while:
-// a wait by the capture id answers in_progress naming the dead hub, or
-// interrupted, and within the stop grace and 15 s, interrupted and
-// retryable. A capture started meanwhile is accepted, and ends done or
-// fails busy. The case where the reaper is held for certain is
-// perfmcp's TestADeadHubsReaperHoldsTheLease.
+// profiles root. The dead hub's reaper is held stopped until a wait by the
+// capture id has answered in_progress, naming the dead hub as gone and its
+// reaper as running; then it ends. From there the test only watches the
+// disk, so no wait of its own asks for recovery:
+// within recoveryBound the new hub's own passes write the capture's
+// interrupted manifest and remove its intent, and a wait then answers
+// interrupted, retryable. A capture started meanwhile is accepted, ends
+// done as another capture or fails busy, and leaves nothing behind
+// either. The case where the reaper is held for certain is perfmcp's
+// TestADeadHubsReaperHoldsTheLease.
 func TestAKilledHubIsRecoveredByTheNext(t *testing.T) {
 	fake := capturetest.FakePerfAgent(t, capturetest.FakeOptions{})
 	profiles, xdg := profilesDir(t), t.TempDir()
@@ -839,7 +953,28 @@ func TestAKilledHubIsRecoveredByTheNext(t *testing.T) {
 	if st := c1.waitCapture(job, profiling); st.Capture != "adhoc/001" {
 		t.Fatalf("the capture is %+v", st)
 	}
+	// The reaper is stopped before the hub is killed, so it still runs,
+	// holding the captures lock, when the new hub first looks: on its own
+	// it would end its children and exit within milliseconds of the kill.
 	dead := h1.cmd.Process.Pid
+	under := h1.procs.watch()
+	i := slices.IndexFunc(under, func(r procRef) bool { return r.ppid == dead && strings.HasPrefix(r.comm, "perf-agent-hub") })
+	if i < 0 {
+		t.Fatalf("no reaper under the hub: %+v", under)
+	}
+	reaper := under[i]
+	cont := sync.OnceFunc(func() {
+		if now, ok := procOf(reaper.pid); ok && now.start == reaper.start {
+			_ = syscall.Kill(reaper.pid, syscall.SIGCONT)
+		}
+	})
+	t.Cleanup(cont)
+	if err := syscall.Kill(reaper.pid, syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	if !eventually(10*time.Second, func() bool { r, _ := procOf(reaper.pid); return r.state == 'T' }) {
+		t.Fatal("the reaper never stopped")
+	}
 	h1.kill9()
 
 	h2 := startCaptureHub(t, fake, hubOptions{profiles: profiles, xdg: xdg, port: h1.port})
@@ -848,39 +983,71 @@ func TestAKilledHubIsRecoveredByTheNext(t *testing.T) {
 	restart := time.Now()
 	c2 := h2.client("two")
 	meanwhile := c2.capture(workloadArgs(t, "1s"))
-	deadline := restart.Add(stopGrace + 15*time.Second)
-	var answers []string
-	for {
-		text, isErr := c2.try("capture_wait", map[string]any{"id": "adhoc/001", "timeout": "1s"})
-		answers = append(answers, text)
-		if isErr {
-			e := capErrorOf(t, text)
-			if e.Status != "interrupted" || !e.Retryable || e.Capture != "adhoc/001" {
-				t.Fatalf("capture_wait adhoc/001: %s, want in_progress or interrupted", text)
-			}
-			break
+
+	// With the reaper running, the capture's owner is not gone yet: this
+	// wait asks for no recovery.
+	text, isErr := c2.try("capture_wait", map[string]any{"id": "adhoc/001", "timeout": "1s"})
+	var ip inProgress
+	if isErr || json.Unmarshal([]byte(text), &ip) != nil || ip.Status != "in_progress" || ip.Capture != "adhoc/001" {
+		t.Fatalf("capture_wait adhoc/001 at once: %s, want in_progress", text)
+	}
+	if want := fmt.Sprintf("pid %d, which is gone; its reaper pid %d still runs", dead, reaper.pid); !strings.Contains(ip.Holder, want) {
+		t.Errorf("holder %q, want it to say %q", ip.Holder, want)
+	}
+	cont()
+	if !eventually(10*time.Second, reaper.gone) {
+		t.Fatal("the dead hub's reaper did not end once continued")
+	}
+
+	series := filepath.Join(profiles, hubCaptures, "adhoc")
+	interrupted := func() bool {
+		var m struct {
+			Outcome string `json:"outcome"`
 		}
-		var ip inProgress
-		if json.Unmarshal([]byte(text), &ip) != nil || ip.Status != "in_progress" || ip.Capture != "adhoc/001" ||
-			!strings.Contains(ip.Holder, fmt.Sprintf("pid %d", dead)) {
-			t.Fatalf("capture_wait adhoc/001: %s, want in_progress naming the dead hub pid %d, or interrupted", text, dead)
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("not interrupted %v after the restart: %s", stopGrace+15*time.Second, strings.Join(answers, "\n"))
+		b, err := os.ReadFile(filepath.Join(series, "001-run.capture.json"))
+		_, intentErr := os.Lstat(filepath.Join(series, "001-run.intent.json"))
+		return err == nil && json.Unmarshal(b, &m) == nil && m.Outcome == "interrupted" && errors.Is(intentErr, fs.ErrNotExist)
+	}
+	for !interrupted() {
+		if time.Since(restart) > recoveryBound {
+			t.Fatalf("capture 001 was not recorded interrupted %v after the restart: %v", recoveryBound, dirNames(t, series))
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Logf("interrupted %v after the restart, after %d answers", time.Since(restart).Round(time.Millisecond), len(answers))
+	t.Logf("recorded interrupted %v after the restart", time.Since(restart).Round(time.Millisecond))
+	for {
+		text, isErr := c2.try("capture_wait", map[string]any{"id": "adhoc/001", "timeout": "1s"})
+		if !isErr {
+			var v struct{ Status string }
+			if json.Unmarshal([]byte(text), &v) == nil && v.Status == "loading" {
+				continue
+			}
+			t.Fatalf("capture_wait adhoc/001 after recovery: %s, want interrupted", text)
+		}
+		if e := capErrorOf(t, text); e.Status != "interrupted" || !e.Retryable || e.Capture != "adhoc/001" {
+			t.Errorf("capture_wait adhoc/001 after recovery: %s, want interrupted and retryable", text)
+		}
+		break
+	}
 
-	text, isErr := c2.captureEnd(meanwhile)
+	text, isErr = c2.captureEnd(meanwhile)
 	switch {
 	case !isErr:
 		var r capResult
-		if json.Unmarshal([]byte(text), &r) != nil || r.Capture.Capture == "" {
-			t.Errorf("the capture started meanwhile: %s", text)
+		if json.Unmarshal([]byte(text), &r) != nil || r.Capture.Capture == "" || r.Capture.Capture == "adhoc/001" {
+			t.Errorf("the capture started meanwhile: %s, want another capture than adhoc/001", text)
 		}
 	case capErrorOf(t, text).Code != string(capture.CodeBusy):
 		t.Errorf("the capture started meanwhile: %s, want done or busy", text)
+	}
+	if !interrupted() {
+		t.Error("capture 001 is no longer recorded interrupted")
+	}
+	for _, n := range dirNames(t, series) {
+		if strings.HasSuffix(n, ".intent.json") || strings.HasSuffix(n, ".intent.hb") ||
+			strings.HasPrefix(n, ".staging-") || strings.Contains(n, ".tmp-") {
+			t.Errorf("%s is left in the series after recovery", n)
+		}
 	}
 }
 
@@ -1139,11 +1306,16 @@ func TestEverySocketIsLoopbackWhileCapturing(t *testing.T) {
 		}
 	}
 
+	pubs := publications(t, pageURL)
 	if s := c.cancelCapture(job); s != "cancelling" {
 		t.Errorf("cancel: %q", s)
 	}
 	if text, isErr := c.captureEnd(job); !isErr || capErrorOf(t, text).Code != string(capture.CodeCancelled) {
 		t.Errorf("the cancelled capture: %s", text)
+	}
+	// A cancelled capture publishes nothing.
+	if after := publications(t, pageURL); !slices.Equal(after, pubs) || !slices.Equal(pubs, []string{pub}) {
+		t.Errorf("the page lists %v after the cancel, %v before; want only %s", after, pubs, pub)
 	}
 }
 

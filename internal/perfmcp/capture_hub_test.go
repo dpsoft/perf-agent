@@ -1,6 +1,7 @@
 package perfmcp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -681,6 +682,51 @@ func TestMultiSessionWaitsAndCancel(t *testing.T) {
 	}
 }
 
+// A wait whose call ends before the job settles (the client cancelled it,
+// its session ended, or the server is closing) answers an error naming the
+// job and its capture id, never the job's running state: a client that
+// reads it after a restart must wait by the capture id.
+func TestAWaitWhoseCallEndsNamesTheCaptureID(t *testing.T) {
+	e := newHubEnv(t, jobOpts{})
+	a := newMCPSession(t, e.s, "A")
+	job := hubCapture(t, a, hubArgs(t, "1m"))
+	v := hubWaitState(t, a, job, profiling)
+	if v.ID == "" {
+		t.Fatalf("a profiling job has no capture id: %+v", v)
+	}
+	waitEnded := func() (wireError, string) {
+		ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+		defer cancel()
+		text, isErr := a.call(ctx, "capture_wait", map[string]any{"id": job, "timeout": "30s"})
+		if !isErr {
+			t.Fatalf("a wait whose call ended answered %s", text)
+		}
+		return toolErrorOf(t, text), text
+	}
+
+	w, text := waitEnded()
+	if w.Code != string(capture.CodeCancelled) || w.Job != job || w.CaptureID != v.ID || w.Status != "" {
+		t.Errorf("a cancelled wait: %s", text)
+	}
+	if !strings.Contains(w.Message, v.ID) || !strings.Contains(w.Message, "not cancelled") || !strings.Contains(w.Next, "capture_wait") || !strings.Contains(w.Next, v.ID) {
+		t.Errorf("a cancelled wait says %q, next %q", w.Message, w.Next)
+	}
+
+	// As the hub stops: the captures are killed first, then every call's
+	// context ends. The job is left running here so the wait sees it.
+	e.s.killed.Store(true)
+	w, text = waitEnded()
+	if w.Code != string(capture.CodeClosing) || w.Job != job || w.CaptureID != v.ID || w.Status != "" {
+		t.Errorf("a wait on a closing server: %s", text)
+	}
+	if !strings.Contains(w.Message, v.ID) || !strings.Contains(w.Next, "restart") || !strings.Contains(w.Next, "capture_wait") || !strings.Contains(w.Next, v.ID) {
+		t.Errorf("a wait on a closing server says %q, next %q", w.Message, w.Next)
+	}
+	var ca cancelAnswer
+	a.callOK("capture_cancel", map[string]any{"id": job}, &ca)
+	hubWaitEnd(t, a, job)
+}
+
 // In the hub, with the registry evicted, waits by capture id read
 // the manifest through the lookup workers. While that read is blocked
 // each wait answers loading at its own deadline and starts no goroutine;
@@ -805,6 +851,9 @@ func TestFourSessionsRaceTheCaptureTools(t *testing.T) {
 	const maxPubs = 3
 	e := newHubEnv(t, jobOpts{limits: func(l *Limits) {
 		l.Capture.WindowCaptures = 1000
+		// The racing sessions finish many jobs; the steady one must stay
+		// in the registry, or its wait answers from the manifest.
+		l.Capture.MaxJobs = 4096
 		l.MaxPublications = maxPubs
 		l.MaxOpenHandles = 2
 	}})

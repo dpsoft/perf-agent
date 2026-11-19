@@ -1,20 +1,11 @@
 package mcphttp
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-)
 
-// compactID is a JSON-RPC id as compact JSON, the key a call is held under
-// in its session, so 7 and "7" are distinct and spacing is not.
-func compactID(raw json.RawMessage) string {
-	var b bytes.Buffer
-	if json.Compact(&b, raw) != nil {
-		return string(raw)
-	}
-	return b.String()
-}
+	"github.com/dpsoft/perf-agent/internal/mcpstdio"
+)
 
 // register holds cancel under s and key, and reports false, holding
 // nothing, when s already has a call in flight with that id. Called with
@@ -47,7 +38,7 @@ func (t *Transport) cancelNamed(s *session, params json.RawMessage) {
 	if json.Unmarshal(params, &p) != nil || len(p.RequestID) == 0 {
 		return
 	}
-	if cancel, ok := s.calls[compactID(p.RequestID)]; ok {
+	if cancel, ok := s.calls[mcpstdio.CompactID(p.RequestID)]; ok {
 		cancel()
 	}
 }

@@ -228,6 +228,29 @@ func TestABusyEngineAnswersWhoHoldsIt(t *testing.T) {
 	}
 }
 
+// The busy answer names the server, not another session, when the server's
+// own maintenance holds the engine: a capture step with no session label.
+func TestABusyEngineNamesTheServerForMaintenance(t *testing.T) {
+	for _, tc := range []struct {
+		h    holder
+		want string
+	}{
+		{holder{tool: "capture retention"}, `perf-agent-hub is busy with capture retention from the server (running 0s); call again`},
+		{holder{tool: "capture j1-ab12"}, `perf-agent-hub is busy with capture j1-ab12 from the server (running 0s); call again`},
+		{holder{tool: "capture j1-ab12", by: "codex"}, `perf-agent-hub is busy with capture j1-ab12 from "codex" (running 0s); call again`},
+		{holder{tool: "top"}, `perf-agent-hub is busy with top from another session (running 0s); call again`},
+	} {
+		s := &Server{engine: newEngine(), cmd: "perf-agent-hub"}
+		if err := s.engine.acquire(t.Context(), tc.h); err != nil {
+			t.Fatal(err)
+		}
+		if got := s.busyText(); got != tc.want {
+			t.Errorf("held by %+v: %q, want %q", tc.h, got, tc.want)
+		}
+		s.engine.release()
+	}
+}
+
 // A call whose context ends while it waits for the engine runs nothing,
 // and leaves the engine as it found it.
 func TestAWaiterWhoseContextEndsRunsNothing(t *testing.T) {

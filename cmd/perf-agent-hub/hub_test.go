@@ -26,6 +26,7 @@ import (
 	"github.com/dpsoft/perf-agent/internal/livehttp"
 	"github.com/dpsoft/perf-agent/internal/mcpflags"
 	"github.com/dpsoft/perf-agent/internal/mcphttp"
+	"github.com/dpsoft/perf-agent/internal/mcpstdio"
 	"github.com/dpsoft/perf-agent/internal/perfmcp"
 )
 
@@ -209,6 +210,32 @@ func TestShutdownOrder(t *testing.T) {
 	l.in.shutdown()
 	if got := recorded(); len(got) != len(want) {
 		t.Errorf("a second shutdown ran %v", got[len(want):])
+	}
+}
+
+// TestWarningsAreFlushedWhileTheHubRuns: the counts of the warnings the
+// MCP server only counted are logged every flushEvery while the hub runs,
+// not only when its transport closes, and the ticker stops at shutdown.
+func TestWarningsAreFlushedWhileTheHubRuns(t *testing.T) {
+	var flushed atomic.Int64
+	pEvery, pFlush := flushEvery, flushWarnings
+	t.Cleanup(func() { flushEvery, flushWarnings = pEvery, pFlush })
+	flushEvery = 20 * time.Millisecond
+	flushWarnings = func(s *mcpstdio.Server) { flushed.Add(1); pFlush(s) }
+
+	l := startLocal(t)
+	deadline := time.Now().Add(5 * time.Second)
+	for flushed.Load() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("flushed %d times in 5s at every %v", flushed.Load(), flushEvery)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	l.in.shutdown()
+	after := flushed.Load()
+	time.Sleep(10 * flushEvery)
+	if n := flushed.Load(); n != after {
+		t.Errorf("flushed %d more times after shutdown", n-after)
 	}
 }
 

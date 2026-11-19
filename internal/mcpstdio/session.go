@@ -305,7 +305,7 @@ func (ss *session) take(line []byte, oversized bool) {
 		ss.send(errorResponse(env.ID, codeServerBusy, fmt.Sprintf("server busy: %d requests queued; retry", ss.s.o.MaxQueued)))
 		return
 	}
-	ss.queue = append(ss.queue, &request{env: env, key: compactID(env.ID), received: time.Now()})
+	ss.queue = append(ss.queue, &request{env: env, key: CompactID(env.ID), received: time.Now()})
 	ss.mu.Unlock()
 	ss.wakeDispatcher()
 }
@@ -335,7 +335,7 @@ func (ss *session) cancelRequest(params json.RawMessage) {
 	if json.Unmarshal(params, &p) != nil || !validID(p.RequestID) {
 		return
 	}
-	key := compactID(p.RequestID)
+	key := CompactID(p.RequestID)
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	if r := ss.running; r != nil && r.key == key {
@@ -348,7 +348,9 @@ func (ss *session) cancelRequest(params json.RawMessage) {
 	}
 }
 
-func compactID(raw json.RawMessage) string {
+// CompactID is a JSON-RPC id as compact JSON, the key a request is held
+// under in its session, so 7 and "7" are distinct and spacing is not.
+func CompactID(raw json.RawMessage) string {
 	var b bytes.Buffer
 	if json.Compact(&b, raw) != nil {
 		return string(raw)

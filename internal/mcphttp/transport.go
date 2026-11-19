@@ -339,7 +339,7 @@ func (t *Transport) post(w http.ResponseWriter, rc *http.ResponseController, r *
 		t.refuseBusy(w, rc, req.ID, busy)
 		return
 	}
-	key := compactID(req.ID)
+	key := mcpstdio.CompactID(req.ID)
 	ctx, cancel := context.WithCancel(t.life)
 	defer cancel()
 	if !t.register(s, key, cancel) {

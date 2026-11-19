@@ -82,4 +82,15 @@ func TestPublicationsAndSteeringRecordBy(t *testing.T) {
 	if p := s.live.snapshot().pubs["p1"]; p.by != "claude-code" {
 		t.Errorf("p1.by = %q", p.by)
 	}
+	// page_open's rows name who made each publication too.
+	var opened struct {
+		Publications []struct {
+			ID string `json:"id"`
+			By string `json:"by"`
+		} `json:"publications"`
+	}
+	claude.callOK("page_open", map[string]any{}, &opened)
+	if len(opened.Publications) != 2 || opened.Publications[0].By != "claude-code" || opened.Publications[1].By != "codex" {
+		t.Errorf("page_open's rows: %+v", opened.Publications)
+	}
 }

@@ -11,6 +11,10 @@ import (
 // before the connection is dropped.
 const refuseReadWindow = 100 * time.Millisecond
 
+// clearSiteData is the Clear-Site-Data value that clears the origin's
+// storage: its service workers, caches and web storage, not its cookies.
+const clearSiteData = `"storage"`
+
 // Front is the one handler of the hub's listener. It sets the security
 // headers on every answer, refuses with 403 a Host that is not this machine
 // (DNS rebinding), and routes by path:
@@ -18,6 +22,13 @@ const refuseReadWindow = 100 * time.Millisecond
 //   - POST /s/<page>/inbox to inbox;
 //   - any other /s/<page>[/…] to pages;
 //   - anything else, a wrong or missing page token included, gets 404.
+//
+// Every 404 it answers, and every answer on the shell's route, also
+// clears the origin's storage (clearSiteData). The page keeps nothing
+// there; a service worker that a program squatting on the port registered
+// while the hub was down does live there. The browser's update check of
+// that worker asks the real hub for its script, gets a 404 and the worker
+// is cleared; so is it when the shell itself reaches the hub.
 //
 // The page token is compared here in constant time as well as in the guards
 // below, so a wrong token gets the same 404 whatever the method or body.
@@ -34,8 +45,12 @@ func Front(page Token, mcp, inbox, pages http.Handler) http.Handler {
 		}
 		seg, after, ok := pageSegment(r.URL.Path)
 		if !ok || !samePageToken(seg, page) {
+			w.Header().Set("Clear-Site-Data", clearSiteData)
 			refuse(w, http.StatusNotFound, "not found")
 			return
+		}
+		if after == "" {
+			w.Header().Set("Clear-Site-Data", clearSiteData)
 		}
 		if r.Method == http.MethodPost && after == "inbox" {
 			inbox.ServeHTTP(w, r)

@@ -17,6 +17,7 @@ import (
 	"github.com/dpsoft/perf-agent/internal/livehttp"
 	"github.com/dpsoft/perf-agent/internal/mcpflags"
 	"github.com/dpsoft/perf-agent/internal/mcphttp"
+	"github.com/dpsoft/perf-agent/internal/mcpstdio"
 	"github.com/dpsoft/perf-agent/internal/perfmcp"
 	"github.com/dpsoft/perf-agent/internal/perfpage"
 )
@@ -62,6 +63,14 @@ const (
 	httpGrace = time.Second
 	stepWait  = mcpflags.BlockedWait
 	closeWait = 500 * time.Millisecond
+)
+
+// flushEvery is how often the hub logs how many warnings the MCP server
+// only counted: the transport logs them once more when it closes.
+// flushWarnings logs them; both are seams for tests.
+var (
+	flushEvery    = time.Minute
+	flushWarnings = (*mcpstdio.Server).FlushWarnings
 )
 
 // configHook, when set, adjusts the server's configuration before it is
@@ -113,6 +122,34 @@ type instance struct {
 	// served gets the HTTP server's error should it stop on its own.
 	served chan error
 	once   sync.Once
+	// stopFlush stops the periodic flush of the warnings and waits for
+	// it; nil until it starts.
+	stopFlush func()
+}
+
+// flushPeriodically logs the MCP server's counted warnings every
+// flushEvery until stopFlush. FlushWarnings logs off its caller's
+// goroutine, so a full stderr never holds the ticker or stopFlush.
+func (in *instance) flushPeriodically() {
+	mcp := in.srv.MCP()
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		tick := time.NewTicker(flushEvery)
+		defer tick.Stop()
+		for {
+			select {
+			case <-tick.C:
+				flushWarnings(mcp)
+			case <-stop:
+				return
+			}
+		}
+	}()
+	in.stopFlush = sync.OnceFunc(func() {
+		close(stop)
+		<-done
+	})
 }
 
 // start starts the hub, in this order: the runtime directory and its
@@ -167,6 +204,7 @@ func start(ctx context.Context, o options) (_ *instance, err error) {
 	if in.srv, err = perfmcp.New(cfg); err != nil {
 		return nil, err
 	}
+	in.flushPeriodically()
 	hub := cfg.Limits.Hub
 	in.tr = mcphttp.New(in.srv.MCP(), mcphttp.Options{
 		MaxSessions:          hub.MaxSessions,
@@ -221,6 +259,9 @@ func start(ctx context.Context, o options) (_ *instance, err error) {
 // closed, and the runtime files it may have written are removed.
 func (in *instance) undo() {
 	in.once.Do(func() {
+		if in.stopFlush != nil {
+			in.stopFlush()
+		}
 		if in.tr != nil {
 			in.tr.Close()
 		}
@@ -237,12 +278,14 @@ func (in *instance) undo() {
 	})
 }
 
-// shutdown stops the hub, each step bounded, in this order:
+// shutdown stops the periodic flush of the warnings (the transport's
+// close logs the last counts), then stops the hub, each step bounded, in
+// this order:
 //  1. the running capture is killed: its reaper ends it whatever follows;
 //  2. the page's streams end, so the HTTP server has none to wait for;
 //  3. the transport closes: every call's context ends, so a capture_wait
-//     or a wait for the engine answers at once, and later requests get
-//     503;
+//     (with an error naming the capture id) or a wait for the engine
+//     answers at once, and later requests get 503;
 //  4. the HTTP server stops listening and gives the answers being written
 //     httpGrace, then drops every connection;
 //  5. the perfmcp server closes;
@@ -251,6 +294,7 @@ func (in *instance) undo() {
 // A second shutdown does nothing.
 func (in *instance) shutdown() {
 	in.once.Do(func() {
+		in.stopFlush()
 		mcpflags.Bounded(stepWait, func() { killCaptures(in.srv) })
 		mcpflags.Bounded(stepWait, func() { closeEvents(in.events) })
 		mcpflags.Bounded(stepWait, func() { closeTransport(in.tr) })

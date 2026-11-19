@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,8 +31,9 @@ type engine struct {
 }
 
 // holder is who holds the engine: a tool and the label of the session
-// that called it, a capture job ("capture <id>") or maintenance ("capture
-// retention"), with by empty; since is when it took the engine.
+// that called it; a capture job ("capture <id>") and the label of the
+// session that started it (j.by); or maintenance ("capture retention"),
+// with by empty. since is when it took the engine.
 type holder struct {
 	tool, by string
 	since    time.Time
@@ -125,8 +127,9 @@ func (s *Server) engineHandler(tool string, h mcpstdio.Handler) mcpstdio.Handler
 }
 
 // busyText is the answer to a call that waited MaxEngineWait for the
-// engine: who holds it and for how long, in whole seconds. A holder with
-// no session label (a capture job, maintenance) is "another session".
+// engine: who holds it and for how long, in whole seconds. A capture step
+// with no session label (maintenance, or a job no session label started)
+// is "the server"; any other holder with no label is "another session".
 func (s *Server) busyText() string {
 	h, ok := s.engine.holding()
 	if !ok {
@@ -136,8 +139,11 @@ func (s *Server) busyText() string {
 	// The label is the client's own text, shown to another session: it is
 	// quoted.
 	from := "another session"
-	if h.by != "" {
+	switch {
+	case h.by != "":
 		from = strconv.Quote(h.by)
+	case strings.HasPrefix(h.tool, "capture "):
+		from = "the server"
 	}
 	return fmt.Sprintf("%s is busy with %s from %s (running %ds); call again",
 		s.command(), h.tool, from, int64(time.Since(h.since)/time.Second))

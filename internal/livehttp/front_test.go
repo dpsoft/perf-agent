@@ -143,6 +143,41 @@ func TestFrontRoutesByPathAndChecksHost(t *testing.T) {
 	}
 }
 
+// Every 404 and the page shell clear the origin's storage, service workers
+// included: a worker a port squatter registered while the hub was down is
+// cleared by the browser's update check, which the real hub answers 404,
+// or by the next load of the shell. The page keeps nothing in storage.
+func TestFrontClearsSiteStorageOn404AndTheShell(t *testing.T) {
+	const want = `"storage"`
+	cases := []struct {
+		method, path string
+		clears       bool
+	}{
+		{"GET", "/sw.js", true},
+		{"GET", "/", true},
+		{"GET", "/s/wrong/", true},
+		{"GET", "/s/wrong/sw.js", true},
+		{"POST", "/s/wrong/inbox", true},
+		{"GET", "/s/pagetok/", true},
+		{"GET", "/s/pagetok", true},
+		{"GET", "/s/pagetok/state", false},
+		{"GET", "/s/pagetok/assets/live.js", false},
+		{"POST", "/s/pagetok/inbox", false},
+		{"POST", "/mcp", false},
+	}
+	for _, tc := range cases {
+		f := newFrontRig("pagetok")
+		w := answer(f.front, httptest.NewRequest(tc.method, "http://127.0.0.1:7341"+tc.path, nil))
+		got := w.Header().Get("Clear-Site-Data")
+		if tc.clears && got != want {
+			t.Errorf("%s %s (%d): Clear-Site-Data %q, want %q", tc.method, tc.path, w.Code, got, want)
+		}
+		if !tc.clears && got != "" {
+			t.Errorf("%s %s (%d): Clear-Site-Data %q, want none", tc.method, tc.path, w.Code, got)
+		}
+	}
+}
+
 // theSevenHeaders are written out here rather than read from securityHeaders,
 // so that dropping one there fails this test.
 var theSevenHeaders = [...][2]string{

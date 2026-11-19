@@ -103,11 +103,14 @@ func (s *Server) pageShowTool() mcpstdio.Tool {
 
 type pageOpenArgs struct{}
 
+// pageListed is a publication as page_open lists it; by is the label of
+// the session that made it, left out for none.
 type pageListed struct {
 	ID    string  `json:"id"`
 	Kind  pubKind `json:"kind"`
 	Title string  `json:"title"`
 	View  string  `json:"view"`
+	By    string  `json:"by,omitzero"`
 }
 
 type pageOpened struct {
@@ -136,7 +139,7 @@ func (s *Server) handlePageOpen(_ context.Context, raw json.RawMessage) (mcpstdi
 	out := pageOpened{URL: url, Current: snap.current, Publications: []pageListed{}, Viewers: s.viewers()}
 	for _, id := range snap.order {
 		p := snap.pubs[id]
-		out.Publications = append(out.Publications, pageListed{ID: p.id, Kind: p.kind, Title: p.title, View: p.view})
+		out.Publications = append(out.Publications, pageListed{ID: p.id, Kind: p.kind, Title: p.title, View: p.view, By: p.by})
 	}
 	return s.respond("page_open", s.shrinkPage(), out)
 }

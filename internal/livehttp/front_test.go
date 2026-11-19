@@ -178,6 +178,36 @@ func TestFrontClearsSiteStorageOn404AndTheShell(t *testing.T) {
 	}
 }
 
+// The hub serves no service worker script, so a worker's script fetch,
+// its registration or its update check, gets 404 and clears the site's
+// storage on any path: a squatter's worker registered from /mcp or a page
+// path is dropped by its update check too. No handler sees it.
+func TestFrontRefusesAServiceWorkerScriptFetch(t *testing.T) {
+	headers := []map[string]string{
+		{"Service-Worker": "script"},
+		{"Sec-Fetch-Dest": "serviceworker"},
+		{"Service-Worker": "script", "Sec-Fetch-Dest": "serviceworker", "Sec-Fetch-Mode": "same-origin"},
+	}
+	for _, h := range headers {
+		for _, path := range []string{"/mcp", "/s/pagetok/", "/s/pagetok/assets/live.js", "/s/pagetok/inbox", "/sw.js"} {
+			for _, method := range []string{"GET", "POST"} {
+				f := newFrontRig("pagetok")
+				req := httptest.NewRequest(method, "http://127.0.0.1:7341"+path, nil)
+				for k, v := range h {
+					req.Header.Set(k, v)
+				}
+				w := answer(f.front, req)
+				if w.Code != http.StatusNotFound || w.Header().Get("Clear-Site-Data") != `"storage"` {
+					t.Errorf("%v %s %s: status %d, Clear-Site-Data %q; want 404 clearing storage", h, method, path, w.Code, w.Header().Get("Clear-Site-Data"))
+				}
+				if n := f.total(); n != 0 {
+					t.Errorf("%v %s %s: %d handler calls, want none", h, method, path, n)
+				}
+			}
+		}
+	}
+}
+
 // theSevenHeaders are written out here rather than read from securityHeaders,
 // so that dropping one there fails this test.
 var theSevenHeaders = [...][2]string{

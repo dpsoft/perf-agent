@@ -531,14 +531,6 @@ func newLiveServer(t *testing.T) *liveServer {
 		w.Header().Set("Content-Type", typ)
 		_, _ = w.Write(body)
 	})
-	// A service worker of the kind a port squatter would register: it
-	// takes control of the pages in its scope at once.
-	mux.HandleFunc("GET /test-sw.js", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-		_, _ = w.Write([]byte(`self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
-`))
-	})
 	mux.HandleFunc("GET /state", func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.stateGets++
@@ -583,7 +575,20 @@ self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
 		s.guarded = append(s.guarded, rec.code)
 		s.mu.Unlock()
 	})
-	s.srv = httptest.NewServer(livehttp.Front(tok, http.NotFoundHandler(), inbox, livehttp.Guard(tok, mux)))
+	front := livehttp.Front(tok, http.NotFoundHandler(), inbox, livehttp.Guard(tok, mux))
+	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A service worker of the kind a port squatter would register,
+		// served beside the front door, which refuses every worker
+		// script: it takes control of the pages in its scope at once.
+		if r.URL.Path == "/test-sw.js" {
+			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+			_, _ = w.Write([]byte(`self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+`))
+			return
+		}
+		front.ServeHTTP(w, r)
+	}))
 	t.Cleanup(s.close)
 	s.url = s.srv.URL + "/s/" + string(tok) + "/"
 	return s
@@ -2000,7 +2005,7 @@ func TestLivePageWarnsOfAServiceWorkerInChrome(t *testing.T) {
 	tab.waitFor("p1 b", func(d liveDOM) bool { return d.SelName == "b" })
 	warn := `(() => { const e = document.getElementById('sw-warn'); return e.hidden ? '' : e.textContent; })()`
 	assert.Empty(t, tab.eval(warn), "no worker, no warning")
-	tab.eval(`navigator.serviceWorker.register('test-sw.js'), ''`)
+	tab.eval(`navigator.serviceWorker.register('/test-sw.js'), ''`)
 	got := tab.waitText(warn)
 	assert.True(t, strings.HasPrefix(got, "A service worker that perf-agent did not install controls this page"), got)
 	assert.Empty(t, tab.errors())

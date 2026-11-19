@@ -3,6 +3,7 @@ package livehttp
 import (
 	"crypto/subtle"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 )
@@ -23,6 +24,8 @@ const clearSiteData = `"storage"`
 //   - any other /s/<page>[/…] to pages;
 //   - anything else, a wrong or missing page token included, gets 404.
 //
+// Before routing, a service worker's script fetch (Service-Worker: script,
+// or Sec-Fetch-Dest: serviceworker) gets 404 on any path, /mcp included.
 // Every 404 it answers, and every answer on the shell's route, also
 // clears the origin's storage (clearSiteData). The page keeps nothing
 // there; a service worker that a program squatting on the port registered
@@ -37,6 +40,11 @@ func Front(page Token, mcp, inbox, pages http.Handler) http.Handler {
 		setSecurityHeaders(w.Header())
 		if !LoopbackHost(r.Host) {
 			refuse(w, http.StatusForbidden, "bad Host")
+			return
+		}
+		if workerScriptFetch(r.Header) {
+			w.Header().Set("Clear-Site-Data", clearSiteData)
+			refuse(w, http.StatusNotFound, "not found")
 			return
 		}
 		if r.URL.Path == "/mcp" {
@@ -58,6 +66,15 @@ func Front(page Token, mcp, inbox, pages http.Handler) http.Handler {
 		}
 		pages.ServeHTTP(w, r)
 	})
+}
+
+// workerScriptFetch reports a browser's fetch of a service worker's script,
+// to register the worker or to check it for an update. The hub serves no
+// worker, so such a fetch, on any path, can only be for a worker someone
+// else registered on this origin.
+func workerScriptFetch(h http.Header) bool {
+	return slices.Contains(h.Values("Service-Worker"), "script") ||
+		slices.Contains(h.Values("Sec-Fetch-Dest"), "serviceworker")
 }
 
 // pageSegment splits /s/<seg>[/<after>] into seg and after.

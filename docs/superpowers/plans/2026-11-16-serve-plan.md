@@ -1,5 +1,7 @@
 # The hub binary, perf-agent-hub (M2c-serve) Implementation Plan
 
+> **Note:** the default port is **7362**, not 7341 as this plan first wrote (ruling SRV-R16: 7341 lies in the 7300–7359 range IANA assigns to swx; 7362 is in the unassigned 7360–7364). Read every 7341 below as 7362.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A second, long-lived binary, `perf-agent-hub`, gives the human layer one loopback server. It serves the M2b live page and speaks MCP over Streamable HTTP behind a bearer token, so several Claude Code and Codex sessions share one engine and one page. The user's clicks reach agents through an inbox they read with `page_state`. The plain stdio `perf-agent-mcp` goes back to linking no networking.

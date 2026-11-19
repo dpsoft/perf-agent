@@ -264,7 +264,7 @@ It takes the stdio server's flags (`--profiles`, `--source`, `--source-manifest`
 | `--port N` | The port, default 7362. The hub listens on `127.0.0.1` only; there is no address flag. A port in use exits 1, naming `--port`. |
 | `--runtime-dir DIR` | The runtime directory. The default, `$XDG_RUNTIME_DIR/perf-agent-mcp`, is created when missing; without `XDG_RUNTIME_DIR` this flag must be given, and a directory given with `--runtime-dir` must exist. It must be a directory of yours with mode 0700, not a symbolic link, or the hub refuses to start. |
 
-It runs in the foreground until SIGINT or SIGTERM. It prints the page URL once on stdout and logs to stderr; no log line carries a token. The URL holds the page's token: open it in your browser and give it to nobody. `perf-agent-hub url` prints it again. A second hub exits 1 with `perf-agent-hub is already running (pid N, port P)`: one runs per user.
+It runs in the foreground until SIGINT or SIGTERM. It prints the page URL once on stdout and logs to stderr; no log line carries a token. The URL holds the page's token: paste it into a browser that is already running and give it to nobody. Do not pass it on a command line, as in `xdg-open URL`: any local user can read a process's arguments in `/proc/<pid>/cmdline`. `perf-agent-hub url` prints it again. A second hub on the same runtime directory exits 1 with `perf-agent-hub is already running (pid N, port P)`: one runs per runtime directory. A second hub given another `--runtime-dir` and `--port` does start, as a separate hub; its clients' helpers then need that `--runtime-dir`.
 
 The runtime directory holds `hub.lock`, locked while the hub runs; `hub.json`, the pid, port, MCP URL, start time and version, and no token; `mcp-token`, the MCP token; and `page-url`. Each file is mode 0600. `hub.json`, `mcp-token` and `page-url` are removed at exit, and `hub.lock` stays, unlocked; a hub that died leaves them, and the next one removes them once it holds the lock. Both tokens, the MCP one and the page's, are new at each start.
 
@@ -291,10 +291,12 @@ Claude Code (a project's `.mcp.json`, a file passed to `--mcp-config`, or the JS
 Codex (`~/.codex/config.toml`):
 
 ```toml
-[mcp_servers.perf-agent-live]
+[mcp_servers.perf_agent_live]
 url = "http://127.0.0.1:7362/mcp"
 http_headers_helper = "perf-agent-hub token --port 7362"
 ```
+
+Give Codex a server name without hyphens, as `perf_agent_live` here. Codex shows its model the name with hyphens turned into underscores; with the server named `perf-agent-live`, the model called `perf_agent_live` and got `unknown MCP server`. A hub named `perf_agent` would also take the name Codex gives a stdio entry named `perf-agent`.
 
 - The helper's port must be the URL's. With `--port N`, change both. `token --url http://127.0.0.1:N/mcp` takes the URL itself instead.
 - Write `127.0.0.1`, never `localhost`, which may resolve to `::1`, where the hub does not listen; `token --url` refuses it.
@@ -306,7 +308,7 @@ http_headers_helper = "perf-agent-hub token --port 7362"
 
 **No hub running.** A client configured for the hub shows it as failed to connect, and the agent has no perf-agent tools. Start the hub, then reconnect the client (`/mcp` in Claude Code).
 
-**A restart.** Stopping the hub kills its running capture, ends the page's streams (open tabs say the server is not running), ends every session and removes the runtime files. Everything held in memory goes: handles, attempts, publications and the inbox. The new hub has new tokens and a new page URL (`perf-agent-hub url`). A client's next request gets 401 for the old token: Claude Code then runs its helper again and retries the call once, and starts a new session on the 404 its old one gets. Whether Codex runs its helper again after a 401 is not verified yet; if it keeps failing, restart Codex. The agent opens its profiles again, since its old handles are unknown. Captures on disk stay: `capture_wait` by capture id and `capture_list` read their manifests.
+**A restart.** Stopping the hub kills its running capture, ends the page's streams (open tabs say the server is not running), ends every session and removes the runtime files. Everything held in memory goes: handles, attempts, publications and the inbox. The new hub has new tokens and a new page URL (`perf-agent-hub url`). A client's next request gets 401 for the old token: Claude Code then runs its helper again and retries the call once, and starts a new session on the 404 its old one gets. Codex does the same: its DELETE of the old session gets 404, it runs its helper again and initializes a new session with the new token. The agent opens its profiles again, since its old handles are unknown. Captures on disk stay: `capture_wait` by capture id and `capture_list` read their manifests.
 
 ### What the hub adds
 
@@ -320,7 +322,7 @@ It has every stdio tool, and five more, plus the resource `perf-agent://page/sta
 | `page_show` | Steer the page: make a kept publication current, select a node, or lay the graph out from it. |
 | `page_state` | What the user did on the page (see The inbox and page_state). |
 
-The page keeps `MaxPublications` publications, each with `by`, the label of the session that made it (its client's name). A tool that needs the engine while another agent's call holds it waits up to `MaxEngineWait` and is then answered with who holds it; the capture tools and `page_state` never wait for it.
+The page keeps `MaxPublications` publications, each with `by`, the label of the session that made it (its client's name, such as `claude-code` or `codex-mcp-client`). Sessions of one client share its label, so `by` names the client, not the session. The page lists each publication's `by`, and names the session that put the current one on screen; `page_open` lists `by` too. A tool that needs the engine while another agent's call holds it waits up to `MaxEngineWait` and is then answered with who holds it; the capture tools and `page_state` never wait for it.
 
 ### The inbox and page_state
 
@@ -343,7 +345,7 @@ The page's reports are the only thing a browser can send the hub: a POST from th
 - **Jobs are the server's.** Any session may `capture_wait` or `capture_cancel` any job, several may wait on one at once, and a session's end never cancels a job.
 - **Published on the page.** `capture` takes `show` (default true). A committed capture is published: a facts page of its first mode's default view, titled `<series>/NNN-<label> · <comm> (<pid>) · <mode> · <profiled duration>`, and with `compare_with` also a diff against the baseline. With `show` the page switches to the diff, else to the facts page; `show: false` only lists them. The result names them in `publication` and `diff_publication`. The facts page is the server's, not an agent's attempt: it records none and takes no place in `MaxAttemptViews`. A failed publication is `derived: "failed"` and the capture stays committed; when the diff fails, the facts page stays.
 - **Recompute.** On the hub, `recompute` ends with a `page_explain` (`explanations: []`, the same title) and, with a baseline, a `page_diff`, which publish the capture again. That `page_explain` is the agent's call, so it is an attempt.
-- **Retention.** Retention never removes a capture a kept publication shows: a series can hold `Capture.KeepPerSeries` unkept captures plus those its publications show, at most `MaxPublications` more.
+- **Retention.** As on stdio, retention never removes a capture whose files are open in the store, which holds at most `MaxOpenHandles` (32 on the hub). Nor does it remove a capture a kept publication shows. So a series can hold `Capture.KeepPerSeries` unkept captures plus those open in the store and those its publications show, at most `MaxPublications` more.
 
 ### Threat model
 
@@ -352,6 +354,7 @@ The hub carries tool-calling authority over TCP, lives long and accepts one kind
 - **Loopback only.** It listens on `127.0.0.1` and opens no outgoing connection: the source scan covers its packages too, and a test checks that every socket of a running hub is on loopback. A request whose `Host` is not a loopback name or address gets 403, which stops DNS rebinding.
 - **`/mcp`** refuses, from the headers alone and before any body byte is read: a request with `Origin`, `Sec-Fetch-Site` or `Sec-Fetch-Dest` (403: no browser is a client; `Sec-Fetch-Mode` alone passes, since Node clients send it); a missing or wrong bearer token (401, compared in constant time, with no `WWW-Authenticate`, so no client starts an OAuth flow); an `Accept` that does not admit both `application/json` and `text/event-stream`, or a `Content-Type` other than `application/json` (400); a body without `Content-Length` (411); and one over `MaxMessageBytes` (413). There is no CORS.
 - **The page token** reads the page and sends reports, and nothing else: no tool call follows from a leaked page URL. A restart makes new tokens.
+- **The page's port while the hub is down.** Never open the page's address while the hub is not running. Another local user's program listening on that port meanwhile could serve a page that registers a service worker for `http://127.0.0.1:7362/`, and the worker would read and change the real page once the hub is back. The hub answers every unknown path, and its page, with `Clear-Site-Data: "storage"` (the page keeps nothing in storage), so the browser drops such a worker when it checks the worker's script against the hub or loads the page from it. The page also warns when a service worker controls it: then close its tabs, clear the site's data and open the URL again.
 - **Another local user** can connect, but cannot read the 0600 token files in your 0700 runtime directory, nor guess a 256-bit token. It can listen on a port the hub is not on (see A port the hub is not on). It can fill the listener: the hub holds at most 512 connections, and closes one that sends nothing for 2 s; it recovers once they stop. That is inherent to a TCP port on a shared machine.
 - **A process running as you** can read `mcp-token` and call every tool, `capture` included; it could run your setcap'd perf-agent itself. That is why headless use stays on stdio.
 - **An agent holding the token** is bounded by the `Hub.*` limits: excess gets 503 at once. While `Hub.MaxIngressReaders` bodies are being read, new requests get 503 until a body arrives or `Hub.IngressBodyTimeout` drops it; one reader and 64 KiB are kept for bodies of at most 64 KiB, so a cancel or ping still gets through a flood of large slow bodies. At most 64 answers are written at once.

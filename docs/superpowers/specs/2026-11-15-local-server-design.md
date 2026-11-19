@@ -241,7 +241,8 @@ package, and the restored M2 test proves it (§D7).
 - **One per user.** The server takes `flock` on
   `$RUNTIME/perf-agent-mcp/hub.lock`. A second instance exits with
   code 1, saying `perf-agent-hub is already running (pid N, port
-  P)`.
+  P)`. Strictly it is one per runtime directory: a second hub given
+  another `--runtime-dir` and `--port` starts.
 - **Port [user, decision 8.2].** The server listens on a fixed loopback
   port, `127.0.0.1:<default>`, which `--port N` changes.
   - **This amends M2b-R7.** A port flag is allowed; an address flag never
@@ -255,13 +256,23 @@ package, and the restored M2 test proves it (§D7).
   - The default is **7362**, in IANA's unassigned 7360–7364 (SRV-R16;
     7341, the plan's first pick, lies in the 7300–7359 range assigned
     to swx).
-- **Stop.** On SIGINT or SIGTERM:
-  1. stop accepting connections;
-  2. close the page hub (streams end, and pages show M2b's "not running"
-     banner);
-  3. kill running captures (capture design §6.6);
-  4. give in-flight tool calls the 1 s grace of M2-R27, then exit;
-  5. remove `hub.json` and the token file.
+- **Stop.** On SIGINT or SIGTERM, each step bounded:
+  1. kill the running capture (`KillCaptures`, capture design §6.6): its
+     reaper ends it whatever follows;
+  2. close the page's events hub (streams end, and pages show M2b's "not
+     running" banner);
+  3. close the MCP transport: every call's context ends, so a
+     `capture_wait` answers at once (an error naming the capture id, to
+     wait by after a restart) and later requests get `503`;
+  4. `Shutdown` the HTTP server, which stops accepting connections and
+     gives the answers being written the 1 s grace of M2-R27, then
+     `Close` it, dropping every connection;
+  5. close the perfmcp server (500 ms);
+  6. remove `hub.json`, the token file and `page-url`, and release the
+     lock.
+
+  The counted warnings are logged every minute while the hub runs, and
+  once more as the transport closes.
 - **Restart rotates both tokens.** Clients recover: see §D2.3.
 
 #### D1.3 Discovery, and what happens with no server **[user, decision 8.1]**
@@ -528,7 +539,11 @@ holder".
     - `DELETE` of that session cancels its in-flight **requests**,
       because the owner has ended the session. It **never cancels a
       capture job** (SRV-R7). A cancelled `capture_wait` request just
-      stops waiting.
+      stops waiting: it answers a `cancelled` error naming the job and
+      its capture id, which says the capture was not cancelled, never
+      the job's running state. On a closing server the code is
+      `closing`, and the error says to wait by the capture id after the
+      restart.
     - Server shutdown cancels everything.
     - **Ownership survives the session table:** LRU eviction never picks
       a session with in-flight requests. If every session slot is pinned
@@ -541,9 +556,10 @@ holder".
     timeout) it returns `isError`: `<command> is busy with <tool> from
     "<label>" (running Ns); call again`, where `<command>` is the binary
     (`perf-agent-hub`, or `perf-agent-mcp` on stdio) and the label is
-    quoted, being the client's own text (`another session` when there is
-    none). The other client's label and tool name are the user's own
-    information.
+    quoted, being the client's own text. A capture step with no label
+    (retention's maintenance) is `from the server`, and any other holder
+    without one `from another session`. The other client's label and
+    tool name are the user's own information.
 - **The inbox is not engine state.** It has its own mutex, held only for
   appends and copies (§D4), so a page click never waits on a tool call.
 - **Why not finer locks.** `store.view` caches views lazily, and `touch`
@@ -690,8 +706,8 @@ they are all that user's. The trust boundary is the token, not the agent.
 | Handles (store) | shared | Handles are content digests (`profilemodel` derives them from the profile digest and execlog), so two agents opening the same file get the same handle. `MaxOpenHandles` is shared: one agent's opens can evict another's handle, which gets M2's error "call open(path) again", deterministic and safe. `perf-agent-hub` raises the default to 32 (stdio keeps 8) |
 | Diff cache | shared | as above |
 | Attempts record | shared, keyed by (digest, view) as M2-R18 | It must be shared: M2b's anti-goal "a live page can show a view without its rejections" requires a rejection by any agent to appear on every publication of that key. IDs `a1, a2, …` are server-wide. A retry may name any agent's attempt of the same key |
-| Publications, steering | shared; last writer wins | The page is one screen. Each publication and each steering change records `by` (the session's client label), and the page shows "p4 · codex" |
-| Captures | shared and **server-owned jobs** (capture design §4.0, §9; SRV-R7) | one active, server-wide. Any session may wait on or cancel any job; no session's end cancels one. Derived results are in the bounded registry only (`Capture.MaxJobs`, `Capture.MaxJobBytes`); the committed manifest is the only thing on disk, and after eviction it answers `derived: "recompute"` (CAP-R17). `capture_list` shows all |
+| Publications, steering | shared; last writer wins | The page is one screen. Each publication and each steering change records `by` (the session's client label). The page renders it as text: each publication's entry ends with its `by` ("p4 · … · codex"), and the header names who published the shown publication and, while it is the current one, who put it on screen. `page_open`'s rows carry `by` too. Sessions of one client share its label, so `by` names the client, not the session |
+| Captures | shared and **server-owned jobs** (capture design §4.0, §9; SRV-R7) | one active, server-wide. Any session may wait on or cancel any job; no session's end cancels one. Derived results are in the bounded registry only (`Capture.MaxJobs`, `Capture.MaxJobBytes`); the committed manifest is the only thing on disk, and after eviction it answers `derived: "recompute"` (CAP-R17). `capture_list` shows all, a running job with `by`, the label of the session that started it |
 | Inbox, user view | shared | §D4 |
 | Session | per session | protocol state and label only (§D2.2) |
 
@@ -703,9 +719,11 @@ a rejection: the record is append-only within its bounds. The design does
 not pretend to isolate agents, and the docs say so.
 
 **Attribution is display only.** The label is the client's own claim.
-Recording `by` changes the **live** state and history JSON only (an added
-field). `render_flamegraph`'s static page and its goldens do not change,
-and in stdio mode the label is empty.
+Recording `by` changes the **live** state and history JSON, and
+`capture_list`'s running jobs, only (an added field). `render_flamegraph`'s
+static page and its goldens do not change. Stdio records the client's
+label too, from `initialize`'s `clientInfo.name`, so its `capture_list`
+running jobs carry `by`: a stdio wire addition.
 
 **D3.5 A bridge from headless runs (a later follow-up, decision 8.4).**
 The serve process can read the profiles root, and with it a headless
@@ -915,6 +933,7 @@ authority over TCP**, and accepts **one kind of browser write**.
 | A process with **the user's uid** (malware, a compromised tool) | read `mcp-token` and call every tool, `capture` included | do more than it already could: it can read the profiles itself and run the setcap'd `perf-agent` directly (the capture design's §12 makes the same point). Out of scope, as in M2b. The stdio-over-HTTP design keeps this cost visible: it is why the default stays stdio for headless use |
 | A **web page** in the user's browser | send requests to `127.0.0.1:*`, including a cross-site navigation to the page shell (M2b-R6) | **MCP:** it has no bearer token, cannot set `Authorization` cross-origin without a CORS preflight that never succeeds, and any request it makes carries `Origin` and `Sec-Fetch-Site`, which `/mcp` refuses. **Inbox:** it lacks the page token; with a leaked token it still fails the `Origin`, `Sec-Fetch-Site`, content-type and custom-header checks |
 | A **DNS-rebinding** page | reach the port under its own hostname | pass `Front`'s Host check |
+| Another local user's program **on the port while the hub is down** (SRV-R19) | serve a page there that registers a service worker for `http://127.0.0.1:PORT/`, should the user open that address meanwhile | keep it: `Front` answers every 404 and the page shell with `Clear-Site-Data: "storage"` (the page keeps nothing in storage), so the browser's update check of the worker's script, which the real hub answers 404, or the next load of the shell drops it. The page warns, as text, when a service worker controls it. The docs say never to open the page's port while the hub is down, and to paste the page URL into a running browser, never pass it on a command line (`/proc/<pid>/cmdline` is world-readable) |
 | Someone **with the page URL** (history, screen share) | read the page and append `select`, `focus` and `ask` reports | call a tool, or inject text: reports are validated IDs, and names come from the engine (§D4). Rotation: restart `perf-agent-hub` |
 | A **misbehaving agent** | flood tool calls, steer the page, evict others' handles | exhaust memory or goroutines: `MaxCalls`, `MaxCallsPerSession` and `MaxRequestBytes` refuse excess at once (SRV-R4). It also cannot starve the page (snapshot reads), delay a parsed control message behind calls or the engine (SRV-R4b), or hold the slot forever (`MaxEngineWait`); every tool keeps M2's bounds. **With the token it can flood slow bodies:** while `MaxIngressReaders` are busy, new requests, controls included, get `503` until readers free, within `IngressBodyTimeout` (SRV-R4c, stated conditionally). One reader and 64 KiB stay reserved for bodies of at most 64 KiB, so only stalled bodies of at most 64 KiB can shut controls out (SRV-R13). The flood holds no engine state, and capture jobs keep running |
 | **Hostile profile content** | as in M2b | as in M2b; the inbox stores no page-supplied text |
@@ -1499,3 +1518,8 @@ written where it applies:
 | **SRV-R15** | The page coalesces its reports: one select or focus in flight, the newest wins, and a 429 is retried once after `Retry-After`. They are no longer fire-and-forget | §D5's row 5 |
 | **SRV-R17** | A capture's server-made facts page is not an attempt (the recipe's `page_explain` is); a capture's publication is that facts page plus, with `compare_with`, a diff | §D2.5, §D7 |
 | Task 5 (the engine's holder) | The busy text names the binary and quotes the label: `<command> is busy with <tool> from "<label>"` | §D2.4 |
+| Final review (stop order) | The stop order is: `KillCaptures`, the events hub's `Close`, the transport's `Close`, the HTTP server's `Shutdown` (1 s) then `Close`, perfmcp's `Close` (500 ms), the runtime files. The counted warnings are also logged every minute | §D1.2 |
+| Final review (labels) | Stdio records the client's label too, and `capture_list`'s running jobs carry `by`, a stdio wire addition. A busy engine held by maintenance is `from the server` | §D2.4, §D3 |
+| **SRV-R20** | The page renders `by` as text: on each publication's entry, and for the shown publication and its steering; `page_open`'s rows carry it | §D3 |
+| Final review (call ends) | A `capture_wait` whose call ends before the job settles answers an error naming the capture id (`cancelled`, or `closing` on a closing server), not the running state | §D2.4 |
+| **SRV-R19** | `Front` sends `Clear-Site-Data: "storage"` on every 404 and on the page shell, so a port squatter's service worker is dropped by the browser's update check against the real hub; the page warns when a service worker controls it; the docs say never to open the page's port while the hub is down, and to paste the page URL into a running browser rather than pass it on a command line | §D6 |

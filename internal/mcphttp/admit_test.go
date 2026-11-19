@@ -25,8 +25,21 @@ const (
 // Retry-After.
 func wantBusy(t *testing.T, what string, r reply, limit string, n int64, id string) {
 	t.Helper()
+	wantBusyText(t, what, r, fmt.Sprintf("server busy: %s=%d reached; retry", limit, n), id)
+}
+
+// wantBusyKept is wantBusy for a large body refused by an ingress cap at
+// n of which kept is held for small messages.
+func wantBusyKept(t *testing.T, what string, r reply, limit string, n, kept int64, id string) {
+	t.Helper()
+	wantBusyText(t, what, r, fmt.Sprintf("server busy: %s=%d reached (%d kept for small messages); retry", limit, n, kept), id)
+}
+
+// wantBusyText fails unless r is the 503 refusal want for id, with
+// Retry-After.
+func wantBusyText(t *testing.T, what string, r reply, want, id string) {
+	t.Helper()
 	code, msg, gotID := r.rpcErr()
-	want := fmt.Sprintf("server busy: %s=%d reached; retry", limit, n)
 	if r.status != http.StatusServiceUnavailable || code != -32000 || msg != want || string(gotID) != id ||
 		r.header.Get("Retry-After") != "1" {
 		t.Fatalf("%s: want 503 %q for id %s; got %d Retry-After %q %s", what, want, id, r.status, r.header.Get("Retry-After"), r.body)
@@ -431,14 +444,14 @@ func TestTheIngressKeepsAReserveForSmallBodies(t *testing.T) {
 		h := startHub(t, nil, nil)
 		sid := h.initialize()
 		stall(t, h, sid, 100<<10, 15)
-		wantBusy(t, "a 16th large body", headers(t, h, sid, 100<<10), "MaxIngressReaders", 16, "null")
+		wantBusyKept(t, "a 16th large body", headers(t, h, sid, 100<<10), "MaxIngressReaders", 16, 1, "null")
 		smallControlsGetThrough(t, h, sid)
 	})
 	t.Run("bytes", func(t *testing.T) {
 		h := startHub(t, func(o *Options) { o.MaxIngressBytes, o.MaxMessageBytes = 2<<20, 1<<20 }, nil)
 		sid := h.initialize()
 		stall(t, h, sid, 1<<20, 1)
-		wantBusy(t, "a second 1 MiB body", headers(t, h, sid, 1<<20), "MaxIngressBytes", 2<<20, "null")
+		wantBusyKept(t, "a second 1 MiB body", headers(t, h, sid, 1<<20), "MaxIngressBytes", 2<<20, 64<<10, "null")
 		smallControlsGetThrough(t, h, sid)
 	})
 }
@@ -468,7 +481,7 @@ func TestHeaderOnlyRejection(t *testing.T) {
 		return timed(t, what, controlBound, func() reply { return readReply(t, bufio.NewReader(c)) })
 	}
 	r := headers("over the bytes left", 300<<10)
-	wantBusy(t, "over the bytes left", r, "MaxIngressBytes", 768<<10, "null")
+	wantBusyKept(t, "over the bytes left", r, "MaxIngressBytes", 768<<10, 64<<10, "null")
 	if !r.close {
 		t.Fatal("an unread refusal does not say it closes its connection")
 	}

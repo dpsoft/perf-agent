@@ -45,6 +45,10 @@ func (s *Server) capturePublish(j *job, m manifest, res *captureResult, d deriva
 		return errors.New("the facts page was rejected")
 	}
 	diff := d.firstBase != nil && d.base != nil
+	// This publishes without checkCall, and so without its title check:
+	// captureTitle runs explain.CheckTitle itself and leaves out the comm
+	// it refuses; the rest of the title is the server's own text, cut to
+	// Explain.MaxTitleBytes.
 	p, err := s.publishExplained(d.first.e, d.first.v, view, r, s.captureTitle(m, mode), "", j.by, j.req.Show && !diff)
 	if err != nil {
 		return s.pageError(err)

@@ -251,6 +251,9 @@ func New(cfg Config) (_ *Server, err error) {
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
 	}
+	// Capture's errors and advice say capture.CommandMark for this
+	// binary's name; a log line names it as the agent's answers do.
+	s.log = slog.New(namingHandler{next: s.log.Handler(), command: s.command})
 	for _, c := range fitted {
 		s.log.Info("capture limit fitted", "limit", c.field, "default", c.from, "now", c.to, "fits", c.fits)
 	}

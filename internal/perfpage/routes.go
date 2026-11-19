@@ -122,6 +122,10 @@ type lastByteWriter struct {
 	release func()
 }
 
+// Unwrap is the writer it wraps, so an http.ResponseController made on a
+// heavy route still reaches the connection's deadlines and flush.
+func (w *lastByteWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 func (w *lastByteWriter) Write(b []byte) (int, error) {
 	if len(b) == 0 {
 		return w.ResponseWriter.Write(b)

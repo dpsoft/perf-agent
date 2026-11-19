@@ -951,3 +951,27 @@ func must[T any](v T, err error) func(*testing.T) T {
 		return v
 	}
 }
+
+// A heavy route's writer unwraps to the connection's, so a
+// ResponseController made on it still sets deadlines and flushes.
+func TestAHeavyRoutesWriterUnwraps(t *testing.T) {
+	rt := &routes{heavy: make(chan struct{}, 1)}
+	errs := make(chan [2]error, 1)
+	h := rt.bounded(func(w http.ResponseWriter, r *http.Request) {
+		rc := http.NewResponseController(w)
+		deadline := rc.SetWriteDeadline(time.Now().Add(time.Second))
+		flush := rc.Flush()
+		_, _ = w.Write([]byte("answer"))
+		errs <- [2]error{deadline, flush}
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	res, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = res.Body.Close()
+	if got := <-errs; got[0] != nil || got[1] != nil {
+		t.Errorf("through the heavy route's writer: SetWriteDeadline %v, Flush %v", got[0], got[1])
+	}
+}

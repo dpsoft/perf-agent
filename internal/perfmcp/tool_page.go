@@ -33,7 +33,7 @@ const pageOpenSchema = `{
   "additionalProperties": false
 }`
 
-const pageOpenDescription = "Start the live page, unless it is started, and return its URL, the publications it keeps, the current one, " +
+const pageOpenDescription = "Return the URL of the live page, which this server serves from its start and every session shares, the publications it keeps, the current one, " +
 	"and viewers, the number of browser tabs that have it open. Give the URL to the user: the server never opens a browser. " +
 	"The page is read-only and shows what page_explain and page_diff publish and page_show selects; the URL holds its access token, so give it to the user only."
 

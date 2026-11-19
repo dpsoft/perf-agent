@@ -1,6 +1,7 @@
 package mcphttp
 
 import (
+	"fmt"
 	"net/http"
 	"time"
 
@@ -35,7 +36,9 @@ func (t *Transport) reserveIngress(contentLength int64) (func(), string) {
 		n = t.o.MaxMessageBytes
 	}
 	readers, bytes := t.o.MaxIngressReaders, t.o.MaxIngressBytes
+	var keptReaders, keptBytes int64
 	if n > smallBody {
+		keptReaders, keptBytes = int64(t.reserveReaders), t.reserveBytes
 		readers -= t.reserveReaders
 		bytes -= t.reserveBytes
 	}
@@ -43,9 +46,9 @@ func (t *Transport) reserveIngress(contentLength int64) (func(), string) {
 	defer t.mu.Unlock()
 	switch {
 	case t.readers >= readers:
-		return nil, busyText("MaxIngressReaders", int64(t.o.MaxIngressReaders))
+		return nil, reserveBusyText("MaxIngressReaders", int64(t.o.MaxIngressReaders), keptReaders)
 	case t.reserved+n > bytes:
-		return nil, busyText("MaxIngressBytes", t.o.MaxIngressBytes)
+		return nil, reserveBusyText("MaxIngressBytes", t.o.MaxIngressBytes, keptBytes)
 	}
 	t.readers++
 	t.reserved += n
@@ -55,6 +58,16 @@ func (t *Transport) reserveIngress(contentLength int64) (func(), string) {
 		t.reserved -= n
 		t.mu.Unlock()
 	}, ""
+}
+
+// reserveBusyText is busyText for an ingress cap at n of which kept is
+// held back for small messages, which a large body may not take: the
+// refusal says so, since fewer than n are then in use.
+func reserveBusyText(limit string, n, kept int64) string {
+	if kept == 0 {
+		return busyText(limit, n)
+	}
+	return fmt.Sprintf("server busy: %s=%d reached (%d kept for small messages); retry", limit, n, kept)
 }
 
 // parseBody reads r's body and parses it, and stamps the receipt time once

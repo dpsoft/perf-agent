@@ -167,8 +167,24 @@
       titleSegments(t, p.title_segs);
       b.appendChild(t);
       b.appendChild(make('span', 'vw', p.view || ''));
+      if (strOf(p.by)) b.appendChild(make('span', 'by', p.by));
       nav.appendChild(b);
     }
+    renderBy();
+  };
+
+  // renderBy names the session that published the shown publication and,
+  // while it is the agent's current one, the session that put it on
+  // screen. A label is the client's own text: it is shown as text, never
+  // as markup.
+  const renderBy = () => {
+    const e = $('by');
+    const pub = view ? strOf((entryOf(agent, view.pub) || {}).by) : '';
+    const steered = view && agent && view.pub === agent.current ? strOf(agent.by) : '';
+    let text = pub ? 'Published by ' + pub : '';
+    if (steered && steered !== pub) text += text ? ' · shown by ' + steered : 'Shown by ' + steered;
+    e.textContent = text;
+    e.hidden = !text;
   };
 
   const renderPills = () => {
@@ -975,6 +991,21 @@
   };
 
   // --- Wiring ---
+
+  // The page registers no service worker. One that controls it was put
+  // there by something else, such as a program that held this port while
+  // the hub was down, and can read and change all the page shows.
+  const workerWarning = () => {
+    const sw = navigator.serviceWorker;
+    if (!sw || !sw.controller) return;
+    const e = $('sw-warn');
+    e.textContent = 'A service worker that perf-agent did not install controls this page: it can read and change ' +
+      "what you see. Close every tab of this address, clear this site's data in the browser, and open the page " +
+      'URL again while perf-agent-hub runs.';
+    e.hidden = false;
+  };
+  workerWarning();
+  if (navigator.serviceWorker) navigator.serviceWorker.addEventListener('controllerchange', workerWarning);
 
   // The ask chip is the live page's own, so it is made here rather than
   // in the shared panel: the static page has no server to ask.

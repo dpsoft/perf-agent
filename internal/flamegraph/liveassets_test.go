@@ -54,7 +54,7 @@ func TestLiveShellHasNoInlineScriptOrStyle(t *testing.T) {
 	}
 
 	for _, id := range []string{"chart", "sel-ref", "sel-name", "sel-id", "facts", "exp", "noexp", "path", "chips", "copybox", "toast",
-		"pubs", "banner", "rejected", "pills", "notes", "quality", "rows", "legend", "axis", "export", "focus-btn", "whole-btn", "inbox"} {
+		"pubs", "banner", "rejected", "pills", "notes", "quality", "rows", "legend", "axis", "export", "focus-btn", "whole-btn", "inbox", "by", "sw-warn"} {
 		assert.Equal(t, 1, strings.Count(shell, ` id="`+id+`"`), "region %s", id)
 	}
 	assert.Contains(t, shell, `<link rel="stylesheet" href="assets/live.css">`)
@@ -65,6 +65,8 @@ func TestLiveShellHasNoInlineScriptOrStyle(t *testing.T) {
 	assert.Regexp(t, `<a [^>]*id="export"[^>]*\bdownload\b`, shell)
 	assert.Regexp(t, `<span [^>]*id="inbox"[^>]*\bhidden\b`, shell, "no count before the first envelope")
 	assert.Less(t, strings.Index(shell, `id="inbox"`), strings.Index(shell, `id="pills"`), "the count sits before the pills")
+	assert.Regexp(t, `<span [^>]*id="by"[^>]*\bhidden\b`, shell, "no label before the first state")
+	assert.Regexp(t, `<div [^>]*id="sw-warn"[^>]*\bhidden\b`, shell)
 }
 
 // fetchArgs are the argument lists of every fetch and EventSource call.
@@ -529,6 +531,14 @@ func newLiveServer(t *testing.T) *liveServer {
 		w.Header().Set("Content-Type", typ)
 		_, _ = w.Write(body)
 	})
+	// A service worker of the kind a port squatter would register: it
+	// takes control of the pages in its scope at once.
+	mux.HandleFunc("GET /test-sw.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+		_, _ = w.Write([]byte(`self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+`))
+	})
 	mux.HandleFunc("GET /state", func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.stateGets++
@@ -847,6 +857,7 @@ type livePubEntry struct {
 	View      string      `json:"view"`
 	Digest    string      `json:"digest"`
 	History   string      `json:"history"`
+	By        string      `json:"by,omitzero"`
 }
 
 type liveStateJSON struct {
@@ -854,6 +865,7 @@ type liveStateJSON struct {
 	Current      string         `json:"current"`
 	Selected     string         `json:"selected"`
 	Focus        string         `json:"focus"`
+	By           string         `json:"by,omitzero"`
 	Publications []livePubEntry `json:"publications"`
 }
 
@@ -1920,6 +1932,78 @@ func TestLivePageConnectionInChrome(t *testing.T) {
 		assert.True(t, d.BannerHid, "an old failed fallback must not mark a recovered connection gone: %q", d.Banner)
 		assert.Empty(t, tab.errors())
 	})
+}
+
+// withBy is the state envelope st with by as the steering's label and
+// pubBy as each publication's.
+func withBy(t *testing.T, st []byte, by string, pubBy map[string]string) []byte {
+	t.Helper()
+	var env struct {
+		Engine liveStateJSON   `json:"engine"`
+		Inbox  json.RawMessage `json:"inbox"`
+	}
+	require.NoError(t, json.Unmarshal(st, &env))
+	env.Engine.By = by
+	for i, p := range env.Engine.Publications {
+		env.Engine.Publications[i].By = pubBy[p.ID]
+	}
+	engine, err := json.Marshal(env.Engine)
+	require.NoError(t, err)
+	return envelope(engine, string(env.Inbox))
+}
+
+// The page names who published each publication and who put the shown one
+// on screen. A label is the client's own text, so a hostile one is shown
+// as text: it makes no element and runs nothing.
+func TestLivePageShowsByInChrome(t *testing.T) {
+	c := startChrome(t)
+	f := newLiveFixture(t)
+	const hostile = `<img src=x onerror="window.pwned=1">`
+	byText := func(tab *liveTab) string {
+		return tab.eval(`(() => { const e = document.getElementById('by'); return e.hidden ? '' : e.textContent; })()`)
+	}
+	pubBy := map[string]string{"p1": hostile, "p2": "codex"}
+	s, tab := newLivePage(t, c, f, withBy(t, liveState("1", "p1", f.b, "", "p1", "p2"), "claude-code", pubBy), nil)
+	d := tab.waitFor("p1 b", func(d liveDOM) bool { return d.SelName == "b" && len(d.Pubs) == 2 })
+	assert.True(t, strings.HasSuffix(d.Pubs[0], hostile), "p1's entry %q ends with its label", d.Pubs[0])
+	assert.True(t, strings.HasSuffix(d.Pubs[1], "codex"), "p2's entry %q ends with its label", d.Pubs[1])
+	assert.Equal(t, "Published by "+hostile+" · shown by claude-code", byText(tab))
+	assert.Equal(t, 0, d.Images)
+	assert.Equal(t, "undefined", tab.eval(`String(window.pwned)`))
+
+	// The same session published and showed it: it is named once.
+	s.push(withBy(t, liveState("2", "p2", f.c, "", "p1", "p2"), "codex", pubBy))
+	tab.waitFor("p2", func(d liveDOM) bool { return d.Title == "second" && d.Seq == "2" })
+	assert.Equal(t, "Published by codex", byText(tab))
+
+	// The user went back to p1: the steering's label is not p1's.
+	tab.eval(`document.querySelector('#pubs button[data-pub="p1"]').click(), ''`)
+	tab.waitFor("p1 again", func(d liveDOM) bool { return d.Title == "first look at 3 frames" })
+	assert.Equal(t, "Published by "+hostile, byText(tab))
+
+	// A state with no labels shows none.
+	s.push(liveState("3", "p1", f.b, "", "p1", "p2"))
+	d = tab.waitFor("seq 3", func(d liveDOM) bool { return d.Seq == "3" })
+	assert.Empty(t, byText(tab))
+	assert.Equal(t, "p1", d.Pubs[0][:2])
+	assert.False(t, strings.Contains(d.Pubs[0], hostile))
+	assert.Equal(t, 0, d.Images)
+	assert.Empty(t, tab.errors())
+}
+
+// A service worker that controls the page was not the page's own: the page
+// warns, as text, and keeps working.
+func TestLivePageWarnsOfAServiceWorkerInChrome(t *testing.T) {
+	c := startChrome(t)
+	f := newLiveFixture(t)
+	_, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), nil)
+	tab.waitFor("p1 b", func(d liveDOM) bool { return d.SelName == "b" })
+	warn := `(() => { const e = document.getElementById('sw-warn'); return e.hidden ? '' : e.textContent; })()`
+	assert.Empty(t, tab.eval(warn), "no worker, no warning")
+	tab.eval(`navigator.serviceWorker.register('test-sw.js'), ''`)
+	got := tab.waitText(warn)
+	assert.True(t, strings.HasPrefix(got, "A service worker that perf-agent did not install controls this page"), got)
+	assert.Empty(t, tab.errors())
 }
 
 func TestLiveFixtureLeavesCOut(t *testing.T) {

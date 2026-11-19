@@ -284,7 +284,7 @@ func (in *instance) undo() {
 //  1. the running capture is killed: its reaper ends it whatever follows;
 //  2. the page's streams end, so the HTTP server has none to wait for;
 //  3. the transport closes: every call's context ends, so a capture_wait
-//     (with an error naming the capture id) or a wait for the engine
+//     (with a closing error naming the capture id) or a wait for the engine
 //     answers at once, and later requests get 503;
 //  4. the HTTP server stops listening and gives the answers being written
 //     httpGrace, then drops every connection;

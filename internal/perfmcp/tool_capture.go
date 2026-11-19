@@ -550,37 +550,33 @@ func (s *Server) waitJob(ctx context.Context, j *job, d time.Duration, asked str
 		case <-timer.C:
 			return s.stateAnswer(ctx, j, deadline, asked)
 		case <-ctx.Done():
-			if _, settled, _ := j.watch(); settled {
-				return s.settledAnswer(ctx, j, deadline, asked)
+			if _, settled, _ := j.watch(); !settled && s.closing() {
+				return s.closingAnswer(j)
 			}
-			return s.callEnded(j)
+			return s.stateAnswer(ctx, j, deadline, asked)
 		}
 	}
 }
 
-// callEnded is a wait's answer when its call ends before j settles: the
-// server is closing (its captures were killed, then every call ended), or
-// the client cancelled the call or ended its session. It is an error, not
-// j's running state, and names j's capture id: after a restart only the
-// capture id still means anything.
-func (s *Server) callEnded(j *job) mcpstdio.Result {
+// closing reports that the server is closing: its captures were killed,
+// or its context ended. Then a wait's call ends because the server stops.
+func (s *Server) closing() bool { return s.killed.Load() || s.ctx.Err() != nil }
+
+// closingAnswer is a wait's answer when its call ends, before j settles,
+// because the server is closing: an error, not j's running state, naming
+// j's capture id, since after a restart only the capture id still means
+// anything. A call that ends otherwise (the client cancelled it, or ended
+// its session) answers j's state, as a timeout does: the code cancelled
+// is kept for a job that was itself cancelled.
+func (s *Server) closingAnswer(j *job) mcpstdio.Result {
 	v := j.view()
 	name := "job " + v.Job
+	next := "after the restart, capture_list shows whether the series kept a capture of job " + v.Job
 	if v.ID != "" {
 		name += " (capture " + v.ID + ")"
+		next = "after the restart, call capture_wait with the capture id " + v.ID + ", not the job id"
 	}
-	var e *capture.Error
-	if s.killed.Load() || s.ctx.Err() != nil {
-		next := "after the restart, capture_list shows whether the series kept a capture of job " + v.Job
-		if v.ID != "" {
-			next = "after the restart, call capture_wait with the capture id " + v.ID + ", not the job id"
-		}
-		e = capture.Errorf(capture.CodeClosing, next, "this server is closing: the wait for %s ended before the capture settled", name)
-	} else {
-		next := "call capture_wait again with " + cmp.Or(v.ID, v.Job) + "; after a restart of the server, only a capture id is known"
-		e = capture.Errorf(capture.CodeCancelled, next, "this capture_wait call ended (cancelled, or its session ended) before %s settled; the capture was not cancelled", name)
-	}
-	w := s.wire(e)
+	w := s.wire(capture.Errorf(capture.CodeClosing, next, "this server is closing: the wait for %s ended before the capture settled", name))
 	w.Job, w.CaptureID = v.Job, v.ID
 	return errorResult(w)
 }

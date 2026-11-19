@@ -682,10 +682,11 @@ func TestMultiSessionWaitsAndCancel(t *testing.T) {
 	}
 }
 
-// A wait whose call ends before the job settles (the client cancelled it,
-// its session ended, or the server is closing) answers an error naming the
-// job and its capture id, never the job's running state: a client that
-// reads it after a restart must wait by the capture id.
+// A wait whose call ends before the job settles answers the job's state
+// when the client cancelled the call or ended its session: the code
+// cancelled is a cancelled job's. On a closing server it answers closing,
+// naming the job and its capture id, never the running state: a client
+// that reads it after a restart must wait by the capture id.
 func TestAWaitWhoseCallEndsNamesTheCaptureID(t *testing.T) {
 	e := newHubEnv(t, jobOpts{})
 	a := newMCPSession(t, e.s, "A")
@@ -694,28 +695,26 @@ func TestAWaitWhoseCallEndsNamesTheCaptureID(t *testing.T) {
 	if v.ID == "" {
 		t.Fatalf("a profiling job has no capture id: %+v", v)
 	}
-	waitEnded := func() (wireError, string) {
+	waitEnded := func() (string, bool) {
 		ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 		defer cancel()
-		text, isErr := a.call(ctx, "capture_wait", map[string]any{"id": job, "timeout": "30s"})
-		if !isErr {
-			t.Fatalf("a wait whose call ended answered %s", text)
-		}
-		return toolErrorOf(t, text), text
+		return a.call(ctx, "capture_wait", map[string]any{"id": job, "timeout": "30s"})
 	}
 
-	w, text := waitEnded()
-	if w.Code != string(capture.CodeCancelled) || w.Job != job || w.CaptureID != v.ID || w.Status != "" {
-		t.Errorf("a cancelled wait: %s", text)
-	}
-	if !strings.Contains(w.Message, v.ID) || !strings.Contains(w.Message, "not cancelled") || !strings.Contains(w.Next, "capture_wait") || !strings.Contains(w.Next, v.ID) {
-		t.Errorf("a cancelled wait says %q, next %q", w.Message, w.Next)
+	text, isErr := waitEnded()
+	var state jobView
+	if isErr || json.Unmarshal([]byte(text), &state) != nil || state.Status != string(jobRunning) || state.ID != v.ID {
+		t.Errorf("a wait whose call was cancelled: %s", text)
 	}
 
 	// As the hub stops: the captures are killed first, then every call's
 	// context ends. The job is left running here so the wait sees it.
 	e.s.killed.Store(true)
-	w, text = waitEnded()
+	text, isErr = waitEnded()
+	if !isErr {
+		t.Fatalf("a wait on a closing server answered %s", text)
+	}
+	w := toolErrorOf(t, text)
 	if w.Code != string(capture.CodeClosing) || w.Job != job || w.CaptureID != v.ID || w.Status != "" {
 		t.Errorf("a wait on a closing server: %s", text)
 	}

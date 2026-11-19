@@ -137,7 +137,26 @@ func TestEverySocketIsLoopback(t *testing.T) {
 	}
 	c.delete()
 
-	pid := p.cmd.Process.Pid
+	listening, connected := checkHubSockets(t, p.cmd.Process.Pid, p.port)
+	// The stream's connection is open, so the check saw the listener and
+	// at least that connection.
+	if listening != 1 || connected < 1 {
+		t.Errorf("%d listening and %d connected sockets, want 1 and at least 1", listening, connected)
+	}
+
+	p.stop(syscall.SIGTERM, 5*time.Second)
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(p.port))
+	if conn, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
+		_ = conn.Close()
+		t.Errorf("%s still accepts connections after the hub exited", addr)
+	}
+}
+
+// checkHubSockets checks every socket the hub pid holds, listening on
+// port: each is TCP on 127.0.0.1, either that listener or a connection it
+// accepted, from a loopback peer. It returns how many of each it saw.
+func checkHubSockets(t *testing.T, pid, port int) (listening, connected int) {
+	t.Helper()
 	sockets := procSockets(t, pid)
 	inodes := socketInodes(t, pid)
 	// A socket made after the tables were read is missing from them: read
@@ -154,7 +173,6 @@ func TestEverySocketIsLoopback(t *testing.T) {
 	// The literal, not the hub's own constant: a changed constant is
 	// what this test must catch.
 	loopback := netip.MustParseAddr("127.0.0.1")
-	var listening, connected int
 	for _, inode := range inodes {
 		s, ok := sockets[inode]
 		switch {
@@ -165,28 +183,17 @@ func TestEverySocketIsLoopback(t *testing.T) {
 			t.Errorf("socket %s is UDP (%s, local %v)", inode, s.table, s.local)
 		case s.local.Addr() != loopback:
 			t.Errorf("socket %s is bound to %v, not %v", inode, s.local, loopback)
-		case s.listening && s.local.Port() == uint16(p.port):
+		case s.listening && s.local.Port() == uint16(port):
 			listening++
 		case s.listening:
-			t.Errorf("socket %s listens on %v, not the hub's port %d", inode, s.local, p.port)
-		case s.local.Port() != uint16(p.port):
-			t.Errorf("socket %s (local %v) is connected to %v but was not accepted on the hub's port %d: an outgoing connection", inode, s.local, s.remote, p.port)
+			t.Errorf("socket %s listens on %v, not the hub's port %d", inode, s.local, port)
+		case s.local.Port() != uint16(port):
+			t.Errorf("socket %s (local %v) is connected to %v but was not accepted on the hub's port %d: an outgoing connection", inode, s.local, s.remote, port)
 		case !s.remote.Addr().IsLoopback():
 			t.Errorf("socket %s (local %v) is connected to %v, not loopback", inode, s.local, s.remote)
 		default:
 			connected++
 		}
 	}
-	// The stream's connection is open, so the check saw the listener and
-	// at least that connection.
-	if listening != 1 || connected < 1 {
-		t.Errorf("%d listening and %d connected sockets among %d, want 1 and at least 1", listening, connected, len(inodes))
-	}
-
-	p.stop(syscall.SIGTERM, 5*time.Second)
-	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(p.port))
-	if conn, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
-		_ = conn.Close()
-		t.Errorf("%s still accepts connections after the hub exited", addr)
-	}
+	return listening, connected
 }

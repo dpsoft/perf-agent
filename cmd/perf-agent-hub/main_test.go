@@ -142,13 +142,16 @@ var binDir = sync.OnceValues(func() (string, error) {
 })
 
 // hubTestBinary builds this package's test binary without the race
-// detector, whose overhead would slow the shutdowns the tests time.
+// detector, whose overhead would slow the shutdowns the tests time. Its
+// name makes the comm of the hub it runs, and of that hub's reapers,
+// begin with perf-agent-hub, as the command's own does, so a search for
+// a hub left behind finds these too.
 var hubTestBinary = sync.OnceValues(func() (string, error) {
 	dir, err := binDir()
 	if err != nil {
 		return "", err
 	}
-	bin := filepath.Join(dir, "hub.test")
+	bin := filepath.Join(dir, "perf-agent-hub.test")
 	if out, err := exec.Command("go", "test", "-c", "-buildvcs=false", "-o", bin, ".").CombinedOutput(); err != nil {
 		return "", fmt.Errorf("go test -c: %v\n%s", err, out)
 	}

@@ -110,6 +110,10 @@ type Server struct {
 	// beforeRelease, when set, runs as a job is about to let go of the
 	// capture directory; a seam for tests.
 	beforeRelease func(*job)
+	// beforeCaptureDiff, when set, runs before a capture's diff is
+	// published, and an error it returns fails that publication; a seam
+	// for tests.
+	beforeCaptureDiff func() error
 	// maintained is closed when the maintenance goroutine has returned,
 	// which Close waits for, bounded.
 	maintained chan struct{}

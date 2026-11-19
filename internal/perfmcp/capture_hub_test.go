@@ -142,7 +142,7 @@ func TestHubAcceptsWhileAnotherToolHoldsTheEngine(t *testing.T) {
 	}
 }
 
-// Reconciliation 6: MaxEngineWait bounds tool calls only. A job's
+// MaxEngineWait bounds tool calls only (§D2.4). A job's
 // derivation waits behind a tool held three times that long, while
 // another session's tool is told who holds the engine, and still ends
 // ready.
@@ -197,7 +197,8 @@ func TestAJobsEngineStepsWaitBehindToolsAndComplete(t *testing.T) {
 
 // A committed capture is published facts-only: the first mode's view
 // with no explanation, by the session that started the job, made current,
-// under the title of the capture, its target, mode and profiled time.
+// under the title of the capture, its target, mode and profiled time. It
+// is the server's page, not an attempt.
 func TestADoneCaptureIsPublishedFactsOnly(t *testing.T) {
 	e := newHubEnv(t, jobOpts{})
 	a := newMCPSession(t, e.s, "claude-code")
@@ -215,7 +216,7 @@ func TestADoneCaptureIsPublishedFactsOnly(t *testing.T) {
 		t.Fatalf("target %+v, profiled %q", r.Capture.Target, r.Capture.ProfiledDuration)
 	}
 	want := fmt.Sprintf("adhoc/001-run · capworkload (%d) · cpu · %s", r.Capture.Target.PID, r.Capture.ProfiledDuration)
-	if p.title != want || p.kind != pubExplained || len(p.result.Checked) != 0 || p.view != r.Profiles[0].Open.DefaultView || p.attempt == "" {
+	if p.title != want || p.kind != pubExplained || len(p.result.Checked) != 0 || p.view != r.Profiles[0].Open.DefaultView || p.attempt != "" {
 		t.Errorf("p1: title %q (want %q), kind %s, %d explained, view %s, attempt %q", p.title, want, p.kind, len(p.result.Checked), p.view, p.attempt)
 	}
 	if snap.selected != "" || snap.focus != "" {
@@ -440,15 +441,31 @@ func bindArgs(t *testing.T, args map[string]any, bound map[string]map[string]any
 	return out
 }
 
+// withoutAttempt is a live model's JSON without its attempt, which only
+// an agent's page_explain records.
+func withoutAttempt(t *testing.T, model []byte) string {
+	t.Helper()
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(model, &m); err != nil {
+		t.Fatal(err)
+	}
+	delete(m, "attempt")
+	return mustJSON(t, m)
+}
+
 // After the registry forgot a compare, a wait by its capture id answers
 // with the recipe; run as it is, step by step through the bindings, every
 // call fits its tool's schema and the page shows the capture again: its
-// facts page, then its diff, current.
+// facts page, then its diff, current, each the same page as the capture's
+// own (the recipe's facts page is an agent's attempt, the capture's is
+// not).
 func TestRecomputeInTheHubRepublishes(t *testing.T) {
 	e := newHubEnv(t, jobOpts{limits: func(l *Limits) { l.Capture.MaxJobs = 1 }})
 	a := newMCPSession(t, e.s, "A")
 	hubResult(t, a, hubCapture(t, a, hubArgs(t, "1s")))
-	hubResult(t, a, hubCapture(t, a, map[string]any{"command": workloadCmd(t), "label": "cand", "compare_with": "001"}))
+	e.fakeProfile(pmfixture.CPUBasicNew())
+	own := hubResult(t, a, hubCapture(t, a, map[string]any{"command": workloadCmd(t), "label": "cand", "compare_with": "001"}))
+	e.fakeProfile(thirdProfile())
 	hubResult(t, a, hubCapture(t, a, hubArgs(t, "1s")))
 
 	r := hubResult(t, a, "adhoc/002")
@@ -485,6 +502,28 @@ func TestRecomputeInTheHubRepublishes(t *testing.T) {
 	if facts.kind != pubExplained || diff.kind != pubDiff || after.current != diff.id || facts.view != bound["new_cpu"]["default_view"] {
 		t.Errorf("republished %s (%s, view %s) and %s (%s), current %s", facts.id, facts.kind, facts.view, diff.id, diff.kind, after.current)
 	}
+	ownFacts, ownDiff := after.pubs[own.Publication], after.pubs[own.DiffPublication]
+	if ownFacts == nil || ownDiff == nil {
+		t.Fatalf("the capture's own publications %s and %s are gone: %q", own.Publication, own.DiffPublication, after.order)
+	}
+	if facts.title != ownFacts.title || diff.title != ownDiff.title {
+		t.Errorf("titles %q and %q, the capture's %q and %q", facts.title, diff.title, ownFacts.title, ownDiff.title)
+	}
+	if facts.attempt == "" || ownFacts.attempt != "" {
+		t.Errorf("the recipe's page has attempt %q, the capture's %q", facts.attempt, ownFacts.attempt)
+	}
+	if got, want := withoutAttempt(t, facts.model), withoutAttempt(t, ownFacts.model); got != want {
+		t.Errorf("the republished facts page differs:\n got %s\nwant %s", got, want)
+	}
+	if string(diff.model) != string(ownDiff.model) {
+		t.Errorf("the republished diff differs:\n got %s\nwant %s", diff.model, ownDiff.model)
+	}
+}
+
+// thirdProfile is a cpu profile unlike CPUBasic and CPUBasicNew.
+func thirdProfile() []byte {
+	return pmfixture.Build("cpu", "nanoseconds", nil,
+		pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn("third")}, Value: 1000})
 }
 
 // fakeProfile makes e's fake perf-agent write b as its cpu profile from
@@ -531,8 +570,7 @@ func TestRetentionSparesPublishedCaptures(t *testing.T) {
 	if snap := e.s.live.snapshot(); snap.pubs["p1"] != nil {
 		t.Fatalf("p1 is still kept: %q", snap.order)
 	}
-	e.fakeProfile(pmfixture.Build("cpu", "nanoseconds", nil,
-		pmfixture.Sample{Frames: []pmfixture.Frame{pmfixture.Fn("main"), pmfixture.Fn("third")}, Value: 1000}))
+	e.fakeProfile(thirdProfile())
 	r := hubResult(t, a, hubCapture(t, a, hubArgs(t, "1s")))
 	if !slices.Contains(r.Evicted, "adhoc/001-run") {
 		t.Errorf("evicted %q, want adhoc/001-run", r.Evicted)
@@ -594,7 +632,7 @@ func TestStdioHasNoShowAndNoPublication(t *testing.T) {
 	}
 }
 
-// SRV-R7: a job outlives the session that started it; two sessions wait
+// §D2.5: a job outlives the session that started it; two sessions wait
 // on it at once, each to its own deadline, and one's cancel ends it for
 // the other.
 func TestMultiSessionWaitsAndCancel(t *testing.T) {
@@ -643,7 +681,7 @@ func TestMultiSessionWaitsAndCancel(t *testing.T) {
 	}
 }
 
-// CAP-R14 in the hub: with the registry evicted, waits by capture id read
+// In the hub, with the registry evicted, waits by capture id read
 // the manifest through the lookup workers. While that read is blocked
 // each wait answers loading at its own deadline and starts no goroutine;
 // then the answer is the recipe, with the page step, and nothing derived
@@ -758,16 +796,34 @@ func activeJobs(s *Server) int {
 	return n
 }
 
-// Review Focus 8: four sessions call the four capture tools at once, over
-// and over, on short captures. Every answer is one the state machine
-// gives, and one capture at most is active at any time.
+// Four sessions call the four capture tools at once, over and over, on
+// short captures, while two more open profiles and steer the page as each
+// capture is published. Every answer is one the state machine gives, one
+// capture at most is active at any time, every capture that ends done is
+// published, and the kept publications keep their order.
 func TestFourSessionsRaceTheCaptureTools(t *testing.T) {
-	e := newHubEnv(t, jobOpts{limits: func(l *Limits) { l.Capture.WindowCaptures = 1000 }})
+	const maxPubs = 3
+	e := newHubEnv(t, jobOpts{limits: func(l *Limits) {
+		l.Capture.WindowCaptures = 1000
+		l.MaxPublications = maxPubs
+		l.MaxOpenHandles = 2
+	}})
+	writeCPUFixtures(t, Config{ProfilesDir: e.profiles})
 	w := workloadCmd(t)
 	var (
-		mu   sync.Mutex
-		jobs []string
+		mu      sync.Mutex
+		jobs    []string
+		results []captureResult
 	)
+	// done notes a capture_wait answer that is a result.
+	done := func(text string) {
+		var r captureResult
+		if json.Unmarshal([]byte(text), &r) == nil && r.Capture.ID != "" {
+			mu.Lock()
+			results = append(results, r)
+			mu.Unlock()
+		}
+	}
 	known := func(r *rand.Rand) string {
 		mu.Lock()
 		defer mu.Unlock()
@@ -805,6 +861,10 @@ func TestFourSessionsRaceTheCaptureTools(t *testing.T) {
 			e.noteRecord()
 		}
 	})
+	// One capture in a series of its own, which no session cancels, ends
+	// done while the others race.
+	steady := newMCPSession(t, e.s, "steady")
+	steadyJob := hubCapture(t, steady, map[string]any{"command": w, "duration": "1s", "series": "steady"})
 	var wg sync.WaitGroup
 	for i := range 4 {
 		c := newMCPSession(t, e.s, fmt.Sprintf("session-%d", i))
@@ -839,6 +899,7 @@ func TestFourSessionsRaceTheCaptureTools(t *testing.T) {
 					if json.Unmarshal([]byte(text), &v) != nil || v.Capture == nil && !slices.Contains(waitStatuses, v.Status) {
 						t.Errorf("capture_wait: %s", text)
 					}
+					done(text)
 				case 2:
 					text, isErr := c.call(t.Context(), "capture_cancel", map[string]any{"id": known(r)})
 					if isErr {
@@ -859,14 +920,52 @@ func TestFourSessionsRaceTheCaptureTools(t *testing.T) {
 			}
 		})
 	}
+	// Two more sessions open profiles and steer the page while captures
+	// are published.
+	for i := range 2 {
+		c := newMCPSession(t, e.s, fmt.Sprintf("page-%d", i))
+		wg.Go(func() {
+			r := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), uint64(10+i)))
+			for time.Now().Before(end) {
+				var o openedAs
+				text, isErr := c.call(t.Context(), "open", map[string]any{"path": []string{"cpu.pb.gz", "cpu-new.pb.gz"}[r.IntN(2)]})
+				if isErr || json.Unmarshal([]byte(text), &o) != nil {
+					t.Errorf("open: %s", text)
+					continue
+				}
+				switch r.IntN(3) {
+				case 0:
+					text, isErr = c.call(t.Context(), "page_explain", map[string]any{"handle": o.Handle, "view": o.DefaultView, "explanations": []any{}})
+				case 1:
+					text, isErr = c.call(t.Context(), "page_state", map[string]any{})
+				case 2:
+					if order := e.s.live.snapshot().order; len(order) > 0 {
+						text, isErr = c.call(t.Context(), "page_show", map[string]any{"publication": order[r.IntN(len(order))]})
+					}
+				}
+				// A handle another call evicted, or a publication dropped
+				// since the snapshot, is an answer the tool gives.
+				if isErr && !strings.Contains(text, "is not open") && !strings.Contains(text, "is not kept") {
+					t.Errorf("page tool: %s", text)
+				}
+			}
+		})
+	}
 	wg.Wait()
 	mu.Lock()
 	started := slices.Clone(jobs)
 	mu.Unlock()
+	if text, isErr := hubWaitEnd(t, steady, steadyJob); isErr {
+		t.Errorf("the steady capture: %s", text)
+	} else {
+		done(text)
+	}
 	last := newMCPSession(t, e.s, "cleanup")
 	for _, j := range started {
 		last.callOK("capture_cancel", map[string]any{"id": j}, nil)
-		hubWaitEnd(t, last, j)
+		if text, isErr := hubWaitEnd(t, last, j); !isErr {
+			done(text)
+		}
 	}
 	close(stop)
 	sampler.Wait()
@@ -875,6 +974,35 @@ func TestFourSessionsRaceTheCaptureTools(t *testing.T) {
 	}
 	if len(started) == 0 {
 		t.Error("no capture was accepted in 3s")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(results) == 0 {
+		t.Error("no capture ended done")
+	}
+	for _, r := range results {
+		if r.Derived != derivedReady || r.Publication == "" {
+			t.Errorf("capture %s: derived %q (%s), publication %q", r.Capture.Capture, r.Derived, r.DeriveError, r.Publication)
+		}
+	}
+	// The kept publications: at most MaxPublications, each once, the
+	// current one last, each keeping its files, and as the snapshot lists
+	// them.
+	l, snap := e.s.live, e.s.live.snapshot()
+	ids := pubIDs(e.s)
+	if len(ids) > maxPubs || len(slices.Compact(slices.Sorted(slices.Values(ids)))) != len(ids) {
+		t.Errorf("kept %q", ids)
+	}
+	if l.current != "" && ids[len(ids)-1] != l.current {
+		t.Errorf("current %q is not last in %q", l.current, ids)
+	}
+	if !slices.Equal(slices.Sorted(slices.Values(ids)), slices.Sorted(slices.Values(snap.order))) || snap.current != l.current {
+		t.Errorf("kept %q current %q, the snapshot lists %q current %q", ids, l.current, snap.order, snap.current)
+	}
+	for _, p := range l.pubs {
+		if len(p.files) == 0 {
+			t.Errorf("%s records no file", p.id)
+		}
 	}
 }
 
@@ -954,5 +1082,131 @@ func TestAnUnsteeredPublicationStandsInForADroppedCurrent(t *testing.T) {
 	publish(false)
 	if s.live.current != "p4" || !slices.Equal(pubIDs(s), []string{"p4"}) || s.live.snapshot().current != "p4" {
 		t.Errorf("the current one dropped: current %q, kept %q", s.live.current, pubIDs(s))
+	}
+}
+
+// The disk refusal names the captures the page keeps from retention, with
+// the live page only.
+func TestTheDiskRefusalNamesPublishedCaptures(t *testing.T) {
+	for _, live := range []bool{false, true} {
+		t.Run(fmt.Sprintf("live=%v", live), func(t *testing.T) {
+			e := newJobEnv(t, jobOpts{live: live, limits: func(l *Limits) {
+				l.Capture.MaxProfileBytes, l.Capture.MaxExeclogBytes = 1, 1
+				l.Capture.MaxStoredBytes = 3 + 1 + storeHeadroom
+			}})
+			// The first capture makes the directory (its profile is over
+			// MaxProfileBytes); then a file no capture owns fills it.
+			e.run(e.request(time.Second))
+			junk := filepath.Join(e.profiles, defaultStdioCaptures, "junk")
+			if err := os.WriteFile(junk, make([]byte, 2*storeHeadroom), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			j, v := e.run(e.request(time.Second))
+			ce := jobErr(j)
+			if v.Status != string(jobFailed) || ce == nil || ce.Code != capture.CodeDisk || !strings.Contains(ce.Message, "Capture.MaxStoredBytes") {
+				t.Fatalf("view %+v, err %v", v, ce)
+			}
+			if got := strings.Contains(ce.Message, "retention keeps every capture the live page shows"); got != live {
+				t.Errorf("the message names the page's captures: %v, want %v: %s", got, live, ce.Message)
+			}
+		})
+	}
+}
+
+// A capture is published whatever the store kept open: derive's own opens
+// evict the handles it opened first when MaxOpenHandles is below their
+// number, and the pages are made from what the job pinned. Every limit
+// from 1 to 5, with two modes, alone and compared.
+func TestAPublicationNeedsNoOpenHandle(t *testing.T) {
+	modes := []any{"cpu", "offcpu"}
+	for handles := 1; handles <= 5; handles++ {
+		t.Run(fmt.Sprintf("MaxOpenHandles=%d", handles), func(t *testing.T) {
+			e := newHubEnv(t, jobOpts{limits: func(l *Limits) { l.MaxOpenHandles = handles }})
+			a := newMCPSession(t, e.s, "A")
+			r := hubResult(t, a, hubCapture(t, a, map[string]any{"command": workloadCmd(t), "duration": "1s", "modes": modes}))
+			if r.Derived != derivedReady || r.Publication == "" {
+				t.Fatalf("two modes: derived %q (%s), publication %q", r.Derived, r.DeriveError, r.Publication)
+			}
+			e.fakeProfile(pmfixture.CPUBasicNew())
+			r = hubResult(t, a, hubCapture(t, a, map[string]any{"command": workloadCmd(t), "label": "cand", "compare_with": "001"}))
+			if r.Derived != derivedReady || r.Publication == "" || r.DiffPublication == "" {
+				t.Fatalf("compared: derived %q (%s), publication %q, diff %q", r.Derived, r.DeriveError, r.Publication, r.DiffPublication)
+			}
+			if r.Compare == nil || len(r.Compare.Views) != 2 {
+				t.Errorf("compare %+v, want a view per mode", r.Compare)
+			}
+			if st := stateBy(t, e.s); st.Current != r.DiffPublication {
+				t.Errorf("current %q, want the diff %q", st.Current, r.DiffPublication)
+			}
+		})
+	}
+}
+
+// When the facts page is published and the diff is not, the facts page
+// stays and, with show, is shown; the error says so, and the recipe makes
+// only the diff again.
+func TestAFailedDiffKeepsAndShowsTheFactsPage(t *testing.T) {
+	var fail atomic.Bool
+	e := newHubEnv(t, jobOpts{setup: func(s *Server) {
+		s.beforeCaptureDiff = func() error {
+			if fail.Load() {
+				return errors.New("injected")
+			}
+			return nil
+		}
+	}})
+	a := newMCPSession(t, e.s, "A")
+	hubResult(t, a, hubCapture(t, a, hubArgs(t, "1s")))
+	fail.Store(true)
+	r := hubResult(t, a, hubCapture(t, a, map[string]any{"command": workloadCmd(t), "label": "cand", "compare_with": "001"}))
+	if r.Derived != derivedFailed || r.Publication != "p2" || r.DiffPublication != "" {
+		t.Fatalf("derived %q, publication %q, diff %q", r.Derived, r.Publication, r.DiffPublication)
+	}
+	if want := "publication: the facts page p2 is kept and shown, but the diff was not published: injected"; r.DeriveError != want {
+		t.Errorf("derive_error %q, want %q", r.DeriveError, want)
+	}
+	if st := stateBy(t, e.s); st.Current != "p2" || st.By != "A" {
+		t.Errorf("state %+v, want the facts page p2 shown", st)
+	}
+	if r.Recompute == nil || slices.ContainsFunc(r.Recompute.Steps, func(c toolCall) bool { return c.Tool == "page_explain" }) ||
+		!slices.ContainsFunc(r.Recompute.Steps, func(c toolCall) bool { return c.Tool == "page_diff" }) {
+		t.Errorf("recompute %+v, want the diff and not the facts page", r.Recompute)
+	}
+	if m, ok := e.manifestOf("adhoc", "002"); !ok || m.Outcome != captureOK {
+		t.Errorf("manifest %+v (found %v)", m, ok)
+	}
+
+	args := map[string]any{"command": workloadCmd(t), "label": "cand2", "compare_with": "001", "show": false}
+	r = hubResult(t, a, hubCapture(t, a, args))
+	if want := "publication: the facts page p3 is kept, but the diff was not published: injected"; r.DeriveError != want {
+		t.Errorf("show false: derive_error %q, want %q", r.DeriveError, want)
+	}
+	if st := stateBy(t, e.s); st.Current != "p2" {
+		t.Errorf("show false moved the page to %q", st.Current)
+	}
+}
+
+// A diff keeps both captures' own files, even when the store read the
+// baseline's bytes from another file first: here an equal profile opened
+// before the baseline was captured.
+func TestADiffKeepsTheBaselinesOwnFiles(t *testing.T) {
+	e := newHubEnv(t, jobOpts{})
+	writeCPUFixtures(t, Config{ProfilesDir: e.profiles})
+	a := newMCPSession(t, e.s, "A")
+	// cpu.pb.gz holds the bytes the fake writes, so 001 shares its entry.
+	a.callOK("open", map[string]any{"path": "cpu.pb.gz"}, nil)
+	hubResult(t, a, hubCapture(t, a, hubArgs(t, "1s")))
+	e.fakeProfile(pmfixture.CPUBasicNew())
+	r := hubResult(t, a, hubCapture(t, a, map[string]any{"command": workloadCmd(t), "label": "cand", "compare_with": "001"}))
+	if r.DiffPublication == "" {
+		t.Fatalf("no diff: %q", r.DeriveError)
+	}
+	diff := e.s.live.snapshot().pubs[r.DiffPublication]
+	base, _ := e.manifestOf("adhoc", "001")
+	cand, _ := e.manifestOf("adhoc", "002")
+	for _, f := range slices.Concat(base.Files, cand.Files) {
+		if !slices.Contains(diff.files, fileKey{f.Dev, f.Ino}) {
+			t.Errorf("the diff does not keep %s", f.Name)
+		}
 	}
 }

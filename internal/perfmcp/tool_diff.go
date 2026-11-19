@@ -243,6 +243,13 @@ func (s *Server) diffPage(q diffQuery, limit int, cursor string) (diffResult, er
 	if err != nil {
 		return diffResult{}, err
 	}
+	return s.diffPageOf(q, base, next, limit, cursor)
+}
+
+// diffPageOf is diffPage over sides already found: q's handles' entries
+// and views, which a capture's derivation holds pinned, so they need not
+// still be open.
+func (s *Server) diffPageOf(q diffQuery, base, next diffSide, limit int, cursor string) (diffResult, error) {
 	key := diffKey(q)
 	d, ok := s.diffs.get(key)
 	if !ok {

@@ -705,9 +705,13 @@ func (r *jobRun) spaceCheck() error {
 	}
 	const next = "remove captures of that series by hand, or raise --limit Capture.MaxStoredBytes"
 	if !s.storeHasRoom(used, need) {
+		kept := ""
+		if s.live != nil {
+			kept = "; retention keeps every capture the live page shows for as long as the page keeps its publication"
+		}
 		return capture.Errorf(capture.CodeDisk, next,
-			"the capture directory %s holds %d bytes after retention, and this capture may write %d more, over Capture.MaxStoredBytes=%d%s",
-			r.d.rel, used, need, c.MaxStoredBytes, largestSeries(r.d))
+			"the capture directory %s holds %d bytes after retention, and this capture may write %d more, over Capture.MaxStoredBytes=%d%s%s",
+			r.d.rel, used, need, c.MaxStoredBytes, largestSeries(r.d), kept)
 	}
 	free, err := r.freeBytes()
 	if err != nil {
@@ -1026,11 +1030,17 @@ func (r *jobRun) done() {
 	if err := s.engine.acquire(s.ctx, holder{tool: "capture " + cmp.Or(j.captureIDNow(), j.id), by: j.by}); err != nil {
 		res = s.underived(m, r.base, "the server is shutting down")
 	} else {
-		res = s.derive(j, m, r.base)
+		var d derivation
+		res, d = s.derive(j, m, r.base)
 		if s.live != nil && res.Derived == "" {
-			if err := s.capturePublish(j, m, &res); err != nil {
-				res.Derived, res.DeriveError = derivedFailed, "publication: "+err.Error()
-				res.Recompute = new(s.recomputeFor(m, r.base, ""))
+			if err := s.capturePublish(j, m, &res, d); err != nil {
+				rc := s.recomputeFor(m, r.base, "")
+				if res.Publication != "" {
+					// The facts page is kept: the recipe does not make it
+					// again.
+					rc = withoutTool(rc, "page_explain")
+				}
+				res.Derived, res.DeriveError, res.Recompute = derivedFailed, "publication: "+err.Error(), &rc
 				s.log.Warn("capture publication failed; the capture stays committed", "job", j.id, "err", res.DeriveError)
 			}
 		}

@@ -25,7 +25,7 @@ Read the server's own guide before the first tool call: the MCP prompt `perf-age
 4. Two profiles: `open` both, then `diff`.
 5. Write each explanation as prose that places every figure with a claim placeholder such as `{c1}` and names frames with `{n:<node id>}`; give each claim its `metric`, `denominator`, `unit` and `value`.
 6. `render_flamegraph` checks the claims and writes the page. If it is rejected, nothing was written: read every failure, fix them all (for a mismatch, re-check the claim's node and metric rather than copying the value), and call again with `attempt` set to the returned attempt. An existing `out` is never replaced, so use a new name for a new page.
-7. The live page is not part of this server: it will ship with a separate long-lived serve binary. Use `render_flamegraph` when the user wants a page.
+7. The live page is `perf-agent-hub`'s: one long-lived server that several agents share, which the client configures as an HTTP server (see docs/mcp.md). Headless loops use the stdio `perf-agent-mcp`, which has no page; there, use `render_flamegraph` when the user wants a page. On the hub, `page_explain` checks claims as `render_flamegraph` does and publishes them on the page instead of writing a file, `page_diff` publishes a diff, `page_show` steers the page, and `page_open` gives its URL to hand to the user. When the user refers to something on the page, call `page_state`: its `asks` are the frames the user asked their agent about (the question itself is in the chat), and `user` is their last selection, best effort.
 
 ## Capture loop
 

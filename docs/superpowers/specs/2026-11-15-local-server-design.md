@@ -168,7 +168,8 @@ socket:
     keeps the lease while perf-agent finishes or is stopped. A capture
     job in a restarted serve, or in a second one, finds the lease held.
     The job takes the lease nonblocking, in `preparing`, before any
-    filesystem side effect, so it **fails** with `busy` and the reaper's
+    filesystem side effect beyond the directory and its `.owner`, which
+    already exist then, so it **fails** with `busy` and the reaper's
     pid. The `capture` call itself still returned `accepted`, because the
     request does no I/O (CAP-R13). It runs no retention or recovery on
     that directory until the lease is free. Recovery then checks the
@@ -198,9 +199,9 @@ socket:
   - Both binaries parse these through one new shared package,
     `internal/mcpflags`, moved out of `cmd/perf-agent-mcp/main.go`.
   - It adds `--port` and `--runtime-dir`.
-- **`perf-agent-hub token`** prints
+- **`perf-agent-hub token --port N`** (or `--url URL`) prints
   `{"Authorization":"Bearer <token>"}` for a client's header helper
-  (§D2.3).
+  (§D2.3), only while the hub runs and its `hub.json` names that port.
 - **`perf-agent-hub url`** prints the page URL for the user.
 
 **What the separate binary requires: `perfmcp` must stop importing
@@ -251,8 +252,9 @@ package, and the restored M2 test proves it (§D7).
     `--port`.
   - A fixed port is needed because an HTTP MCP client's config names a
     URL (§D2.3).
-  - The default number is picked at implementation from an unassigned
-    range.
+  - The default is **7362**, in IANA's unassigned 7360–7364 (SRV-R16;
+    7341, the plan's first pick, lies in the 7300–7359 range assigned
+    to swx).
 - **Stop.** On SIGINT or SIGTERM:
   1. stop accepting connections;
   2. close the page hub (streams end, and pages show M2b's "not running"
@@ -284,9 +286,13 @@ So:
 - **An interactive session with a human watching:** the user configures
   that client with the HTTP entry (`perf-agent-live` →
   `http://127.0.0.1:PORT/mcp`), served by `perf-agent-hub`.
-- **Do not configure both in one session.** The tool names would collide
-  (`mcp__perf-agent__open` against `mcp__perf-agent-live__open`). The
-  docs say so.
+- **Do not configure both in one session.** The tool names do not
+  collide, since clients name each tool by its server
+  (`mcp__perf-agent__open` and `mcp__perf-agent-live__open`). But the
+  same tools appear twice, and the agent's work is split between two
+  engines, with their own handles and pages, and two capture
+  directories.
+  The docs say so.
 - **A client configured for HTTP while no server runs** shows the server
   as failed to connect, and the agent has no perf-agent tools. This is
   visible and harmless. Headless configurations use stdio and never hit
@@ -388,16 +394,26 @@ restart's rotated token is picked up without editing config):
 // Claude Code (.mcp.json or `claude mcp add-json`)
 { "mcpServers": { "perf-agent-live": {
     "type": "http",
-    "url": "http://127.0.0.1:PORT/mcp",
-    "headersHelper": "perf-agent-hub token" } } }
+    "url": "http://127.0.0.1:7362/mcp",
+    "headersHelper": "perf-agent-hub token --port 7362" } } }
 ```
 
 ```toml
 # Codex (~/.codex/config.toml)
 [mcp_servers.perf-agent-live]
-url = "http://127.0.0.1:PORT/mcp"
-http_headers_helper = "perf-agent-hub token"
+url = "http://127.0.0.1:7362/mcp"
+http_headers_helper = "perf-agent-hub token --port 7362"
 ```
+
+- **The helper names the client's port** (`--port N`, or `--url` with
+  the client's URL) and prints the token only when the running hub holds
+  its lock and listens there. A client still configured for a port the
+  hub left, where another local user may listen, never sends that user
+  the token. The client still talks to whoever listens there, so the
+  docs tell users to keep the URL and `--port` in step.
+- **The URL names `127.0.0.1`, never `localhost`**: `localhost` may
+  resolve to `::1`, where the hub does not listen, and `token --url`
+  refuses it.
 
 - **Claude Code** runs the helper on every connection, and "On a 401 or
   403, it re-runs and the call is retried once" ([Claude Code MCP
@@ -452,7 +468,8 @@ holder".
   1. **Header-only rejection first.** These checks all run before any
      body byte is read (§D2.6):
      - Front's Host check;
-     - the MCP guard's `Origin`/`Sec-Fetch-*` refusal;
+     - the MCP guard's refusal of `Origin`, `Sec-Fetch-Site` or
+       `Sec-Fetch-Dest` (`Sec-Fetch-Mode` alone passes, SRV-R8);
      - the bearer token;
      - `Content-Type`;
      - `Content-Length`, which is required (a chunked body gets `411`);
@@ -468,6 +485,13 @@ holder".
      (default 2 s; a loopback client sends 4 MiB in milliseconds), or the
      connection is dropped. Reader and bytes are released as soon as the
      message is parsed, or refused.
+
+     **A reserve for small messages (SRV-R13).** One reader and 64 KiB
+     (as far as a `MaxMessageBytes` body still fits beside them) are kept
+     for bodies of at most 64 KiB, which every control message is. Large
+     bodies that stall therefore never keep a cancel or a ping from being
+     read. A large body refused for want of room names the reserve
+     (`MaxIngressReaders=16 reached (1 kept for small messages)`).
   3. **Parse, then classify.** Classification happens **only after**
      parsing: the server reads the JSON-RPC `method`, `id` and, for
      `tools/call`, the tool name. Then it admits the message into its
@@ -475,7 +499,7 @@ holder".
 
      | Class | Members | Bound | When full |
      |---|---|---|---|
-     | **control** | `notifications/cancelled`, `ping`, `initialize`, `tools/list` and the other list methods, `DELETE`, and **`capture_cancel`** (CAP-R10) | `MaxControlInFlight` (default 32), apart from every other class | `503` |
+     | **control** | `notifications/cancelled`, `ping`, `initialize`, `tools/list` and the other list methods, `DELETE`, and **`capture_cancel`** (CAP-R10) | `MaxControlInFlight` (default 32), apart from every other class, for `ping`, `initialize`, the list methods and `capture_cancel`. **Notifications, `notifications/cancelled` included, and `DELETE` are exempt (SRV-R12):** they are answered under the transport's lock and hold nothing, and a refused cancel would be lost | `503` |
      | **page_state** | the `page_state` tool and `resources/read` of `perf-agent://page/state` | `MaxPageStateInFlight` (default 4) | `503` |
      | **calls** | every other `tools/call` and `resources/read`, `capture_wait` included | `MaxCalls` (default 16) active plus queued server-wide, `MaxCallsPerSession` (default 4), and `MaxRequestBytes` (default 16 MiB) of retained decoded arguments; never the raw body | `503` with a JSON-RPC error carrying the request's id, saying which cap was hit |
   4. **Dispatch.** Control and `page_state` messages are answered inline
@@ -490,6 +514,8 @@ holder".
   - **Under a slow-body flood**, while `MaxIngressReaders` readers are
     busy, **every new request, controls included, is refused** with
     `503`, until readers free. That happens within `IngressBodyTimeout`.
+    A flood of bodies over 64 KiB leaves the small-message reserve free
+    (SRV-R13), so only stalled small bodies can shut controls out.
   - Only the token holder can mount such a flood, since every request
     is authenticated from its headers before its body is read.
 - **Waiting.** An admitted call waits for the slot in FIFO order.
@@ -537,7 +563,9 @@ states it:
 - a request does a pure argument check and an in-memory active-job
   admission, with no I/O;
 - the job takes the nonblocking captures-directory lease before any
-  filesystem side effect, so cross-process `busy` is an **async job
+  filesystem side effect other than creating the directory and its
+  `.owner` (which hold the lock file, and exist already whenever another
+  process holds the lease), so cross-process `busy` is an **async job
   failure**, not a synchronous refusal;
 - the engine is held for prepare's shared inputs (baseline, pins,
   protected inputs, retention) and for derivation and pin release;
@@ -548,7 +576,10 @@ states it:
 
 - **The engine is serve's engine slot (§D2.4).** The capture job takes
   it like any tool call, for exactly the steps the capture design names.
-  Waiting for it is bounded by `MaxEngineWait` like any caller.
+  **Its waits are not bounded by `MaxEngineWait`**, which bounds tool and
+  page calls only: a job's wait ends only with a cancel or shutdown, and
+  the slot's FIFO waiting rules out starvation (plan reconciliation
+  row 6).
 - **Admission classes (§D2.4).**
   - `capture`, `capture_wait` and `capture_list` are in the **calls**
     class, so they count against `MaxCalls` and `MaxCallsPerSession`.
@@ -597,7 +628,7 @@ states it:
 **Long calls.** `livehttp.NewServer`'s `WriteTimeout` (30 s) would cut a
 `capture_wait` or a call that waits for the slot (up to 45 s). The `/mcp`
 handler therefore:
-1. reads the body under a 30 s read deadline;
+1. reads the body under `IngressBodyTimeout` (default 2 s, SRV-R4c);
 2. **clears the read deadline** before any wait;
 3. clears the write deadline on entry, through `http.ResponseController`;
 4. sets a 10 s write deadline just before writing the response, so a
@@ -622,7 +653,7 @@ Every request goes through **`livehttp.Front`**, which is new:
 
 | Route | Methods | Guard (after Front) |
 |---|---|---|
-| `/mcp` | POST, DELETE (GET → 405) | **MCP guard:** any `Origin` header → 403, including an empty value or a repeated header (the spec says a present, invalid Origin gets 403, and for this endpoint every Origin is invalid: no browser is a client); any `Sec-Fetch-*` header → 403; Bearer token (constant time) → else 401; `Content-Type: application/json`; `Content-Length` required (chunked → 411); body ≤ `MaxMessageBytes` (`http.MaxBytesReader`, 413 over) read under a 30 s read deadline; the admission caps (§D2.4) |
+| `/mcp` | POST, DELETE (GET → 405) | **MCP guard:** any `Origin` header → 403, including an empty value or a repeated header (the spec says a present, invalid Origin gets 403, and for this endpoint every Origin is invalid: no browser is a client); a `Sec-Fetch-Site` or `Sec-Fetch-Dest` header → 403, while `Sec-Fetch-Mode` alone passes, since Node's `fetch` sends it (SRV-R8); Bearer token (constant time) → else 401; `Content-Type: application/json`; `Content-Length` required (chunked → 411); body ≤ `MaxMessageBytes` (`http.MaxBytesReader`, 413 over) read within `IngressBodyTimeout` (2 s, SRV-R4c); the admission caps (§D2.4) |
 | `/s/<page token>/…` | GET, HEAD | **`livehttp.Guard` unchanged** (M2b D5, R6, R8): body refused, same-origin fetch metadata, shell navigation exception |
 | `/s/<page token>/inbox` | POST | **Inbox guard:** page token; `Origin` must appear exactly once, be non-empty and equal `http://` + Host; `Sec-Fetch-Site` must be present and `same-origin`; `Content-Type: application/json` (a non-simple type, so a cross-origin request needs a preflight that never succeeds: no CORS); custom header `X-Perf-Agent-Page: 1`; body ≤ 1 KiB under a 2 s read deadline; rate 5 per second per server (token bucket), else 429 |
 
@@ -866,13 +897,27 @@ authority over TCP**, and accepts **one kind of browser write**.
 
 | Adversary | Can | Cannot, because |
 |---|---|---|
-| Another local **user** | connect to `127.0.0.1:PORT` | guess either 256-bit token, or read the 0600 token files in the 0700 per-uid runtime directory. Both tokens compare in constant time |
+| Another local **user** | connect to `127.0.0.1:PORT`; fill the listener (below); listen on a port the hub is not on, and answer a client still configured for it | guess either 256-bit token, or read the 0600 token files in the 0700 per-uid runtime directory. Both tokens compare in constant time. The token helper prints the token only for the running hub's port (§D2.3), so a squatter never receives it |
 | A process with **the user's uid** (malware, a compromised tool) | read `mcp-token` and call every tool, `capture` included | do more than it already could: it can read the profiles itself and run the setcap'd `perf-agent` directly (the capture design's §12 makes the same point). Out of scope, as in M2b. The stdio-over-HTTP design keeps this cost visible: it is why the default stays stdio for headless use |
 | A **web page** in the user's browser | send requests to `127.0.0.1:*`, including a cross-site navigation to the page shell (M2b-R6) | **MCP:** it has no bearer token, cannot set `Authorization` cross-origin without a CORS preflight that never succeeds, and any request it makes carries `Origin` and `Sec-Fetch-Site`, which `/mcp` refuses. **Inbox:** it lacks the page token; with a leaked token it still fails the `Origin`, `Sec-Fetch-Site`, content-type and custom-header checks |
 | A **DNS-rebinding** page | reach the port under its own hostname | pass `Front`'s Host check |
 | Someone **with the page URL** (history, screen share) | read the page and append `select`, `focus` and `ask` reports | call a tool, or inject text: reports are validated IDs, and names come from the engine (§D4). Rotation: restart `perf-agent-hub` |
 | A **misbehaving agent** | flood tool calls, steer the page, evict others' handles | exhaust memory or goroutines: `MaxCalls`, `MaxCallsPerSession` and `MaxRequestBytes` refuse excess at once (SRV-R4). It also cannot starve the page (snapshot reads), delay a parsed control message behind calls or the engine (SRV-R4b), or hold the slot forever (`MaxEngineWait`); every tool keeps M2's bounds. **With the token it can flood slow bodies:** while `MaxIngressReaders` are busy, new requests, controls included, get `503` until readers free, within `IngressBodyTimeout` (SRV-R4c, stated conditionally). The flood holds no engine state, and capture jobs keep running |
 | **Hostile profile content** | as in M2b | as in M2b; the inbox stores no page-supplied text |
+
+**Connections (SRV-R11b).**
+- The listener holds at most **512** connections, a bound on file
+  descriptors; one more waits in the kernel's backlog.
+- A connection that sends no first byte within **2 s** is closed
+  unanswered and never reaches a guard. Once bytes arrive, the HTTP
+  server's 5 s header timeout applies.
+- At most **64** MCP answers are written at once. A place is taken only
+  by a request past the MCP guard, so 64 × the answer bound holds the
+  memory of unread answers, and only token holders consume it.
+- **Residual:** any local user can still fill a loopback listener, by
+  opening connections again and again. That is inherent to a TCP port
+  on a shared machine; the hub recovers once they stop, and such
+  connections reach no guard, engine or answer.
 
 **Long-lived consequences:**
 - **Memory.** It is bounded as in M2b (`MaxRetainedBytes`, an estimated
@@ -949,8 +994,9 @@ authority over TCP**, and accepts **one kind of browser write**.
 - an unsupported `MCP-Protocol-Version` → 400;
 - a 2026-07-28-style probe → a 400 that makes a client fall back;
 - a notification → 202; a batch → refused; a body over the limit → 413;
-- any `Origin` (including an empty value and a repeated header) or
-  `Sec-Fetch-*` on `/mcp` → 403;
+- any `Origin` (including an empty value and a repeated header),
+  `Sec-Fetch-Site` or `Sec-Fetch-Dest` on `/mcp` → 403, while
+  `Sec-Fetch-Mode` alone passes (SRV-R8);
 - every guard refusal is answered before a body byte is read and before
   dispatch, checked with a body that blocks;
 - a chunked body → 411;
@@ -1024,11 +1070,14 @@ authority over TCP**, and accepts **one kind of browser write**.
   - **cross-process busy:** the captures directory's lease is held by
     another process (a stdio server, or a reaper left by a crashed
     serve). `capture` still returns `accepted`; the job then fails with
-    `busy` naming the holder, having made no filesystem side effect;
+    `busy` naming the holder. It creates no entry: the directory and its
+    `.owner` already exist whenever another process holds the lease, and
+    the captures tree is the same before and after;
   - **derivations contend like tools:** a job's prepare and derivation
     steps wait for the engine slot behind other sessions' tools, and the
-    reverse, both bounded by `MaxEngineWait`. A blocked hash or fsync in
-    `committing` never holds the slot;
+    reverse. A tool's wait is bounded by `MaxEngineWait`; a job's is not,
+    and it still completes once the slot frees (reconciliation row 6).
+    A blocked hash or fsync in `committing` never holds the slot;
   - **page publication:** a committed capture is published facts-only
     with `by`, and a publication failure leaves the capture committed
     with `derived: failed`;
@@ -1113,7 +1162,7 @@ authority over TCP**, and accepts **one kind of browser write**.
 
 | Path | Method | Auth | Returns |
 |---|---|---|---|
-| `/mcp` | POST | Bearer MCP token | JSON-RPC response (`application/json`) or 202 |
+| `/mcp` | POST | Bearer MCP token; no `Origin`, `Sec-Fetch-Site` or `Sec-Fetch-Dest` (SRV-R8); the body within `IngressBodyTimeout`, 2 s (SRV-R4c) | JSON-RPC response (`application/json`) or 202 |
 | `/mcp` | DELETE | Bearer + session | 204 or 404 |
 | `/mcp` | GET | — | 405 |
 | `/s/<page token>/…` | GET, HEAD | page token | every M2b route unchanged (M2b §6); `state` gains `by` per publication and `inbox` counts |
@@ -1267,8 +1316,8 @@ The questions of the first draft were answered on 2026-11-15 (decision
 8). What remains is minor, and the defaults hold:
 
 1. **The default port number.**
-   - **Default:** one from an unassigned range, chosen at implementation
-     and written in the docs, with `--port` to change it.
+   - **Decided:** 7362, from IANA's unassigned 7360–7364 (SRV-R16), and
+     written in the docs, with `--port` to change it.
 2. **`MaxOpenHandles` in serve.**
    - **Default:** 32, since several agents share one store; stdio keeps 8.
 
@@ -1412,3 +1461,21 @@ Codex found no new serve-only issue. One shared change is mirrored here:
 |---|---|---|
 | **CAP-R17** | The `result.json` sidecar and the `.journal` are removed. Derived results live only in the in-memory job registry. After eviction or a restart, `capture_wait` answers terminally from the committed manifest with `derived: "recompute"` and the exact `open`/`diff` calls to run | §D2.5, §D3, §6, §9 and the §D7 server test now say so; no serve text mentions a sidecar, a journal or a derived result read from disk. In serve the recompute answer also names the `page_explain` call that publishes the capture again |
 
+### 10.6 Amendments from the implementation (plan 2026-11-16)
+
+The plan's rulings (`.superpowers/sdd/2026-11-16-serve-plan/progress.md`)
+and its spec-reconciliation rows changed these details. Each is now
+written where it applies:
+
+| Ruling or row | Change | Where |
+|---|---|---|
+| **SRV-R4c** | The `/mcp` body is read under `IngressBodyTimeout` (2 s), not within the 30 s first written | §D2.5 "Long calls" step 1, §D2.6's table, §4 |
+| **Reconciliation row 6** | A capture job's waits for the engine are not bounded by `MaxEngineWait`; only a cancel or shutdown ends them, and FIFO waiting rules out starvation. `MaxEngineWait` bounds tool and page calls | §D2.5, §D7 |
+| **SRV-R8** | Browser metadata on `/mcp` is `Origin`, `Sec-Fetch-Site` or `Sec-Fetch-Dest`; `Sec-Fetch-Mode` alone passes (Node's `fetch` sends it). It replaces the refusal of any `Sec-Fetch-*` header | §D2.4 stage 1, §D2.6's table, §D7, §4 |
+| **SRV-R12** | Notifications, `notifications/cancelled` included, and `DELETE` are exempt from `MaxControlInFlight` | §D2.4's class table |
+| **SRV-R13** | One ingress reader and 64 KiB are kept for bodies of at most 64 KiB; a large body's refusal names the reserve | §D2.4 stage 2 and the overload guarantee |
+| **SRV-R11b** | The listener holds at most 512 connections; a connection with no first byte is closed after 2 s; at most 64 answers are written at once, only for authenticated requests. Any local user can still fill a loopback listener | §D6 |
+| **SRV-R16** | The default port is 7362 | §D1.2, §D2.3, §8 |
+| Task 10 (the token helper) | The helper names the client's port, and client URLs write `127.0.0.1`, not `localhost` | §D1.1, §D2.3, §D6 |
+| Task 14 | The two configurations' tool names do not collide (clients name tools by server); configuring both still shows the tools twice and splits the work | §D1.3 |
+| **Reconciliation row 2** | A cross-process `busy` job creates no entry; the directory and its `.owner` exist before the lease, as they must for another process to hold it | §2, §D2.5, §D7 |

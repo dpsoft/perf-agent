@@ -1,10 +1,10 @@
 # perf-agent-mcp
 
-`perf-agent-mcp` is an MCP server that lets an AI agent investigate perf-agent profiles and, when started with `--perf-agent`, capture new ones: an autonomous agent can run capture, analyse, change the code, capture again and compare. It speaks MCP over stdio only and works offline. It answers from the same profile model as `cmd/flamegraph`; every figure an agent states about a profile is checked against that engine before a page is written or published. A live page that a browser on the same machine reads will ship with a separate serve binary, not this one.
+`perf-agent-mcp` is an MCP server that lets an AI agent investigate perf-agent profiles and, when started with `--perf-agent`, capture new ones: an autonomous agent can run capture, analyse, change the code, capture again and compare. It speaks MCP over stdio only, works offline and links no networking. It answers from the same profile model as `cmd/flamegraph`; every figure an agent states about a profile is checked against that engine before a page is written or published. The live page, which a browser on the same machine reads while several agents share one server, is served by a separate binary, `perf-agent-hub`, the only one that listens (see [Watching with the live server](#watching-with-the-live-server)).
 
 ## What it does not do
 
-- It opens no outgoing connection: it never dials, looks a name up or makes an HTTP request. It opens no listener: nothing in this process serves HTTP, and the stdio server registers no `page_*` tool. The live page engine is compiled in as library code for the future serve binary, so the binary still links `net/http` until that split. It starts no process and makes no raw system call except at reviewed sites: the read-only `git` probe in `internal/sourceroot/git.go` (`exec.LookPath("git")`, then `exec.CommandContext`), and for capture two files of `internal/capture`. `exec_linux.go` holds the only two `exec.Command` calls: `exec.Command(self)` in `selfCommand`, this server's own binary re-run as a capture's reaper or launcher, and `exec.Command(path)` in `startPerfAgent`, the verified perf-agent. `launch_linux.go` holds the launcher's one `syscall.Exec` of the command and the only raw system calls, two `syscall.RawSyscall(syscall.SYS_PRCTL, …)`: `PR_SET_NO_NEW_PRIVS` (the launcher, before that exec) and `PR_SET_CHILD_SUBREAPER` (the reaper). Tests read the source of every non-standard package the binary links (perf-agent's own and pprof's; the standard library is not scanned) for client calls, name resolution, raw system calls, process starts and listening calls, hold those sites to exactly those shapes and callers, refuse cgo, assembly and `go:linkname` in those packages, and check that every socket of a running server is TCP on loopback. The scan is drift protection for code review, not a defence against a committer set on evading it: it follows no values beyond its rules.
+- It opens no outgoing connection: it never dials, looks a name up or makes an HTTP request. It opens no listener and links no networking package (`net`, `net/http`, `crypto/tls`, nor the hub's page and transport packages): a test of the built binary checks its dependencies, and it registers no `page_*` tool. `perf-agent-hub` is the only binary that listens. It starts no process and makes no raw system call except at reviewed sites: the read-only `git` probe in `internal/sourceroot/git.go` (`exec.LookPath("git")`, then `exec.CommandContext`), and for capture two files of `internal/capture`. `exec_linux.go` holds the only two `exec.Command` calls: `exec.Command(self)` in `selfCommand`, this server's own binary re-run as a capture's reaper or launcher, and `exec.Command(path)` in `startPerfAgent`, the verified perf-agent. `launch_linux.go` holds the launcher's one `syscall.Exec` of the command and the only raw system calls, two `syscall.RawSyscall(syscall.SYS_PRCTL, …)`: `PR_SET_NO_NEW_PRIVS` (the launcher, before that exec) and `PR_SET_CHILD_SUBREAPER` (the reaper). Tests read the source of every non-standard package the binary links (perf-agent's own and pprof's; the standard library is not scanned) for client calls, name resolution, raw system calls, process starts and listening calls, hold those sites to exactly those shapes and callers, refuse cgo, assembly and `go:linkname` in those packages, and check that every socket of a running server is TCP on loopback. The scan is drift protection for code review, not a defence against a committer set on evading it: it follows no values beyond its rules.
 - It never loads BPF, links neither `perfagent` nor `cilium/ebpf`, and never holds or raises a capability. With `--perf-agent` it runs the user's setcap'd `perf-agent` binary as a child process for a bounded time (see Capturing); without it, it captures nothing and starts no profiler.
 - It writes only pages under `--output` and captures in the capture directory, and never replaces an existing file. Retention in the capture directory is the one place it deletes files (see Retention). The one write outside its roots is a launched command's cgroup (see Guardrails).
 - It is not shipped in releases, release archives or container images. Build it from source.
@@ -26,7 +26,7 @@ go build -o perf-agent-mcp ./cmd/perf-agent-mcp
 | `--output DIR` | The root rendered pages are written to. Without it `render_flamegraph` is disabled. |
 | `--limit Name=Value` | Override a limit. Repeatable. Names are the fields of the limits tables below, such as `Model.MaxRawBytes=1073741824` or `Capture.MaxDuration=1m`. An unknown name exits 2 and lists the valid ones. |
 | `--perf-agent PATH` | The absolute path of the setcap'd perf-agent binary. Without it every capture tool answers `disabled`. Checked at start-up (see Setting up capture); a binary that fails the checks exits 1, a relative path exits 2. |
-| `--captures DIR` | The capture directory, a subdirectory of the profiles root (relative to it, or absolute inside it). Default `<profiles>/captures`. The profiles root itself, a non-directory, or a path or symlink that leads outside the root exits 2. Checked only with `--perf-agent`. |
+| `--captures DIR` | The capture directory, a subdirectory of the profiles root (relative to it, or absolute inside it). Default `<profiles>/captures` (`<profiles>/captures-hub` for `perf-agent-hub`). The profiles root itself, a non-directory, or a path or symlink that leads outside the root exits 2. Checked only with `--perf-agent`. |
 | `--capture-command PATH` | Repeatable allow-list: when given, a capture may launch only these programs (absolute paths; each a regular, executable file, not setuid, setgid or setcap'd, or the server exits 1). Without it any program may be launched. |
 | `--capture-ttl AGE` | How old an unkept capture may grow before retention deletes it, a Go duration (default `168h`, 7 days). `0` keeps captures of any age; negative exits 2. It wins over `--limit Capture.TTL`. |
 | `--gpu-shim PATH` | The absolute path of the CUPTI adapter a `gpu` capture injects. Without it `gpu` captures are refused. A shim that fails its checks exits 1. |
@@ -40,7 +40,7 @@ Every file is opened through an `os.Root`, so `..`, symlinks that leave the root
 
 ## Tools
 
-Integers are decimal strings in every result, a failure's `explanation` index included, except source line numbers (a row's `line` and each `lines[].n`) and the capture tools' own integers (`sample_rate` in settings, a target's or survivor's `pid` and `start_time`, `capture_list`'s counts, a failure's `perf_agent_exit`), which are JSON integers, so a setting read back can be passed again as it is. A perf-agent ended by a signal has `perf_agent_signal`, its name, instead of `perf_agent_exit`. The `open` and `diff` results a capture embeds keep their decimal strings. An argument of the wrong JSON type is refused naming the argument and the type it takes. A fact has `status` `ok`, `zero` or `unavailable`; an unavailable fact has a `reason` and no `value`.
+Integers are decimal strings in every result, a failure's `explanation` index and `page_state`'s counts included, except source line numbers (a row's `line` and each `lines[].n`) and the capture tools' own integers (`sample_rate` in settings, a target's or survivor's `pid` and `start_time`, `capture_list`'s counts, a failure's `perf_agent_exit`), which are JSON integers, so a setting read back can be passed again as it is. A perf-agent ended by a signal has `perf_agent_signal`, its name, instead of `perf_agent_exit`. The `open` and `diff` results a capture embeds keep their decimal strings. An argument of the wrong JSON type is refused naming the argument and the type it takes. A fact has `status` `ok`, `zero` or `unavailable`; an unavailable fact has a `reason` and no `value`.
 
 Every result about a GPU view carries the view's sampling `notes`, `render_flamegraph` results included. A result about a CPU view has no `notes` key (nor `diff`'s `base_notes` and `new_notes`), except `open`, whose `notes` is always present.
 
@@ -128,11 +128,11 @@ The server itself must run with euid other than 0, empty effective and permitted
 ### The loop
 
 ```json
-capture        {"command": ["/home/u/proj/bench", "-n", "3"], "cwd": "/home/u/proj", "series": "parse-opt", "label": "base", "duration": "20s", "keep": true}
+capture        {"command": ["/srv/proj/bench", "-n", "3"], "cwd": "/srv/proj", "series": "parse-opt", "label": "base", "duration": "20s", "keep": true}
                → {"job": "j1-3f9a", "status": "accepted", "eta": "…"}
 capture_wait   {"id": "j1-3f9a"}                         → the result: capture "parse-opt/001", each profile's open result with its handle
 … change the code, rebuild …
-capture        {"command": ["/home/u/proj/bench", "-n", "3"], "cwd": "/home/u/proj", "series": "parse-opt", "label": "cand1", "compare_with": "001"}
+capture        {"command": ["/srv/proj/bench", "-n", "3"], "cwd": "/srv/proj", "series": "parse-opt", "label": "cand1", "compare_with": "001"}
 capture_wait   {"id": "<job>", "timeout": "45s"}        → the result, with compare: comparability and the first diff rows
 capture_wait   {"id": "parse-opt/002"}                  → after a restart: from the manifest, with recompute
 capture_cancel {"id": "<job>"}
@@ -164,7 +164,7 @@ capture_list   {"series": "parse-opt"}
 - `capture_cancel {id}` answers `cancelling`, `cancelling (decision pending)`, `too late: committed`, `too late: failed` or `cancelled`. Job status, manifest outcome and answer always agree.
 - `capture_list {series?, limit?, cursor?}` lists the series with their counts, bytes and leftovers, or one series' captures newest first; it reads the manifests, so a loop finds its history after a restart. A history not read in time is `loading`.
 
-A stdio session's jobs end with it: EOF on stdin cancels them, and so does a client that stops reading its output (see Guardrails).
+A stdio session's jobs end with it: EOF on stdin cancels them, and so does a client that stops reading its output (see Guardrails). On `perf-agent-hub` jobs are the server's and outlive sessions (see Captures on the hub).
 
 ### Failures
 
@@ -246,9 +246,135 @@ These are stated as they are; the guardrails bound the agent, not malware runnin
 
 `capture` returns at once and `capture_wait` blocks at most 45 s, so no call comes near the smallest client limit, Codex's default of 60 s per tool call (`tool_timeout_sec`); no client configuration is needed. Claude Code's per-call limit (`MCP_TOOL_TIMEOUT`, or a per-server `timeout`) is far larger by default. Progress notifications do not extend either client's limit.
 
-## Live page
+## Watching with the live server
 
-The live page, a read-only page a browser on the same machine reads while the agent explains profiles, will ship with a separate long-lived serve binary. The stdio server has no `--live` flag, registers no `page_*` tool and opens no listener.
+`perf-agent-hub` is one long-lived MCP server on this machine, shared by several agents, that also serves the live page: a page a browser on the same machine reads while the agents explain profiles, and on which the user can point at a frame and ask their agent about it. Use it for an interactive session with a human watching. A headless loop, or an agent nobody watches, uses the stdio `perf-agent-mcp`: it keeps nothing between sessions, shares nothing with other agents and opens no socket.
+
+### Starting it
+
+```bash
+go build -o perf-agent-hub ./cmd/perf-agent-hub
+perf-agent-hub --profiles /path/to/profiles --output /path/to/pages
+```
+
+It takes the stdio server's flags (`--profiles`, `--source`, `--source-manifest`, `--source-git`, `--output`, `--limit` and the capture flags), and two of its own:
+
+| Flag | Meaning |
+|---|---|
+| `--port N` | The port, default 7362. The hub listens on `127.0.0.1` only; there is no address flag. A port in use exits 1, naming `--port`. |
+| `--runtime-dir DIR` | The runtime directory, default `$XDG_RUNTIME_DIR/perf-agent-mcp`, created when missing; without `XDG_RUNTIME_DIR` it must be given, and exist. It must be a directory of yours with mode 0700, not a symbolic link, or the hub refuses to start. |
+
+It runs in the foreground until SIGINT or SIGTERM. It prints the page URL once on stdout and logs to stderr; no log line carries a token. The URL holds the page's token: open it in your browser and give it to nobody. `perf-agent-hub url` prints it again. A second hub exits 1 with `perf-agent-hub is already running (pid N, port P)`: one runs per user.
+
+The runtime directory holds `hub.lock`, locked while the hub runs; `hub.json`, the pid, port, MCP URL, start time and version, and no token; `mcp-token`, the MCP token; and `page-url`. Each file is mode 0600. `hub.json`, `mcp-token` and `page-url` are removed at exit, and `hub.lock` stays, unlocked; a hub that died leaves them, and the next one removes them once it holds the lock. Both tokens, the MCP one and the page's, are new at each start.
+
+Besides the `Hub.*` limits below, the hub differs from stdio in two defaults: `MaxOpenHandles` is 32, since the agents share the handles, and captures go to `<profiles>/captures-hub` (see Captures on the hub).
+
+### Configuring a client
+
+The MCP endpoint is `http://127.0.0.1:7362/mcp`, Streamable HTTP with JSON responses. Every request carries `Authorization: Bearer <token>`. The token is never written in a URL or in a client's configuration: the client runs a headers helper, `perf-agent-hub token --port 7362`, when it connects, and the helper prints `{"Authorization":"Bearer <token>"}`, only while a hub runs on that port.
+
+Claude Code (a project's `.mcp.json`, a file passed to `--mcp-config`, or the JSON given to `claude mcp add-json perf-agent-live`):
+
+```json
+{
+  "mcpServers": {
+    "perf-agent-live": {
+      "type": "http",
+      "url": "http://127.0.0.1:7362/mcp",
+      "headersHelper": "perf-agent-hub token --port 7362"
+    }
+  }
+}
+```
+
+Codex (`~/.codex/config.toml`):
+
+```toml
+[mcp_servers.perf-agent-live]
+url = "http://127.0.0.1:7362/mcp"
+http_headers_helper = "perf-agent-hub token --port 7362"
+```
+
+- The helper's port must be the URL's. With `--port N`, change both. `token --url http://127.0.0.1:N/mcp` takes the URL itself instead.
+- Write `127.0.0.1`, never `localhost`, which may resolve to `::1`, where the hub does not listen; `token --url` refuses it.
+- Name `perf-agent-hub` by its absolute path when it is not in the client's PATH, and pass the helper `--runtime-dir DIR` when the hub was started with one.
+
+**A port the hub is not on.** Any local user can listen on a loopback port the hub is not using. The helper never sends the token there: it prints the token only when the running hub holds its lock and its `hub.json` names the port asked for; otherwise it exits 1 and prints nothing. But a client whose URL names such a port talks to an impostor, which can feed the agent false results and instructions: a prompt-injection channel. Keep the client's URL and `--port` in step, and when a client fails to connect, check `perf-agent-hub url`, which names the running hub's port, before changing anything.
+
+**Do not configure both in one session.** The stdio entry and the hub entry do not collide: clients name each tool by its server (`mcp__perf-agent__open`, `mcp__perf-agent-live__open`). But the same tools appear twice, and the two servers keep separate handles, pages and capture directories, so the agent's work is split between them. Use the hub entry where a human watches, and stdio for headless loops.
+
+**No hub running.** A client configured for the hub shows it as failed to connect, and the agent has no perf-agent tools. Start the hub, then reconnect the client (`/mcp` in Claude Code).
+
+**A restart.** Stopping the hub kills its running capture, ends the page's streams (open tabs say the server is not running), ends every session and removes the runtime files. Everything held in memory goes: handles, attempts, publications and the inbox. The new hub has new tokens and a new page URL (`perf-agent-hub url`). A client's next request gets 401 for the old token: Claude Code then runs its helper again and retries the call once, and starts a new session on the 404 its old one gets. Whether Codex runs its helper again after a 401 is not verified yet; if it keeps failing, restart Codex. The agent opens its profiles again, since its old handles are unknown. Captures on disk stay: `capture_wait` by capture id and `capture_list` read their manifests.
+
+### What the hub adds
+
+It has every stdio tool, and five more, plus the resource `perf-agent://page/state`. Its initialize instructions tell the agent to call `page_state` when the user refers to something on the page. One page is shared by every session: what one agent publishes, the others see.
+
+| Tool | Use |
+|---|---|
+| `page_open` | The page's URL, to give to the user, with the publications it keeps, the current one and `viewers`, the tabs open on it. |
+| `page_explain` | Check explanations exactly as `render_flamegraph` does, and publish them on the page as its current publication instead of writing a file; `explanations: []` publishes a view's facts alone. Attempts are shared with `render_flamegraph`. |
+| `page_diff` | Compare two views as `diff` does and publish the comparison, a flame graph coloured by change. |
+| `page_show` | Steer the page: make a kept publication current, select a node, or lay the graph out from it. |
+| `page_state` | What the user did on the page (see The inbox and page_state). |
+
+The page keeps `MaxPublications` publications, each with `by`, the label of the session that made it (its client's name). A tool that needs the engine while another agent's call holds it waits up to `MaxEngineWait` and is then answered with who holds it; the capture tools and `page_state` never wait for it.
+
+### The inbox and page_state
+
+On the page, a selected frame offers "Ask my agent about this". A click records an ask: the frame's node ID and name, the publication, its view and profile digest, and the time. An ask carries no text: the user writes the question in the chat, and the agent finds the frame with `page_state`. The page also reports the frame the user selects or lays the graph out from.
+
+`page_state {since?, limit?}` answers:
+
+- `agent`: what the page was told to show (`seq`, `current`, `selected`, `focus`, and `by`, the session that steered it);
+- `user`: the frame the user last selected or focused, absent until they did. It is best effort: the last report the server received. The page sends one report at a time, the newest replacing any waiting, so a quick run of clicks reaches the server late or not at all;
+- `asks`: `rows`, oldest first, each with `read_by`; `next`; and `dropped`. Pass `since` set to your last call's `next` to get only newer asks: each agent keeps its own cursor. `limit` defaults to 8 and is at most `Hub.MaxInboxEntries`. The inbox keeps the newest `Hub.MaxInboxEntries` asks; a `note` says when asks after `since` were dropped, or when `since` came from an earlier run of the hub;
+- `viewers`, the tabs watching.
+
+`read_by` is the first session that read an ask: `page_state` records it, and the page shows the ask as read. The resource `perf-agent://page/state` answers as `page_state` does without `since`, with the newest 8 asks, and reading it marks them read too. `page_state` never waits for the engine: it answers while another agent's tool runs. Its counts are decimal strings.
+
+The page's reports are the only thing a browser can send the hub: a POST from the page itself (same origin, its token, a custom header, at most 1 KiB, at most 5 a second). One about a publication or frame the hub no longer keeps is refused, and the page says so. A second ask of the same frame within 2 s is taken for the same click. No report changes what the agents made: the store, attempts, publications and steering are theirs alone.
+
+### Captures on the hub
+
+- **Its own directory.** Captures go to `<profiles>/captures-hub` unless `--captures` says otherwise. Its `.owner` file records the kind `hub`: the stdio server refuses that directory, and the hub refuses a stdio one (`owner_mismatch`). Never give both binaries one directory.
+- **Jobs are the server's.** Any session may `capture_wait` or `capture_cancel` any job, several may wait on one at once, and a session's end never cancels a job.
+- **Published on the page.** `capture` takes `show` (default true). A committed capture is published: a facts page of its first mode's default view, titled `<series>/NNN-<label> · <comm> (<pid>) · <mode> · <profiled duration>`, and with `compare_with` also a diff against the baseline. With `show` the page switches to the diff, else to the facts page; `show: false` only lists them. The result names them in `publication` and `diff_publication`. The facts page is the server's, not an agent's attempt: it records none and takes no place in `MaxAttemptViews`. A failed publication is `derived: "failed"` and the capture stays committed; when the diff fails, the facts page stays.
+- **Recompute.** On the hub, `recompute` ends with a `page_explain` (`explanations: []`, the same title) and, with a baseline, a `page_diff`, which publish the capture again. That `page_explain` is the agent's call, so it is an attempt.
+- **Retention.** Retention never removes a capture a kept publication shows: a series can hold `Capture.KeepPerSeries` unkept captures plus those its publications show, at most `MaxPublications` more.
+
+### Threat model
+
+The hub carries tool-calling authority over TCP, lives long and accepts one kind of browser write. What guards it:
+
+- **Loopback only.** It listens on `127.0.0.1` and opens no outgoing connection: the source scan covers its packages too, and a test checks that every socket of a running hub is on loopback. A request whose `Host` is not a loopback name or address gets 403, which stops DNS rebinding.
+- **`/mcp`** refuses, from the headers alone and before any body byte is read: a request with `Origin`, `Sec-Fetch-Site` or `Sec-Fetch-Dest` (403: no browser is a client; `Sec-Fetch-Mode` alone passes, since Node clients send it); a missing or wrong bearer token (401, compared in constant time, with no `WWW-Authenticate`, so no client starts an OAuth flow); a `Content-Type` other than JSON; a body without `Content-Length` (411); and one over `MaxMessageBytes` (413). There is no CORS.
+- **The page token** reads the page and sends reports, and nothing else: no tool call follows from a leaked page URL. A restart makes new tokens.
+- **Another local user** can connect, but cannot read the 0600 token files in your 0700 runtime directory, nor guess a 256-bit token. It can listen on a port the hub is not on (see A port the hub is not on). It can fill the listener: the hub holds at most 512 connections, and closes one that sends nothing for 2 s; it recovers once they stop. That is inherent to a TCP port on a shared machine.
+- **A process running as you** can read `mcp-token` and call every tool, `capture` included; it could run your setcap'd perf-agent itself. That is why headless use stays on stdio.
+- **An agent holding the token** is bounded by the `Hub.*` limits: excess gets 503 at once. While `Hub.MaxIngressReaders` bodies are being read, new requests get 503 until a body arrives or `Hub.IngressBodyTimeout` drops it; one reader and 64 KiB are kept for bodies of at most 64 KiB, so a cancel or ping still gets through a flood of large slow bodies. At most 64 answers are written at once.
+- **Memory** is bounded as on stdio, but held for the hub's life: the publications by `MaxRetainedBytes`.
+
+### Hub limits
+
+Set with `--limit Hub.Name=Value`, on the hub only: stdio refuses them (exit 2). A value that makes another unreachable is refused at start-up: `Hub.MaxCallsPerSession` over `Hub.MaxCalls`, `Hub.MaxIngressBytes` or `Hub.MaxRequestBytes` under `MaxMessageBytes`, and `Hub.IngressBodyTimeout` over 30s. `MaxEngineWait` (see Limits) applies to the hub's agents too.
+
+| Name | Default | Meaning |
+|---|---|---|
+| `Hub.MaxSessions` | 32 | MCP sessions kept; one more evicts the least recently used idle one, whose client gets 404 and starts a new session. A session with a call in flight is never evicted; with every one busy, a new session gets 503 |
+| `Hub.MaxIngressReaders` | 16 | Request bodies read at once; one is kept for bodies of at most 64 KiB. Then 503 |
+| `Hub.MaxIngressBytes` | 8388608 (8 MiB) | Bytes the bodies being read may announce; 64 KiB kept for small bodies. Then 503 |
+| `Hub.IngressBodyTimeout` | 2s | How long a body may take to arrive, at most 30s; then the connection is dropped |
+| `Hub.MaxControlInFlight` | 32 | Control messages answered at once: `ping`, `initialize`, the list methods, `capture_cancel`. Notifications, `notifications/cancelled` included, and DELETE are never refused by it |
+| `Hub.MaxPageStateInFlight` | 4 | `page_state` calls and reads of its resource at once |
+| `Hub.MaxCalls` | 16 | Every other call running or waiting, server-wide; then 503 with a JSON-RPC error naming the cap |
+| `Hub.MaxCallsPerSession` | 4 | The same for one session, at most `Hub.MaxCalls` |
+| `Hub.MaxRequestBytes` | 16777216 (16 MiB) | Bytes of arguments the admitted calls hold |
+| `Hub.MaxInboxEntries` | 32 | Asks the inbox keeps; the oldest is dropped |
+
+Fixed, not limits: 512 connections, a connection's first byte within 2 s, 64 answers written at once, and the page's reports at most 1 KiB and 5 a second.
 
 ## Agent skill
 
@@ -310,14 +436,17 @@ Defaults; override with `--limit Name=Value`. Sizes are bytes. Every limit must 
 | `MaxAttemptViews` | 64 |
 | `MaxHistoryBytes` (all attempt records) | 4194304 (4 MiB) |
 | `MaxPublications` (live page publications kept) | 8 |
-| `MaxRetainedBytes` (estimated memory the live page's publications keep, not a physical cap: the heap can reach about twice it; at least `MaxPageBytes`); used by the live page engine, not by the stdio server | 2147483648 (2 GiB) |
+| `MaxRetainedBytes` (estimated memory the live page's publications keep, not a physical cap: the heap can reach about twice it; at least `MaxPageBytes`); used by `perf-agent-hub`'s live page, not by the stdio server | 2147483648 (2 GiB) |
 | `MaxPageClients` (live page streams at once) | 4 |
+| `MaxEngineWait` | 45s (a duration, at most 55s; see below) |
 | `Source.MaxFileBytes` | 8388608 (8 MiB) |
 | `Source.MaxLineBytes` | 512 |
 | `Source.MaxContext` | 50 |
 | `Source.MaxWalkEntries` | 200000 |
 | `Source.MaxManifestBytes` | 16777216 (16 MiB) |
 | `Source.GitTimeout` | 5s (a duration) |
+
+`MaxEngineWait` is how long a tool call waits for the engine while another call, or a step of a capture, holds it; the call is then answered `isError` with who holds it and for how long (`perf-agent-hub is busy with top from "claude-code" (running 46s); call again`). A capture job's own waits for the engine are not bounded by it: they end only with a cancel or shutdown, and waiters are served in the order they came, so none is starved.
 
 Displayed frame names are cut at 1 KiB on pages; the node ID stays the reference. A response over `MaxResponseBytes` is refused with advice to page with a smaller `limit` or restart with a larger `--limit MaxResponseBytes=N`.
 
@@ -335,7 +464,7 @@ A limit left at its default (or set to it) follows the limit it depends on inste
 | `Capture.FinishTimeout` | 30s | 10m | perf-agent's finish after the capture's end; `finish_timeout` |
 | `Capture.StopGrace` | 5s | 30s | How long a stopped child gets before SIGKILL; then survivors are `stuck_child` |
 | `Capture.TTL` | 168h (7 days) | — | Retention's age limit for unkept captures; 0 means none |
-| `Capture.KeepPerSeries` | 10 | — | Unkept captures retained per series, newest first; failures have a budget of the same size. Captures open in this server's store are kept beyond it |
+| `Capture.KeepPerSeries` | 10 | — | Unkept captures retained per series, newest first; failures have a budget of the same size. Captures open in this server's store, and on the hub those a kept publication shows, are kept beyond it |
 | `Capture.MaxKeptPerSeries` | 4 | — | `keep: true` captures per series; one more is `invalid_argument` |
 | `Capture.CompareRows` | 20 | `MaxDiffRows` | Diff rows per view in a `compare_with` result |
 | `Capture.MaxJobs` | 32 | — | Finished jobs kept in memory, least recently used first |
@@ -360,7 +489,9 @@ claude mcp add perf-agent -- /path/to/perf-agent-mcp --profiles /path/to/profile
 
 To let the agent capture, add `--perf-agent /path/to/perf-agent` (the setcap'd binary, not in `/tmp`), and `--gpu-shim` for GPU captures.
 
-Any other MCP client: run `/path/to/perf-agent-mcp --profiles DIR --output DIR` as a stdio server. The server answers protocol versions 2025-11-25 and 2025-06-18 and answers `server/discover` with method-not-found, so clients fall back to `initialize`.
+Any other MCP client: run `/path/to/perf-agent-mcp --profiles DIR --output DIR` as a stdio server.
+
+For a session with a human watching the live page, configure the client for `perf-agent-hub` instead (see [Configuring a client](#configuring-a-client)), never both in one session. The server answers protocol versions 2025-11-25 and 2025-06-18 and answers `server/discover` with method-not-found, so clients fall back to `initialize`.
 
 ## Evals
 

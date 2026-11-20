@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
@@ -21,9 +22,21 @@ const (
 	reportAsk    = "ask"    // the user asked their agent about a frame
 )
 
-// askDuplicateWindow is how long an ask of the same publication and node
-// as a kept one is taken for the same click.
+// askDuplicateWindow is how long an ask of the same publication, node and
+// question as a kept one is taken for the same click.
 const askDuplicateWindow = 2 * time.Second
+
+// maxQuestionRunes is the most characters an ask's question holds, after
+// trimming.
+const maxQuestionRunes = 280
+
+// questionSource is how page_state labels an ask's question: the one value
+// in the inbox that a person typed rather than the server made.
+const questionSource = "typed on the page by the person viewing it"
+
+// questionBreaks folds the line breaks of a question to spaces, so the
+// agent always reads it as one line.
+var questionBreaks = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ", "\u2028", " ", "\u2029", " ")
 
 // maxInboxName is the most bytes of a frame's name the inbox keeps.
 const maxInboxName = 1 << 10
@@ -37,9 +50,10 @@ const askNonceBytes = 4
 // ("" for none), the frame the layout now starts at for focus ("" for
 // the whole view), and the frame asked about for ask. Focus is, for
 // select, the frame the page's layout started at, "" for the whole view;
-// the other kinds do not use it.
+// the other kinds do not use it. Question is, for ask, the question the
+// person typed about the frame, "" for none; the other kinds carry none.
 type PageReport struct {
-	Kind, Publication, Node, Focus string
+	Kind, Publication, Node, Focus, Question string
 }
 
 // ErrBadReport is Server.Report's error for a report that does not match
@@ -51,15 +65,16 @@ var ErrBadReport = errors.New("invalid page report")
 // against the current snapshot: the publication must be kept, and each
 // node a node of it, looked up as PageView.Frame looks it up. Every value
 // the inbox keeps is the server's own: the IDs and the frame's name (cut
-// to 1 KiB) from the publication, its view and digest, and the time. A
-// select or focus replaces the user's last one, which page_state reads;
+// to 1 KiB) from the publication, its view and digest, and the time; the
+// one exception is an ask's question, which the person typed, kept as
+// normalizeQuestion makes it and labelled as typed wherever it is shown.
+// A select or focus replaces the user's last one, which page_state reads;
 // the envelope does not show it, so the page is sent nothing, and one that
 // repeats the last changes nothing. An ask joins the ask ring and is sent
-// to the page, unless one of the same publication and node was kept less
-// than 2 s ago, when it is taken for the same click and Report returns
-// nil. It never
-// takes the engine, so it answers while a tool holds it. Any goroutine
-// may call it.
+// to the page, unless one of the same publication, node and question was
+// kept less than 2 s ago, when it is taken for the same click and Report
+// returns nil. It never takes the engine, so it answers while a tool
+// holds it. Any goroutine may call it.
 func (s *Server) Report(r PageReport) error {
 	if s.live == nil {
 		return fmt.Errorf("%w: this server has no live page", ErrBadReport)
@@ -74,7 +89,7 @@ func (s *Server) Report(r PageReport) error {
 
 // reported is a validated report in the server's own values.
 type reported struct {
-	kind, publication, node, name, focus, view, digest string
+	kind, publication, node, name, focus, view, digest, question string
 }
 
 // resolveReport validates r against snap and returns its values as the
@@ -88,6 +103,13 @@ func resolveReport(snap *liveSnapshot, r PageReport) (reported, error) {
 	default:
 		return bad("kind must be select, focus or ask")
 	}
+	if r.Kind != reportAsk && r.Question != "" {
+		return bad("only an ask carries a question")
+	}
+	question, err := normalizeQuestion(r.Question)
+	if err != nil {
+		return bad(err.Error())
+	}
 	p, err := PageView{snap: snap}.pub(r.Publication)
 	if err != nil {
 		return bad("the publication is not on the page; the page will refresh")
@@ -95,7 +117,7 @@ func resolveReport(snap *liveSnapshot, r PageReport) (reported, error) {
 	if r.Kind == reportAsk && r.Node == "" {
 		return bad("an ask names a frame")
 	}
-	out := reported{kind: r.Kind, publication: p.id, view: p.view}
+	out := reported{kind: r.Kind, publication: p.id, view: p.view, question: question}
 	if p.kind == pubExplained && p.prof != nil {
 		out.digest = p.digest.String()
 	}
@@ -111,6 +133,42 @@ func resolveReport(snap *liveSnapshot, r PageReport) (reported, error) {
 		}
 	}
 	return out, nil
+}
+
+// normalizeQuestion is q as the inbox keeps it: its line breaks folded to
+// spaces and the space around it trimmed, "" for none. It refuses q when
+// it is not UTF-8, holds any other control character (C0, DEL or C1) or a
+// bidirectional formatting character, or is left with more than 280
+// characters; the reason never repeats q.
+func normalizeQuestion(q string) (string, error) {
+	if !utf8.ValidString(q) {
+		return "", errors.New("the question is not valid UTF-8")
+	}
+	q = questionBreaks.Replace(q)
+	if strings.ContainsFunc(q, unicode.IsControl) {
+		return "", errors.New("the question holds a control character; send it as plain text")
+	}
+	if strings.ContainsFunc(q, isBidiControl) {
+		return "", errors.New("the question holds a bidirectional formatting character; send it as plain text")
+	}
+	q = strings.TrimSpace(q)
+	if utf8.RuneCountInString(q) > maxQuestionRunes {
+		return "", fmt.Errorf("the question is over %d characters", maxQuestionRunes)
+	}
+	return q, nil
+}
+
+// isBidiControl reports whether r is one of the characters that change
+// the direction text is shown in: the Arabic letter mark, the left-to-right
+// and right-to-left marks, the embeddings and overrides, and the isolates.
+func isBidiControl(r rune) bool {
+	switch {
+	case r == '\u061c', r == '\u200e', r == '\u200f':
+		return true
+	case r >= '\u202a' && r <= '\u202e', r >= '\u2066' && r <= '\u2069':
+		return true
+	}
+	return false
 }
 
 // lookup is node of p, by the lookups hasNode makes: its ID and its
@@ -149,10 +207,10 @@ type userView struct {
 // inboxAsk is one kept ask. readBy is the label of the session whose
 // page_state first returned it, "" until one did.
 type inboxAsk struct {
-	n                                     int64
-	publication, node, name, view, digest string
-	at                                    time.Time
-	readBy                                string
+	n                                               int64
+	publication, node, name, view, digest, question string
+	at                                              time.Time
+	readBy                                          string
 }
 
 // inbox is what the user reported from the page: the last select or
@@ -185,13 +243,14 @@ func newInbox(size int, nonce string) *inbox {
 }
 
 // inboxState is the inbox part of the envelope: its revision, how many
-// asks are kept and how many of them no session has read, and who read
-// the newest one ("" for nobody yet).
+// asks are kept and how many of them no session has read, who read the
+// newest one ("" for nobody yet) and its question, absent for none.
 type inboxState struct {
-	Rev    string `json:"rev"`
-	Asks   string `json:"asks"`
-	Unread string `json:"unread"`
-	ReadBy string `json:"read_by"`
+	Rev      string `json:"rev"`
+	Asks     string `json:"asks"`
+	Unread   string `json:"unread"`
+	ReadBy   string `json:"read_by"`
+	Question string `json:"question,omitzero"`
 }
 
 // state is the inbox's state JSON. The caller holds in.mu, or in is not
@@ -205,7 +264,8 @@ func (in *inbox) state() []byte {
 	}
 	st := inboxState{Rev: strconv.FormatInt(in.rev, 10), Asks: strconv.Itoa(len(in.asks)), Unread: strconv.Itoa(unread)}
 	if len(in.asks) > 0 {
-		st.ReadBy = in.asks[len(in.asks)-1].readBy
+		newest := in.asks[len(in.asks)-1]
+		st.ReadBy, st.Question = newest.readBy, newest.question
 	}
 	out, err := marshal(st)
 	if err != nil {
@@ -245,7 +305,8 @@ func (in *inbox) record(r reported, now time.Time) {
 	case reportAsk:
 		if slices.ContainsFunc(in.asks, func(a inboxAsk) bool {
 			d := now.Sub(a.at)
-			return a.publication == r.publication && a.node == r.node && d < askDuplicateWindow && d > -askDuplicateWindow
+			return a.publication == r.publication && a.node == r.node && a.question == r.question &&
+				d < askDuplicateWindow && d > -askDuplicateWindow
 		}) {
 			return
 		}
@@ -255,7 +316,7 @@ func (in *inbox) record(r reported, now time.Time) {
 		}
 		in.next++
 		in.asks = append(in.asks, inboxAsk{n: in.next, publication: r.publication, node: r.node, name: r.name,
-			view: r.view, digest: r.digest, at: now})
+			view: r.view, digest: r.digest, question: r.question, at: now})
 	}
 	in.changed()
 }
@@ -282,16 +343,19 @@ func parseAskID(id string) (n int64, nonce string, ok bool) {
 	return n, nonce, true
 }
 
-// askRow is an ask as page_state lists it.
+// askRow is an ask as page_state lists it. Question and QuestionSource
+// are absent for an ask without a question.
 type askRow struct {
-	ID          string `json:"id"`
-	Publication string `json:"publication"`
-	Node        string `json:"node"`
-	Name        string `json:"name"`
-	View        string `json:"view"`
-	Digest      string `json:"digest"`
-	At          string `json:"at"`
-	ReadBy      string `json:"read_by"`
+	ID             string `json:"id"`
+	Publication    string `json:"publication"`
+	Node           string `json:"node"`
+	Name           string `json:"name"`
+	View           string `json:"view"`
+	Digest         string `json:"digest"`
+	At             string `json:"at"`
+	ReadBy         string `json:"read_by"`
+	Question       string `json:"question,omitzero"`
+	QuestionSource string `json:"question_source,omitzero"`
 }
 
 // userRow is the user's last select or focus as page_state shows it.
@@ -352,8 +416,12 @@ func (in *inbox) read(since string, limit int, newest bool, label string, answer
 		}
 	}
 	for _, a := range asks {
-		out.rows = append(out.rows, askRow{ID: in.askID(a.n), Publication: a.publication, Node: a.node, Name: a.name,
-			View: a.view, Digest: a.digest, At: stamp(a.at), ReadBy: cmp.Or(a.readBy, label)})
+		row := askRow{ID: in.askID(a.n), Publication: a.publication, Node: a.node, Name: a.name,
+			View: a.view, Digest: a.digest, At: stamp(a.at), ReadBy: cmp.Or(a.readBy, label), Question: a.question}
+		if a.question != "" {
+			row.QuestionSource = questionSource
+		}
+		out.rows = append(out.rows, row)
 	}
 	if u := in.user; u != nil {
 		out.user = &userRow{Publication: u.publication, Selected: u.selected, Name: u.name, Focus: u.focus, At: stamp(u.at)}

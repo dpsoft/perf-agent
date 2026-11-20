@@ -66,7 +66,7 @@ func TestInboxHandlerAnswers204And422(t *testing.T) {
 		{"not an object", `["ask"]`, "the body must be one JSON object"},
 		{"empty", ``, "the body must be one JSON object"},
 		{"truncated", `{"kind":"ask"`, "the body must be one JSON object"},
-		{"over 1 KiB", `{"kind":"ask","publication":"p1","node":"` + c + `","focus":"` + strings.Repeat(" ", 1024) + `"}`, "over 1024 bytes"},
+		{"over 2 KiB", `{"kind":"ask","publication":"p1","node":"` + c + `","focus":"` + strings.Repeat(" ", 2048) + `"}`, "over 2048 bytes"},
 	} {
 		code, body := report(h, http.MethodPost, tc.body)
 		if code != http.StatusUnprocessableEntity || !strings.HasPrefix(body, "invalid page report: ") || !strings.Contains(body, tc.reason) {

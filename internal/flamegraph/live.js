@@ -688,6 +688,12 @@
   // what follows it. MAX_REASON bounds what it shows.
   const REFUSAL_PREFIX = 'invalid page report: ';
   const MAX_REASON = 300;
+  // MAX_QUESTION is the most characters a question holds, as the inbox
+  // counts them. The field's maxlength counts UTF-16 units, so it is twice
+  // this, and the page counts the characters itself; the inbox has the
+  // last word.
+  const MAX_QUESTION = 280;
+  const refused = (reason) => toast('Your question could not be sent: ' + reason, ASK_TOAST_MS);
 
   // askQuestion is askAgent with the question typed in the side panel. It
   // goes at once, never through the queue selections wait in, and is tried
@@ -700,6 +706,10 @@
     const typed = field.value;
     const question = typed.trim();
     if (!question || !view || !view.selected || !isPub(view.pub)) return;
+    if ([...question].length > MAX_QUESTION) {
+      refused('the question is over ' + MAX_QUESTION + ' characters');
+      return;
+    }
     const body = {kind: 'ask', publication: view.pub, node: view.selected, focus: view.focus, question};
     postOrRetry(body).then((res) => {
       if (res.status === 204 && field.value === typed) field.value = '';
@@ -709,7 +719,7 @@
       }
       let reason = res.reason.trim();
       if (reason.startsWith(REFUSAL_PREFIX)) reason = reason.slice(REFUSAL_PREFIX.length);
-      toast('Your question could not be sent: ' + (reason.slice(0, MAX_REASON) || 'perf-agent refused it.'), ASK_TOAST_MS);
+      refused(reason.slice(0, MAX_REASON) || 'perf-agent refused it.');
     });
   };
 

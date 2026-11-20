@@ -34,9 +34,15 @@ const maxQuestionRunes = 280
 // in the inbox that a person typed rather than the server made.
 const questionSource = "typed on the page by the person viewing it"
 
-// questionBreaks folds the line breaks of a question to spaces, so the
-// agent always reads it as one line.
-var questionBreaks = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ", "\u2028", " ", "\u2029", " ")
+// questionBreaks folds the line breaks and tabs of a question to spaces,
+// so the agent always reads it as one line.
+var questionBreaks = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ", "\t", " ", "\u2028", " ", "\u2029", " ")
+
+// questionMarks strips the directional marks (the left-to-right,
+// right-to-left and Arabic letter marks) from a question: right-to-left
+// text pasted from elsewhere carries them, and they change only how
+// neighbouring punctuation is placed.
+var questionMarks = strings.NewReplacer("\u200e", "", "\u200f", "", "\u061c", "")
 
 // maxInboxName is the most bytes of a frame's name the inbox keeps.
 const maxInboxName = 1 << 10
@@ -135,21 +141,26 @@ func resolveReport(snap *liveSnapshot, r PageReport) (reported, error) {
 	return out, nil
 }
 
-// normalizeQuestion is q as the inbox keeps it: its line breaks folded to
-// spaces and the space around it trimmed, "" for none. It refuses q when
-// it is not UTF-8, holds any other control character (C0, DEL or C1) or a
-// bidirectional formatting character, or is left with more than 280
-// characters; the reason never repeats q.
+// normalizeQuestion is q as the inbox keeps it: only text the person can
+// see. Its line breaks and tabs are folded to spaces, its directional marks
+// stripped and the space around it trimmed; "" is no question. It refuses q
+// when it is not UTF-8, holds any other control character (C0, DEL or C1),
+// a bidirectional embedding, override or isolate, an invisible character
+// (see invisibleIn), or is left with more than 280 characters. The reason
+// never repeats q.
 func normalizeQuestion(q string) (string, error) {
 	if !utf8.ValidString(q) {
 		return "", errors.New("the question is not valid UTF-8")
 	}
-	q = questionBreaks.Replace(q)
+	q = questionMarks.Replace(questionBreaks.Replace(q))
 	if strings.ContainsFunc(q, unicode.IsControl) {
 		return "", errors.New("the question holds a control character; send it as plain text")
 	}
 	if strings.ContainsFunc(q, isBidiControl) {
 		return "", errors.New("the question holds a bidirectional formatting character; send it as plain text")
+	}
+	if invisibleIn(q) {
+		return "", errors.New("the question holds an invisible formatting character; send it as plain text")
 	}
 	q = strings.TrimSpace(q)
 	if utf8.RuneCountInString(q) > maxQuestionRunes {
@@ -158,15 +169,41 @@ func normalizeQuestion(q string) (string, error) {
 	return q, nil
 }
 
-// isBidiControl reports whether r is one of the characters that change
-// the direction text is shown in: the Arabic letter mark, the left-to-right
-// and right-to-left marks, the embeddings and overrides, and the isolates.
+// isBidiControl reports whether r is one of the characters that reorder
+// the text around them: the embeddings, the overrides and the isolates.
 func isBidiControl(r rune) bool {
-	switch {
-	case r == '\u061c', r == '\u200e', r == '\u200f':
-		return true
-	case r >= '\u202a' && r <= '\u202e', r >= '\u2066' && r <= '\u2069':
-		return true
+	return r >= '\u202a' && r <= '\u202e' || r >= '\u2066' && r <= '\u2069'
+}
+
+// isVariationSelector reports whether r selects a variant of the
+// character before it.
+func isVariationSelector(r rune) bool {
+	return r >= '\ufe00' && r <= '\ufe0f' || r >= '\U000e0100' && r <= '\U000e01ef'
+}
+
+// invisibleIn reports whether q holds a character that is not drawn but
+// that an agent reading q would still read: any format character (Cf: the
+// tag characters, which can spell a whole hidden sentence, zero-width
+// spaces and joiners, the BOM, the soft hyphen, the interlinear
+// annotations) other than the zero-width non-joiner and joiner, which
+// scripts and emoji need; every tag character, assigned or not; and any
+// variation selector but one text or emoji presentation selector (U+FE0E,
+// U+FE0F) right after a character that is not itself a selector.
+func invisibleIn(q string) bool {
+	prev := rune(-1)
+	for _, r := range q {
+		switch {
+		case r == '\u200c', r == '\u200d':
+		case r >= '\U000e0000' && r <= '\U000e007f':
+			return true
+		case r == '\ufe0e', r == '\ufe0f':
+			if prev < 0 || isVariationSelector(prev) {
+				return true
+			}
+		case isVariationSelector(r), unicode.Is(unicode.Cf, r):
+			return true
+		}
+		prev = r
 	}
 	return false
 }

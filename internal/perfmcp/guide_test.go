@@ -62,6 +62,7 @@ func TestGuideIsShortAndStatesTheRules(t *testing.T) {
 		"`comparability`",
 		"`retryable`",
 		"`recompute`",
+		"`busy` with this server's job",
 	} {
 		if !strings.Contains(guideText, want) {
 			t.Errorf("guide does not contain %q", want)

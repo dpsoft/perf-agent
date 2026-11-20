@@ -96,7 +96,7 @@ func TestQuestionBounds(t *testing.T) {
 	}
 	for i, body := range []string{
 		emoji,
-		askQuestionBody(nodes[1], quoted(t, "line one\r\nline two")),
+		askQuestionBody(nodes[1], quoted(t, "line one\r\nline\ttwo\u200f")),
 		askQuestionBody(nodes[2], quoted(t, " \n ")),
 		askQuestionBody(nodes[3], `"😀 ok"`),
 	} {
@@ -126,7 +126,8 @@ func TestQuestionBounds(t *testing.T) {
 		{"a C1 control", quoted(t, "SECRET\u009b"), "control"},
 		{"an RTL override", quoted(t, "SECRET\u202egnp.exe"), "bidirectional"},
 		{"an isolate", quoted(t, "SECRET\u2066x\u2069"), "bidirectional"},
-		{"a tab", quoted(t, "SECRET\tx"), "control"},
+		{"tag characters", quoted(t, "SECRET hi\U000e0069\U000e0067\U000e006e"), "invisible"},
+		{"a zero-width space", quoted(t, "SECRET\u200bx"), "invisible"},
 		{"a number", `7`, "the body must be one JSON object"},
 		{"null", `null`, "the body must be one JSON object"},
 	} {

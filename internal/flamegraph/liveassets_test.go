@@ -71,7 +71,7 @@ func TestLiveShellHasNoInlineScriptOrStyle(t *testing.T) {
 	assert.Regexp(t, `<div [^>]*id="sw-warn"[^>]*\bhidden\b`, shell)
 	// The question field is the side panel's, single-line, bounded and
 	// off until a frame is selected.
-	assert.Regexp(t, `<input [^>]*type="text"[^>]*id="ask-q"[^>]*maxlength="280"[^>]*placeholder="Ask about this frame…"[^>]*\bdisabled\b`, shell)
+	assert.Regexp(t, `<input [^>]*type="text"[^>]*id="ask-q"[^>]*maxlength="560"[^>]*placeholder="Ask about this frame…"[^>]*\bdisabled\b`, shell)
 	assert.Regexp(t, `<button [^>]*id="ask-send"[^>]*\bdisabled\b[^>]*>Ask</button>`, shell)
 	assert.Regexp(t, `<p [^>]*id="ask-last"[^>]*\bhidden\b`, shell)
 	_, side, _ := strings.Cut(shell, `<aside class="side"`)
@@ -2135,7 +2135,7 @@ func TestLivePageQuestionInChrome(t *testing.T) {
 		assert.True(t, d.AskQOff, "no selection, no field")
 		assert.True(t, d.AskSendOff)
 		assert.Equal(t, "Ask about this frame…", tab.eval(`document.getElementById('ask-q').placeholder`))
-		assert.Equal(t, "280", tab.eval(`String(document.getElementById('ask-q').maxLength)`))
+		assert.Equal(t, "560", tab.eval(`String(document.getElementById('ask-q').maxLength)`), "room for 280 characters of two UTF-16 units")
 		// A question typed with nothing selected is not sent.
 		typeQuestion(tab, "anything?")
 		s.push(liveState("1", "p1", "", "", "p1"))
@@ -2203,6 +2203,31 @@ func TestLivePageQuestionInChrome(t *testing.T) {
 		assert.NotContains(t, d.Toast, "SECRET")
 		assert.Equal(t, secret, d.AskQ, "a refused question stays in the field to edit")
 		assert.Len(t, s.reportsSeen(), 1)
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("280 emoji can be typed and sent; 281 characters are refused here", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), nil)
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.AskQOff })
+		emoji := strings.Repeat("😀", 280)
+		// Typed as the user types, so the field's maxlength applies; one
+		// more emoji does not fit.
+		tab.eval(`(() => { const e = document.getElementById('ask-q'); e.focus(); document.execCommand('insertText', false, '` + emoji + `😀'); return ''; })()`)
+		assert.Equal(t, "280", tab.eval(`String([...document.getElementById('ask-q').value].length)`))
+		tab.eval(`document.getElementById('ask-q').dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true, cancelable: true})), ''`)
+		d := tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast != "" })
+		assert.Equal(t, liveAskSent, d.Toast)
+		assert.Equal(t, []map[string]string{liveQuestion("p1", f.b, "", emoji)}, s.reportsSeen())
+		// 281 characters fit the field's 560 units, but the page refuses
+		// them as the hub would, and sends nothing.
+		tab.eval(`document.getElementById('toast').textContent = '', ''`)
+		long := "SECRET" + strings.Repeat("x", 275)
+		typeQuestion(tab, long)
+		d = tab.waitFor("the refusal", func(d liveDOM) bool { return d.Toast != "" })
+		assert.Equal(t, "Your question could not be sent: the question is over 280 characters", d.Toast)
+		assert.Equal(t, long, d.AskQ)
+		time.Sleep(200 * time.Millisecond)
+		assert.Len(t, s.reportsSeen(), 1, "the page sent nothing")
 		assert.Empty(t, tab.errors())
 	})
 

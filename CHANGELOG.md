@@ -40,10 +40,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client goes away. The server refuses to capture as root, with
   capabilities, or under `no_new_privs`. The new limits are
   `--limit Capture.*`. `--gpu-shim` enables GPU captures.
-- The live page (`page_open`, `page_explain`, `page_diff`, `page_show`) is
-  not exposed by the stdio `perf-agent-mcp`, which has no `--live` flag and
-  opens no listener; it will ship with a separate serve binary. Limits
-  `MaxPublications`, `MaxRetainedBytes` and `MaxPageClients` are kept for it.
+- `cmd/perf-agent-hub`, one long-lived MCP server that several agents share
+  while the user watches the live page in a browser. It speaks MCP over
+  Streamable HTTP at `http://127.0.0.1:7362/mcp` (`--port` changes the
+  port; the host is always loopback) behind a bearer token that clients
+  fetch with the `perf-agent-hub token --port N` headers helper, so a
+  restart's new token needs no configuration change; `perf-agent-hub url`
+  prints the page's address. It keeps its lock, tokens and `hub.json` in a
+  0700 runtime directory (`--runtime-dir`, default
+  `$XDG_RUNTIME_DIR/perf-agent-mcp`), and refuses browsers, other hosts and
+  unauthenticated requests before reading a body. It adds the page tools
+  (`page_open`, `page_explain`, `page_diff`, `page_show`) and `page_state`:
+  "Ask my agent about this" on the page records the frame the user points
+  at, and the agent reads those asks and the user's last selection without
+  waiting for another agent's call. Committed captures are published on the
+  page, and the hub captures into `<profiles>/captures-hub`. Its transport
+  is bounded by the new `--limit Hub.*` limits, and a call's wait for
+  another agent's by `MaxEngineWait`. See [docs/mcp.md](docs/mcp.md).
+- The stdio `perf-agent-mcp` links no networking package; it has no page
+  tools and no `--live` flag. Headless loops keep using it.
 
 ## [1.5.2] - 2026-11-12
 

@@ -27,6 +27,8 @@ var skillArgs = []string{
 	"error", "code", "retryable", "retry_after", "recompute", "handles", "reopen",
 	"comparability", "status", "done", "interrupted", "derived", "capture_id",
 	"sample_rate", "start_time", "perf_agent_exit",
+	// page_state's answer.
+	"asks", "user",
 }
 
 // captureCodes are the capture failure codes, which the skill may cite.
@@ -71,7 +73,10 @@ func TestSkillNamesExistInTheServer(t *testing.T) {
 	}
 	skill := string(b)
 
-	c := newTestServer(t, testConfig(t))
+	// The hub's tool list: the stdio one and the page tools.
+	cfg := testConfig(t)
+	cfg.Page = livePage()
+	c := newTestServer(t, cfg)
 	var list struct {
 		Tools []struct {
 			Name string `json:"name"`
@@ -83,6 +88,9 @@ func TestSkillNamesExistInTheServer(t *testing.T) {
 	var tools []string
 	for _, tl := range list.Tools {
 		tools = append(tools, tl.Name)
+	}
+	if !slices.Contains(tools, "page_state") {
+		t.Fatalf("the hub's tool list %v lacks page_state", tools)
 	}
 	metrics := explain.Metrics()
 	codes := append(explainCodes(t), captureCodes()...)

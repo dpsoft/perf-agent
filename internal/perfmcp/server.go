@@ -2,6 +2,7 @@ package perfmcp
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -26,11 +27,20 @@ import (
 // Server is the perf-agent MCP server. The store, the diffs, the attempts,
 // the pins and the live page's publications belong to the engine holder:
 // every tool runs holding the engine (see engine), and so will a capture
-// job's steps, so they need no locks of their own. Serve must not run
-// concurrently with itself. The live page's HTTP handlers read only the
-// snapshot the engine holder last committed and the immutable publications
-// it holds. Close may run on another goroutine, even after Serve returned
-// while a handler still runs, and stops the live page under its lock.
+// job's steps, so they need no locks of their own. Several sessions may
+// share one Server: each Serve is one session, and a transport may answer
+// others through the mcpstdio per-message API. The engine serializes the
+// tools that hold it whichever session calls them; the capture tools do
+// not hold it and keep their state under the job registry's lock. A Serve
+// that ends cancels every capture job, whichever session started it,
+// since a stdio client is the only one that can collect them; a session
+// answered through the per-message API ends no job. A PageView reads only
+// the snapshot the engine
+// holder last committed and the immutable publications it holds; Report
+// and page_state read that snapshot and keep the page's inbox under its
+// own lock, so they never take the engine. Close
+// may run on another goroutine, even after Serve returned while a handler
+// still runs, and marks the live page closed under its lock.
 type Server struct {
 	lim Limits
 	log *slog.Logger
@@ -51,7 +61,7 @@ type Server struct {
 	attempts *attempts
 	mcp      *mcpstdio.Server
 	// pins is the ledger of the profiles and views the store and the live
-	// page keep. live is the live page, nil unless Config.Live.
+	// page keep. live is the live page, nil unless Config.Page.
 	pins *pins
 	live *live
 
@@ -64,8 +74,12 @@ type Server struct {
 	// evalSymlinks is filepath.EvalSymlinks; a seam for tests.
 	evalSymlinks func(string) (string, error)
 
-	// engine grants the engine state to one holder at a time.
-	engine *engine
+	// engine grants the engine state to one holder at a time; holdEngine
+	// is Config.HoldEngine.
+	engine     *engine
+	holdEngine func(tool string)
+	// cmd is the binary's name, Config.Command or perf-agent-mcp.
+	cmd string
 	// captureCfg is the capture configuration, and perfAgent and shim what
 	// New verified of it. captureDisabled says why capture is off, and is
 	// "" when it is on.
@@ -73,6 +87,9 @@ type Server struct {
 	perfAgent       capture.Binary
 	shim            capture.Shim
 	captureDisabled string
+	// noPerfAgent says capture is off because no perf-agent was given, so
+	// captureDisabled is the tools' own DISABLED sentence.
+	noPerfAgent bool
 
 	// The capture file protocol's seams, all nil outside tests: now is the
 	// clock (time.Now); ownerAlive judges an intent's owner (by its
@@ -93,6 +110,10 @@ type Server struct {
 	// beforeRelease, when set, runs as a job is about to let go of the
 	// capture directory; a seam for tests.
 	beforeRelease func(*job)
+	// beforeCaptureDiff, when set, runs before a capture's diff is
+	// published, and an error it returns fails that publication; a seam
+	// for tests.
+	beforeCaptureDiff func() error
 	// maintained is closed when the maintenance goroutine has returned,
 	// which Close waits for, bounded.
 	maintained chan struct{}
@@ -109,7 +130,8 @@ type Server struct {
 	// /proc).
 	selfStartTime func() (uint64, error)
 	// captureProtect, when set, names files retention must keep besides
-	// the ones this server knows of (serve's publications); nil in stdio.
+	// the ones the store has open: the kept publications' files, with the
+	// live page; nil in stdio. It runs under the engine.
 	captureProtect func() []fileKey
 	// ownerSeen is the capture directory's owner kind once it was read,
 	// so a mismatch is refused without I/O.
@@ -166,9 +188,34 @@ type Server struct {
 // readSelfStatus reads this process's /proc/self/status; a seam for tests.
 var readSelfStatus = capture.ReadSelfStatus
 
+// defaultCommand is the binary a server runs as when Config.Command is
+// empty: the stdio one.
+const defaultCommand = "perf-agent-mcp"
+
+// command is the name of the binary this server runs as.
+func (s *Server) command() string { return cmp.Or(s.cmd, defaultCommand) }
+
+// startAdvice tells the user to start the server with what.
+func (s *Server) startAdvice(what string) string { return startWith(s.command(), what) }
+
+// startWith tells the user to start the binary command with what.
+func startWith(command, what string) string { return "start " + command + " with " + what }
+
+// named is text with capture.CommandMark replaced by command.
+func named(text, command string) string {
+	return strings.ReplaceAll(text, capture.CommandMark, command)
+}
+
+// raiseAdvice tells the user to restart the server with limit raised.
+func (s *Server) raiseAdvice(limit string) string {
+	return "restart " + s.command() + " with a larger --limit " + limit + "=N"
+}
+
 // captureDisabledText is every capture call's answer, and the start of the
 // tool's description, on a server started without a perf-agent binary.
-const captureDisabledText = "DISABLED: start perf-agent-mcp with --perf-agent PATH (the setcap'd perf-agent binary) to enable capturing."
+func (s *Server) captureDisabledText() string {
+	return "DISABLED: " + s.startAdvice("--perf-agent PATH (the setcap'd perf-agent binary) to enable capturing.")
+}
 
 // drainTimeout bounds how long Serve, once its input or context ended,
 // writes the answers already queued: under the command's 1 s shutdown
@@ -183,7 +230,7 @@ func New(cfg Config) (_ *Server, err error) {
 		return nil, errors.New("perfmcp: Config.ProfilesDir is required: the directory profiles are read from")
 	}
 	lim, fitted := cfg.Limits.resolve()
-	if err := lim.validate(cfg.Live); err != nil {
+	if err := lim.validate(cfg.Page != nil); err != nil {
 		return nil, err
 	}
 	s := &Server{
@@ -194,6 +241,8 @@ func New(cfg Config) (_ *Server, err error) {
 
 		evalSymlinks: filepath.EvalSymlinks,
 		engine:       newEngine(),
+		holdEngine:   cfg.HoldEngine,
+		cmd:          cfg.Command,
 		dirMu:        make(chan struct{}, 1),
 		listKept:     map[string]keptHistory{},
 	}
@@ -202,6 +251,9 @@ func New(cfg Config) (_ *Server, err error) {
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
 	}
+	// Capture's errors and advice say capture.CommandMark for this
+	// binary's name; a log line names it as the agent's answers do.
+	s.log = slog.New(namingHandler{next: s.log.Handler(), command: s.command})
 	for _, c := range fitted {
 		s.log.Info("capture limit fitted", "limit", c.field, "default", c.from, "now", c.to, "fits", c.fits)
 	}
@@ -224,19 +276,22 @@ func New(cfg Config) (_ *Server, err error) {
 	s.diffs = newDiffCache(lim.MaxCachedDiffs)
 	s.pins = newPins()
 	s.store = newStore(s.profiles, lim.Model, lim.MaxOpenHandles, s.pins)
-	if cfg.Live {
-		s.live = newLive(lim, s.pins)
+	if cfg.Page != nil {
+		s.live = newLive(lim, s.pins, *cfg.Page)
+		// A capture the page shows keeps its files: its recipe reopens
+		// them, and the user may read them while the page is on screen.
+		s.captureProtect = s.publishedFiles
 	}
 	if err := s.setupCapture(cfg.Capture); err != nil {
 		return nil, err
 	}
 	s.registry = newRegistry(lim.Capture, randHex(2))
 	s.mcp = mcpstdio.New(mcpstdio.Options{
-		Info:            mcpstdio.Implementation{Name: "perf-agent-mcp", Title: "perf-agent profiles", Version: cfg.Version},
-		Instructions:    instructions,
+		Info:            mcpstdio.Implementation{Name: s.command(), Title: "perf-agent profiles", Version: cfg.Version},
+		Instructions:    s.instructions(),
 		Tools:           s.tools(),
 		Prompts:         guidePrompts(),
-		Resources:       guideResources(),
+		Resources:       s.resources(),
 		MaxMessageBytes: lim.MaxMessageBytes,
 		// A tool error is a result too: no agent argument echoed in one
 		// can make it larger than a result may be. The floor keeps the
@@ -297,7 +352,7 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 		s.captureDisabled = "capture needs Linux"
 		return nil
 	case c.PerfAgent == "":
-		s.captureDisabled = captureDisabledText
+		s.captureDisabled, s.noPerfAgent = s.captureDisabledText(), true
 		return nil
 	}
 	verify := c.Verify
@@ -306,7 +361,7 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 	}
 	bin, err := verify(c.PerfAgent)
 	if err != nil {
-		return fmt.Errorf("perfmcp: cannot use perf-agent %s: %w", c.PerfAgent, uncoded{err})
+		return fmt.Errorf("perfmcp: cannot use perf-agent %s: %w", c.PerfAgent, s.uncoded(err))
 	}
 	s.perfAgent = bin
 	for _, w := range bin.Warnings {
@@ -314,7 +369,7 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 	}
 	if c.GPUShim != "" {
 		if s.shim, err = capture.VerifyShim(c.GPUShim); err != nil {
-			return fmt.Errorf("perfmcp: cannot use the GPU shim %s: %w", c.GPUShim, uncoded{err})
+			return fmt.Errorf("perfmcp: cannot use the GPU shim %s: %w", c.GPUShim, s.uncoded(err))
 		}
 	}
 	for _, cmd := range c.Commands {
@@ -322,7 +377,7 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 			return fmt.Errorf("perfmcp: capture command %q is not an absolute path; name each allowed program by its absolute path", cmd)
 		}
 		if e := capture.CheckCommandFile(cmd); e != nil {
-			return fmt.Errorf("perfmcp: cannot allow capture command %s: %w", cmd, uncoded{e})
+			return fmt.Errorf("perfmcp: cannot allow capture command %s: %w", cmd, s.uncoded(e))
 		}
 	}
 	status, err := readSelfStatus()
@@ -344,7 +399,7 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 		}
 	}
 	if err != nil {
-		s.captureDisabled = uncoded{err}.Error()
+		s.captureDisabled = s.uncoded(err).Error()
 		s.log.Warn("capture disabled", "reason", s.captureDisabled)
 		return nil
 	}
@@ -354,17 +409,25 @@ func (s *Server) setupCapture(c CaptureConfig) error {
 
 // uncoded is a capture error as text that already says what failed: its
 // message and advice without the code ("disabled: ..."), which would only
-// repeat it. It unwraps to the error.
-type uncoded struct{ err error }
+// repeat it, naming the binary cmd ("" for perf-agent-mcp). It unwraps to
+// the error.
+type uncoded struct {
+	err error
+	cmd string
+}
+
+// uncoded is err as an uncoded naming the binary this server runs as.
+func (s *Server) uncoded(err error) uncoded { return uncoded{err: err, cmd: s.command()} }
 
 func (u uncoded) Error() string {
+	text := u.err.Error()
 	if e, ok := errors.AsType[*capture.Error](u.err); ok {
-		if e.Next == "" {
-			return e.Message
+		text = e.Message
+		if e.Next != "" {
+			text += "; " + e.Next
 		}
-		return e.Message + "; " + e.Next
 	}
-	return u.err.Error()
+	return named(text, cmp.Or(u.cmd, defaultCommand))
 }
 
 func (u uncoded) Unwrap() error { return u.err }
@@ -374,16 +437,19 @@ func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	return s.mcp.Serve(ctx, r, w)
 }
 
+// MCP is the MCP server the tools are registered on, for a transport
+// that answers through its per-message API (Parse and Handle) instead of
+// Serve.
+func (s *Server) MCP() *mcpstdio.Server { return s.mcp }
+
 // Close cancels the capture jobs and kills their captures, waits up to
 // Capture.StopGrace + 1 s for the jobs to roll back and up to
 // maintenanceJoin for the maintenance goroutine to end (neither when a
-// signal path already called KillCaptures), stops the live page, if any,
-// and closes the server's roots. It may run on another goroutine than
-// Serve's, while a request is in flight, and does not wait for the engine:
-// a handler may still run after Serve returned. The
-// page's streams end first and its other responses get liveShutdown before
-// their connections are dropped, so a tab that stopped reading delays Close
-// by at most that. A second Close does nothing and returns nil.
+// signal path already called KillCaptures), marks the live page closed,
+// if any, and closes the server's roots. It may run on another goroutine
+// than Serve's, while a request is in flight, and does not wait for the
+// engine: a handler may still run after Serve returned. It serves no page,
+// so it waits for no tab. A second Close does nothing and returns nil.
 func (s *Server) Close() error {
 	signalled := s.killed.Load()
 	s.jobsMu.Lock()
@@ -434,28 +500,43 @@ func (s *Server) tools() []mcpstdio.Tool {
 	}
 	for _, group := range [][]mcpstdio.Tool{ts, pages} {
 		for i := range group {
-			group[i].Handler = s.engineHandler(group[i].Handler)
+			group[i].Handler = s.engineHandler(group[i].Name, group[i].Handler)
 		}
 	}
 	// The capture tools never hold the engine: a wait would keep every
-	// other tool, and the jobs' own steps, from it.
+	// other tool, and the jobs' own steps, from it. Nor does page_state,
+	// which reads the snapshot and the inbox only.
 	ts = append(ts, s.captureTools()...)
+	if s.live != nil {
+		pages = append(pages, s.pageStateTool())
+	}
 	return append(ts, pages...)
+}
+
+// resources are the server's resources: the guide, and with the live page
+// its state.
+func (s *Server) resources() []mcpstdio.Resource {
+	rs := guideResources()
+	if s.live != nil {
+		rs = append(rs, s.pageStateResource())
+	}
+	return rs
 }
 
 // readOnly are the annotations of every tool that only reads.
 var readOnly = mcpstdio.Annotations{ReadOnly: true, Idempotent: true}
 
-// Advice for a response over MaxResponseBytes, per kind of tool.
-const (
-	// shrinkWithLimit is for tools that page their rows with limit.
-	shrinkWithLimit = "call again with a smaller limit"
-	// shrinkOpen is for open, whose size is the profile's own: one
-	// unresolved_by_module entry per module with unresolved frames, and the
-	// notes.
-	shrinkOpen = "it is large because of the profile's unresolved_by_module entries and notes; " +
-		"restart perf-agent-mcp with a larger --limit MaxResponseBytes=N to open it"
-)
+// shrinkWithLimit is the advice for a response over MaxResponseBytes of a
+// tool that pages its rows with limit.
+const shrinkWithLimit = "call again with a smaller limit"
+
+// shrinkOpen is the advice for open's response over MaxResponseBytes,
+// whose size is the profile's own: one unresolved_by_module entry per
+// module with unresolved frames, and the notes.
+func (s *Server) shrinkOpen() string {
+	return "it is large because of the profile's unresolved_by_module entries and notes; " +
+		s.raiseAdvice("MaxResponseBytes") + " to open it"
+}
 
 // respond encodes a tool's result as compact JSON text, refusing one over
 // MaxResponseBytes with shrink, which says how to get a smaller one.
@@ -479,7 +560,14 @@ func (s *Server) respond(tool, shrink string, v any) (mcpstdio.Result, error) {
 // arguments, taken from v's JSON names, and repeats the agent's text only
 // cut short.
 func decodeArgs(tool string, raw json.RawMessage, v any) error {
-	names := argNames(v)
+	return decodeArgsHiding(tool, raw, v)
+}
+
+// decodeArgsHiding is decodeArgs for a tool that does not take the
+// arguments hidden on this server, though v has fields for them: each is
+// refused, and named nowhere, as one v has no field for.
+func decodeArgsHiding(tool string, raw json.RawMessage, v any, hidden ...string) error {
+	names := slices.DeleteFunc(argNames(v), func(n string) bool { return slices.Contains(hidden, n) })
 	takes := "its arguments are: " + strings.Join(names, ", ")
 	if len(names) == 0 {
 		takes = "it takes no arguments"

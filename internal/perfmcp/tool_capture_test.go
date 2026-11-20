@@ -289,7 +289,7 @@ func TestCaptureArgumentRefusals(t *testing.T) {
 
 	// A capture directory known to belong to the other kind is refused
 	// before anything else is looked at.
-	e.s.ownerSeen.Store(new(ownerServe))
+	e.s.ownerSeen.Store(new(ownerHub))
 	text, _ := c.call("capture", map[string]any{"pid": 0})
 	if w := toolErrorOf(t, text); w.Code != string(capture.CodeOwnerMismatch) {
 		t.Errorf("%+v", w)
@@ -950,7 +950,7 @@ func TestTheResultIsCutToMaxResponseBytes(t *testing.T) {
 // the page tools of a live server.
 func TestToolsListOrder(t *testing.T) {
 	cfg := testConfig(t)
-	cfg.Live = true
+	cfg.Page = livePage()
 	c := newTestServer(t, cfg)
 	var list struct {
 		Tools []struct {
@@ -966,7 +966,7 @@ func TestToolsListOrder(t *testing.T) {
 	}
 	want := []string{"open", "top", "path", "facts", "gpu_kernels_for", "sandwich", "diff", "source", "render_flamegraph",
 		"capture", "capture_wait", "capture_cancel", "capture_list",
-		"page_open", "page_explain", "page_show", "page_diff"}
+		"page_open", "page_explain", "page_show", "page_diff", "page_state"}
 	if !slices.Equal(names, want) {
 		t.Errorf("tools %v", names)
 	}

@@ -84,6 +84,11 @@ pmu.txt
 
 ### Project binaries ###
 perf-agent
+# The MCP server and the hub, built in place by `go build ./cmd/...`.
+/cmd/perf-agent-mcp/perf-agent-mcp
+/cmd/perf-agent-hub/perf-agent-hub
+/perf-agent-mcp
+/perf-agent-hub
 /gpu-cuda-profile
 # GPU shim executables (the .so/.a/.o forms are covered above; these have no
 # extension for those rules to catch). Built by `make -C shim`.

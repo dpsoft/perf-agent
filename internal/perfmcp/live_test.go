@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
-	"net/netip"
 	"reflect"
 	"runtime"
 	"slices"
@@ -17,19 +16,19 @@ import (
 
 	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
-	"github.com/dpsoft/perf-agent/internal/livehttp"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
 )
 
-// newLiveServer is a server with the live page on that nothing serves:
-// the test calls its methods itself, as its one request goroutine would.
+// newLiveServer is a server with the live page engine on, which nothing
+// serves: the test calls its methods itself, as its one request goroutine
+// would.
 // edit, when set, changes the config first; fixtures maps file names in
 // the profiles root to their bytes.
 func newLiveServer(t *testing.T, edit func(*Config), fixtures map[string][]byte) *Server {
 	t.Helper()
 	cfg := testConfig(t)
-	cfg.Live = true
+	cfg.Page = livePage()
 	if edit != nil {
 		edit(&cfg)
 	}
@@ -112,7 +111,7 @@ func (o liveOpened) reject(t *testing.T, s *Server, name string) string {
 
 func (o liveOpened) publish(t *testing.T, s *Server, r explain.Result, title string) *publication {
 	t.Helper()
-	p, err := s.publishExplained(o.e, o.v, o.view, r, title, "a0")
+	p, err := s.publishExplained(o.e, o.v, o.view, r, title, "a0", "", true)
 	if err != nil {
 		t.Fatalf("publishExplained: %v", err)
 	}
@@ -160,20 +159,10 @@ func ids(pubs []*publication) []string {
 	return out
 }
 
-func TestTheLiveAddressIsLoopbackOnAnyPort(t *testing.T) {
-	ap, err := livehttp.CheckAddr(liveAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ap.Addr() != netip.MustParseAddr("127.0.0.1") || ap.Port() != 0 {
-		t.Errorf("live address %s, want 127.0.0.1 on a port the kernel picks", ap)
-	}
-}
-
 func TestTheZeroStateIsEmpty(t *testing.T) {
 	s := newLiveServer(t, nil, nil)
 	snap := s.live.snapshot()
-	if got, want := string(snap.state), `{"seq":"0","current":"","selected":"","focus":"","publications":[]}`; got != want {
+	if got, want := string(snap.state), `{"seq":"0","current":"","selected":"","focus":"","by":"","publications":[]}`; got != want {
 		t.Errorf("zero state = %s, want %s", got, want)
 	}
 	if snap.seq != 0 || len(snap.pubs) != 0 || len(snap.history) != 0 {
@@ -230,7 +219,7 @@ func TestAFactsOnlyPublicationSelectsNothing(t *testing.T) {
 	s := newLiveServer(t, nil, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
 	o := openLive(t, s, "cpu.pb.gz")
 	o.publish(t, s, o.explained(t, s, "b", "0.411"), "")
-	if err := s.live.show("p1", string(o.node(t, "b")), true); err != nil {
+	if err := s.live.show("p1", string(o.node(t, "b")), true, ""); err != nil {
 		t.Fatal(err)
 	}
 	s.commit()
@@ -249,7 +238,7 @@ func TestPublicationsAreImmutable(t *testing.T) {
 	for range 4 {
 		o.publish(t, s, o.explained(t, s, "c", "0.489"), "")
 	}
-	if err := s.live.show("p1", "", false); err != nil {
+	if err := s.live.show("p1", "", false, ""); err != nil {
 		t.Fatal(err)
 	}
 	o.reject(t, s, "b")
@@ -313,7 +302,7 @@ func TestALargeProfileWithATinyModelIsChargedForItsEngine(t *testing.T) {
 		t.Fatalf("the profile's estimate %d is not over the budget %d", o.e.prof.RetainedBytes(), s.lim.MaxRetainedBytes)
 	}
 	before := s.live.snapshot()
-	_, err := s.publishExplained(o.e, o.v, o.view, o.check(t, s, nil), "", "a0")
+	_, err := s.publishExplained(o.e, o.v, o.view, o.check(t, s, nil), "", "a0", "", true)
 	if err == nil || !strings.Contains(err.Error(), "MaxRetainedBytes=1048576") || !strings.Contains(err.Error(), "--limit MaxRetainedBytes=N") {
 		t.Fatalf("publish over the budget: %v", err)
 	}
@@ -394,7 +383,7 @@ func TestThePublicationCountsItsCheckedExplanations(t *testing.T) {
 		if held <= 0 || ratio < 0.5 || ratio > 2 {
 			t.Errorf("%s: resultBytes %d is not within [0.5x, 2x] of the %d bytes the result holds", n, est, held)
 		}
-		p, err := s.publishExplained(o.e, o.v, o.view, r, "", "a0")
+		p, err := s.publishExplained(o.e, o.v, o.view, r, "", "a0", "", true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -500,7 +489,7 @@ func TestRetainedBudgetEvictsOlderPublications(t *testing.T) {
 	if got := ids(s.live.pubs); !slices.Equal(got, []string{"p2", "p3"}) {
 		t.Fatalf("kept %v, want [p2 p3]: the least recently shown is evicted", got)
 	}
-	if err := s.live.show("p2", "", false); err != nil {
+	if err := s.live.show("p2", "", false, ""); err != nil {
 		t.Fatal(err)
 	}
 	s.commit()
@@ -558,20 +547,20 @@ func TestARefusedAdmissionChangesNothing(t *testing.T) {
 	deepNew := openLive(t, s, "deepnew.pb.gz")
 	a.publish(t, s, a.explained(t, s, "b", "0.411"), "")
 	b.facts(t, s)
-	if err := s.live.show("p1", string(a.node(t, "b")), true); err != nil {
+	if err := s.live.show("p1", string(a.node(t, "b")), true, ""); err != nil {
 		t.Fatal(err)
 	}
 	s.commit()
 	before := dumpLive(s)
 
-	_, err := s.publishExplained(deep.e, deep.v, deep.view, deep.check(t, s, nil), "", "a9")
+	_, err := s.publishExplained(deep.e, deep.v, deep.view, deep.check(t, s, nil), "", "a9", "", true)
 	if err == nil || !strings.Contains(err.Error(), "MaxRetainedBytes=") || !strings.Contains(err.Error(), " bytes in memory (profile, view, page model and history), over MaxRetainedBytes=") {
 		t.Fatalf("publish over the budget alone: %v", err)
 	}
 	// A diff's refusal names what a diff keeps.
 	q := diffQuery{BaseHandle: deep.e.prof.Handle, BaseView: deep.view, NewHandle: deepNew.e.prof.Handle, NewView: deepNew.view}
 	bs, ns := mustBoth(s.diffSides(q))(t)
-	_, err = s.publishDiff(must(s.compare(q, bs, ns))(t), bs, ns, "", "")
+	_, err = s.publishDiff(must(s.compare(q, bs, ns))(t), bs, ns, "", "", "", true)
 	if err == nil || !strings.Contains(err.Error(), " bytes in memory (the profiles and views of both sides, the diff and its index, and the page model), over MaxRetainedBytes=") ||
 		!strings.Contains(err.Error(), "compare smaller views") {
 		t.Fatalf("a diff over the budget alone: %v", err)
@@ -820,29 +809,14 @@ func TestALargeLabelIsChargedToItsProfile(t *testing.T) {
 		c.Limits.MaxPageBytes = 32 << 10
 	}, map[string][]byte{"cpu.pb.gz": b.Bytes()})
 	o := openLive(t, s, "cpu.pb.gz")
-	if _, err := s.publishExplained(o.e, o.v, o.view, o.check(t, s, nil), "", "a1"); err == nil || !strings.Contains(err.Error(), "MaxRetainedBytes=65536") {
+	if _, err := s.publishExplained(o.e, o.v, o.view, o.check(t, s, nil), "", "a1", "", true); err == nil || !strings.Contains(err.Error(), "MaxRetainedBytes=65536") {
 		t.Errorf("a profile holding an 8 MiB label was admitted under a 64 KiB budget: %v", err)
-	}
-}
-
-func TestNoLiveWithoutTheFlag(t *testing.T) {
-	cfg := testConfig(t)
-	s := must(New(cfg))(t)
-	t.Cleanup(func() { _ = s.Close() })
-	if s.live != nil {
-		t.Error("a server without Live has live state")
-	}
-	cfg.Live = true
-	s = must(New(cfg))(t)
-	t.Cleanup(func() { _ = s.Close() })
-	if s.live == nil {
-		t.Error("a server with Live has no live state")
 	}
 }
 
 func TestLimitsValidateTheRetainedBudget(t *testing.T) {
 	cfg := testConfig(t)
-	cfg.Live = true
+	cfg.Page = livePage()
 	cfg.Limits.MaxPageBytes = 1 << 20
 	cfg.Limits.MaxRetainedBytes = 1<<20 - 1
 	_, err := New(cfg)
@@ -851,10 +825,10 @@ func TestLimitsValidateTheRetainedBudget(t *testing.T) {
 		t.Errorf("New with MaxRetainedBytes < MaxPageBytes: %v", err)
 	}
 
-	cfg.Live = false
+	cfg.Page = nil
 	s, err := New(cfg)
 	if err != nil {
-		t.Errorf("without Live the budget is not checked against MaxPageBytes: %v", err)
+		t.Errorf("without Page the budget is not checked against MaxPageBytes: %v", err)
 	} else {
 		_ = s.Close()
 	}
@@ -886,7 +860,7 @@ func TestCloseIsSafeDuringAPublish(t *testing.T) {
 			if i == 5 {
 				close(started)
 			}
-			if _, err := s.publishExplained(o.e, o.v, o.view, r, "", "a0"); err != nil {
+			if _, err := s.publishExplained(o.e, o.v, o.view, r, "", "a0", "", true); err != nil {
 				t.Errorf("publish %d: %v", i, err)
 				return
 			}

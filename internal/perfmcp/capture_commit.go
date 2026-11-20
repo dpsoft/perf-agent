@@ -630,17 +630,17 @@ func (t *captureTxn) probe() error {
 	errno, _ := errors.AsType[syscall.Errno](lerr)
 	if errno == syscall.EPERM || errno == syscall.ENOTSUP || errno == syscall.EOPNOTSUPP || errno == syscall.EXDEV {
 		return capture.Errorf(capture.CodeDisabled,
-			"start perf-agent-mcp with --captures naming a directory inside the profiles root on a filesystem that supports hard links",
+			t.s.startAdvice("--captures naming a directory inside the profiles root on a filesystem that supports hard links"),
 			"%v (%s)", lerr, where)
 	}
 	if errno == syscall.ENOSPC || errno == syscall.EDQUOT {
 		return capture.Errorf(capture.CodeDisk,
-			"free space there, or start perf-agent-mcp with --captures naming another directory inside the profiles root",
+			"free space there, or "+t.s.startAdvice("--captures naming another directory inside the profiles root"),
 			"there is no room to make a hard link in the capture directory: %s (%s)", errnoText(lerr), where)
 	}
 	if errno == syscall.EMLINK {
 		return capture.Errorf(capture.CodeDisk,
-			"start perf-agent-mcp with --captures naming a directory inside the profiles root on another filesystem",
+			t.s.startAdvice("--captures naming a directory inside the profiles root on another filesystem"),
 			"the filesystem refused a second link to a new file, too many links: %s (%s)", errnoText(lerr), where)
 	}
 	return t.d.writeError(lerr)
@@ -1218,7 +1218,7 @@ func (t *captureTxn) rollback(cause *capture.Error, m manifest) error {
 	if t.dead {
 		return errCrash
 	}
-	fm := t.manifestOf(m, captureFailed, toWireError(cause))
+	fm := t.manifestOf(m, captureFailed, t.s.wire(cause))
 	if cause.Code == capture.CodeCancelled {
 		fm.Cancel = cancelAnswerCancelled
 	}
@@ -1429,7 +1429,7 @@ func (s *Server) writeFailure(d *captureDir, series string, id int, label string
 	}
 	defer func() { _ = ser.Close() }()
 	t := &captureTxn{s: s, d: d, ser: ser, series: series, id: id, in: intent{Label: label, Settings: settings}, borrowed: true}
-	fm := t.manifestOf(m, captureFailed, toWireError(cause))
+	fm := t.manifestOf(m, captureFailed, t.s.wire(cause))
 	if cause.Code == capture.CodeCancelled {
 		fm.Cancel = cancelAnswerCancelled
 	}

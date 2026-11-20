@@ -421,8 +421,8 @@ func TestStdioAndServeRefuseEachOthersDir(t *testing.T) {
 				sync = true
 			}
 			w := toolErrorOf(t, text)
-			if w.Code != string(capture.CodeOwnerMismatch) || !strings.Contains(w.Message, "belongs to a perf-agent-mcp "+theirs+" server") ||
-				!strings.Contains(w.Message, "this one is "+mine) {
+			if w.Code != string(capture.CodeOwnerMismatch) || !strings.Contains(w.Message, "belongs to a "+ownerBinary(theirs)+" server (owner kind "+theirs+")") ||
+				!strings.Contains(w.Message, "(owner kind "+mine+")") {
 				t.Fatalf("%+v", w)
 			}
 		}
@@ -437,14 +437,14 @@ func TestStdioAndServeRefuseEachOthersDir(t *testing.T) {
 		if err := os.Mkdir(e.captures(), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		owner := []byte(`{"kind":"serve","format":1}` + "\n")
+		owner := []byte(`{"kind":"hub","format":1}` + "\n")
 		if err := os.WriteFile(filepath.Join(e.captures(), ownerFile), owner, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		cfg := e.config()
 		cfg.Captures = "captures"
 		c := startServerProcess(t, cfg)
-		refuses(t, e, c, ownerServe, ownerStdio)
+		refuses(t, e, c, ownerHub, ownerStdio)
 		if names := e.listCaptures(); !slices.Equal(names, []string{ownerFile}) {
 			t.Errorf("the serve directory holds %v", names)
 		}
@@ -461,9 +461,9 @@ func TestStdioAndServeRefuseEachOthersDir(t *testing.T) {
 		s := startServerProcess(t, cfg)
 		s.waitResult(s.startCapture(e.args("1s")))
 		before := e.listCaptures()
-		cfg.Owner = ownerServe
+		cfg.Owner = ownerHub
 		c := startServerProcess(t, cfg)
-		refuses(t, e, c, ownerStdio, ownerServe)
+		refuses(t, e, c, ownerStdio, ownerHub)
 		if after := e.listCaptures(); !slices.Equal(after, before) {
 			t.Errorf("the serve server changed the stdio directory: %v, then %v", before, after)
 		}
@@ -550,6 +550,77 @@ func TestARestartRightAfterAKillAnswersTheCaptureInProgress(t *testing.T) {
 		}
 		w := toolErrorOf(t, text)
 		return w.Status == captureInterrupted && w.Retryable && w.Code == string(capture.CodeCancelled)
+	}) {
+		t.Fatalf("capture_wait adhoc/001 never answered interrupted: %s", last)
+	}
+	if m, ok := e.manifest(1, "run"); !ok || m.Outcome != captureInterrupted {
+		t.Errorf("capture 001: %+v (found %v), want interrupted", m, ok)
+	}
+	e.invariant()
+}
+
+// The hub's crash case, held deterministic by the reaper's barrier: a hub
+// SIGKILLed while it profiles leaves its reaper holding the captures lock.
+// The next hub accepts a capture, whose job fails busy naming the reaper
+// with a retry_after of at most 5s; a wait by the dead hub's capture id
+// answers in_progress naming the dead server and its reaper; once the
+// reaper is gone the capture is interrupted, and retryable.
+func TestADeadHubsReaperHoldsTheLease(t *testing.T) {
+	e := newProcEnv(t, capturetest.FakeOptions{})
+	e.owner = ownerHub
+	hold := filepath.Join(t.TempDir(), "hold")
+	if err := os.WriteFile(hold, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := e.config()
+	cfg.ReaperPause = capture.PauseBeforeExit + hold
+	a := startServerProcess(t, cfg)
+	t.Cleanup(func() { _ = os.Remove(hold) })
+
+	job := a.startCapture(e.args("60s"))
+	a.waitProfiling(job)
+	a.awaitGrandchild()
+	h := e.holder(func(h capture.Holder) bool { return h.ReaperPID > 0 })
+	reaper, ok := procOf(h.ReaperPID)
+	if !ok || reaper.start != h.ReaperStart || reaper.ppid != a.pid() {
+		t.Fatalf("the lock names reaper %d (start %d), and /proc has %+v", h.ReaperPID, h.ReaperStart, reaper)
+	}
+	a.kill9()
+	b := startServerProcess(t, e.config())
+
+	text, isErr := b.waitEnd(b.startCapture(e.args("1s")))
+	w := toolErrorOf(t, text)
+	if !isErr || w.Code != string(capture.CodeBusy) || !strings.Contains(w.Message, fmt.Sprintf("(reaper pid %d)", reaper.pid)) {
+		t.Fatalf("B's capture: %s, want busy naming reaper pid %d", text, reaper.pid)
+	}
+	if d, err := time.ParseDuration(w.RetryAfter); err != nil || d <= 0 || d > 5*time.Second {
+		t.Errorf("busy retry_after %q, want at most 5s", w.RetryAfter)
+	}
+	text, isErr = b.call("capture_wait", map[string]any{"id": "adhoc/001", "timeout": "1s"})
+	var ip inProgress
+	if isErr || json.Unmarshal([]byte(text), &ip) != nil || ip.Status != statusInProgress || ip.Capture != "adhoc/001" {
+		t.Fatalf("capture_wait adhoc/001 while the dead hub's reaper holds the lock: %s", text)
+	}
+	if !strings.Contains(ip.Holder, fmt.Sprintf("pid %d", a.pid())) || !strings.Contains(ip.Holder, fmt.Sprintf("its reaper pid %d still runs", reaper.pid)) {
+		t.Errorf("the answer does not name the dead hub %d and its reaper %d: %s", a.pid(), reaper.pid, text)
+	}
+	if reaper.gone() {
+		t.Fatal("the reaper exited while its barrier file exists")
+	}
+
+	if err := os.Remove(hold); err != nil {
+		t.Fatal(err)
+	}
+	waitGone(t, "the reaper", reaper.gone)
+	var last string
+	if !eventuallyTrue(time.Minute, func() bool {
+		text, isErr := b.call("capture_wait", map[string]any{"id": "adhoc/001", "timeout": "1s"})
+		last = text
+		if !isErr {
+			return false
+		}
+		w := toolErrorOf(t, text)
+		return w.Status == captureInterrupted && w.Retryable
 	}) {
 		t.Fatalf("capture_wait adhoc/001 never answered interrupted: %s", last)
 	}

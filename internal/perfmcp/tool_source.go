@@ -44,7 +44,7 @@ const sourceDescription = "The source lines a node's samples point at, from insi
 const shrinkSource = "call again with a smaller limit or context"
 
 // noSourceRoots is the reason of every row when no --source was given.
-const noSourceRoots = "no source roots: start perf-agent-mcp with --source DIR"
+func (s *Server) noSourceRoots() string { return "no source roots: " + s.startAdvice("--source DIR") }
 
 func (s *Server) sourceTool() mcpstdio.Tool {
 	return mcpstdio.Tool{
@@ -184,7 +184,7 @@ func (s *Server) handleSource(_ context.Context, raw json.RawMessage) (mcpstdio.
 		var res sourceroot.Resolution
 		switch {
 		case !hasRoots:
-			res = sourceroot.Resolution{Status: sourceroot.StatusUnresolved, Reason: noSourceRoots}
+			res = sourceroot.Resolution{Status: sourceroot.StatusUnresolved, Reason: s.noSourceRoots()}
 		case r.Kind == profilemodel.SourceGPUPC:
 			res = batch.ResolveBasename(r.Filename, r.Module.BuildID, e.prof.CaptureID)
 		default:

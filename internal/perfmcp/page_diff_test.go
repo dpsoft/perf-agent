@@ -3,15 +3,13 @@ package perfmcp
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"net/http"
-	"net/url"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
-	"github.com/dpsoft/perf-agent/internal/livehttp"
 	"github.com/dpsoft/perf-agent/internal/pmfixture"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
 )
@@ -129,17 +127,17 @@ func TestPageDiffPublishesTheComparison(t *testing.T) {
 	if out.URL != pageOpen(t, p.c).URL {
 		t.Errorf("url %q is not the page's", out.URL)
 	}
-	st := pageState(t, out.URL)
+	st := pageState(t, p.c)
 	if st.Current != "p1" || st.Selected != "" || st.Focus != "" || len(st.Publications) != 1 {
 		t.Fatalf("state %+v", st)
 	}
 	if e := st.Publications[0]; e.Kind != "diff" || e.View != p.base.view || e.History != "0" {
 		t.Errorf("state entry %+v", e)
 	}
-	if m := diffModelOf(t, []byte(pageGet(t, out.URL, "pub/p1/model"))); m.Kind != "diff" || len(m.Drawn) == 0 {
+	if m := diffModelOf(t, []byte(pageGet(t, p.c, "pub/p1/model"))); m.Kind != "diff" || len(m.Drawn) == 0 {
 		t.Errorf("model kind %q with %d frames drawn", m.Kind, len(m.Drawn))
 	}
-	if got, want := pageGet(t, out.URL, "pub/p1/history"), `{"publication":"p1","version":"0","rows":[]}`; got != want {
+	if got, want := pageGet(t, p.c, "pub/p1/history"), `{"publication":"p1","version":"0","rows":[]}`; got != want {
 		t.Errorf("history %s, want %s", got, want)
 	}
 	if p.c.srv.attempts.next != 0 {
@@ -174,7 +172,8 @@ func TestPageDiffRefusesWhatDiffRefuses(t *testing.T) {
 	c := pageClient(t, nil, map[string][]byte{"base.pb.gz": pmfixture.CPUBasic(), "gpu.pb.gz": pmfixture.GPUBasic()})
 	b, _ := openOn(t, c, "base.pb.gz", "")
 	g, _ := openOn(t, c, "gpu.pb.gz", "")
-	before := pageState(t, pageOpen(t, c).URL)
+	pageOpen(t, c)
+	before := pageState(t, c)
 	pair := map[string]any{"base_handle": b.handle, "base_view": b.view, "new_handle": g.handle, "new_view": g.view}
 	with := func(extra map[string]any) map[string]any {
 		m := map[string]any{}
@@ -205,7 +204,8 @@ func TestPageDiffRefusesWhatDiffRefuses(t *testing.T) {
 	if text, isErr := c.call("page_diff", with(map[string]any{"limit": 2})); !isErr || !strings.Contains(text, `unknown argument "limit"`) {
 		t.Errorf("limit: isError=%v %s", isErr, text)
 	}
-	if after := pageState(t, pageOpen(t, c).URL); after.Seq != before.Seq || len(after.Publications) != 0 {
+	pageOpen(t, c)
+	if after := pageState(t, c); after.Seq != before.Seq || len(after.Publications) != 0 {
 		t.Errorf("a refused page_diff changed the page: %+v, then %+v", before, after)
 	}
 }
@@ -222,11 +222,12 @@ func TestPageDiffChecksItsTitle(t *testing.T) {
 			t.Errorf("%s: isError=%v %s", name, isErr, text)
 		}
 	}
-	if st := pageState(t, pageOpen(t, p.c).URL); len(st.Publications) != 0 {
+	pageOpen(t, p.c)
+	if st := pageState(t, p.c); len(st.Publications) != 0 {
 		t.Errorf("a refused title published: %+v", st)
 	}
 	out, _ := p.pageDiff(t, map[string]any{"title": "2 builds of app"})
-	st := pageState(t, out.URL)
+	st := pageState(t, p.c)
 	var segs []struct {
 		Kind string `json:"kind"`
 		Text string `json:"text"`
@@ -234,7 +235,7 @@ func TestPageDiffChecksItsTitle(t *testing.T) {
 	if err := json.Unmarshal(must(json.Marshal(st.Publications[0].TitleSegs))(t), &segs); err != nil {
 		t.Fatalf("title segments %s: %v", st.Publications[0].TitleSegs, err)
 	}
-	m := diffModelOf(t, []byte(pageGet(t, out.URL, "pub/p1/model")))
+	m := diffModelOf(t, []byte(pageGet(t, p.c, "pub/"+out.Publication+"/model")))
 	for what, ss := range map[string][]struct {
 		Kind string `json:"kind"`
 		Text string `json:"text"`
@@ -254,7 +255,7 @@ func TestPageDiffSelectsAUnionNode(t *testing.T) {
 	p := openLivePair(t, nil, pmfixture.CPUBasic(), pmfixture.CPUBasicNew())
 	b, d := p.unionID(t, "b"), p.unionID(t, "d")
 	out, text := p.pageDiff(t, map[string]any{"node": b})
-	if st := pageState(t, out.URL); st.Current != "p1" || st.Selected != b || st.Focus != "" {
+	if st := pageState(t, p.c); out.Publication != "p1" || st.Current != "p1" || st.Selected != b || st.Focus != "" {
 		t.Errorf("page_diff node b: %s; state %+v", text, st)
 	}
 	plain := p.base.nodeID(t, "b")
@@ -264,14 +265,14 @@ func TestPageDiffSelectsAUnionNode(t *testing.T) {
 			t.Errorf("%s: isError=%v %.300s", name, isErr, text)
 		}
 	}
-	if st := pageState(t, out.URL); len(st.Publications) != 1 {
+	if st := pageState(t, p.c); len(st.Publications) != 1 {
 		t.Errorf("a refused node published: %+v", st)
 	}
 
 	// page_show checks a diff's nodes against the whole union.
 	var shown pageShowOut
 	p.c.callOK("page_show", map[string]any{"node": d, "focus": true}, &shown)
-	if st := pageState(t, out.URL); st.Selected != d || st.Focus != d {
+	if st := pageState(t, p.c); st.Selected != d || st.Focus != d {
 		t.Errorf("page_show d focused: %+v", st)
 	}
 	if text, isErr := p.c.call("page_show", map[string]any{"node": plain}); !isErr || !strings.Contains(text, "union ID") || !strings.Contains(text, "diff") {
@@ -303,18 +304,13 @@ func TestPageDiffExportIsTheM1DiffPage(t *testing.T) {
 		flamegraph.DiffPageOptions{BaseName: "base.pb.gz", NewName: "new.pb.gz"}); err != nil {
 		t.Fatal(err)
 	}
-	res, body := httpGet(t, out.URL+"pub/p1/export", nil)
-	wantStatus(t, "export", res, body, http.StatusOK)
-	if !bytes.Equal(body, want.Bytes()) {
+	if out.Publication != "p1" {
+		t.Fatalf("page_diff published %s", out.Publication)
+	}
+	if body := pageGet(t, p.c, "pub/p1/export"); body != want.String() {
 		t.Errorf("the export is %d bytes that are not WriteDiffPage's %d", len(body), want.Len())
 	}
-	if got := res.Header.Get("Content-Disposition"); got != `attachment; filename="p1.html"` {
-		t.Errorf("Content-Disposition %q", got)
-	}
-	if got := res.Header.Get("Content-Security-Policy"); got != livehttp.ExportCSP {
-		t.Errorf("CSP %q", got)
-	}
-	if m := diffModelOf(t, []byte(pageGet(t, out.URL, "pub/p1/model"))); !m.Export.OK {
+	if m := diffModelOf(t, []byte(pageGet(t, p.c, "pub/p1/model"))); !m.Export.OK {
 		t.Errorf("the model offers no export: %+v", m.Export)
 	}
 }
@@ -342,21 +338,18 @@ func TestPageDiffExportTooLargeIs422(t *testing.T) {
 	base, next := wideDeepPair()
 	p := openLivePair(t, func(c *Config) { c.Limits.MaxPageBytes = budget }, base, next)
 	out, _ := p.pageDiff(t, nil)
-	m := diffModelOf(t, []byte(pageGet(t, out.URL, "pub/p1/model")))
+	m := diffModelOf(t, []byte(pageGet(t, p.c, "pub/p1/model")))
 	if m.SizeNote == "" || m.Export.OK || !strings.Contains(m.Export.Reason, fmt.Sprint(budget)) {
 		t.Fatalf("the model fits by leaving frames out and offers no export: size_note %q, export %+v", m.SizeNote, m.Export)
 	}
-	res, body := httpGet(t, out.URL+"pub/p1/export", nil)
-	wantStatus(t, "export", res, body, http.StatusUnprocessableEntity)
-	if got := res.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
-		t.Errorf("Content-Type %q", got)
+	_, err := p.c.srv.PageSnapshot().Export(out.Publication)
+	le, ok := errors.AsType[*PageLimitError](err)
+	if !ok {
+		t.Fatalf("the export: %v, want a page limit error", err)
 	}
-	if got := res.Header.Get("Content-Disposition"); got != "" {
-		t.Errorf("a refused export has Content-Disposition %q", got)
-	}
-	want := fmt.Sprintf("the diff cannot be exported within this server's MaxPageBytes=%d and MaxPageNodes=%d: flamegraph: %s\n", budget, DefaultLimits().MaxPageNodes, m.Export.Reason)
-	if string(body) != want {
-		t.Errorf("body %q, want %q", body, want)
+	want := fmt.Sprintf("the diff cannot be exported within this server's MaxPageBytes=%d and MaxPageNodes=%d: flamegraph: %s", budget, DefaultLimits().MaxPageNodes, m.Export.Reason)
+	if le.Msg != want {
+		t.Errorf("the refusal %q, want %q", le.Msg, want)
 	}
 }
 
@@ -405,8 +398,8 @@ func TestPageShowFindsADiffNodeTheModelLeftOut(t *testing.T) {
 	if got := p.unionID(t, "b"); got != string(bID) {
 		t.Fatalf("diff names b %s, the fixture's diff %s", got, bID)
 	}
-	out, _ := p.pageDiff(t, nil)
-	if m := diffModelOf(t, []byte(pageGet(t, out.URL, "pub/p1/model"))); slices.Contains(m.frameIDs(), string(bID)) {
+	p.pageDiff(t, nil)
+	if m := diffModelOf(t, []byte(pageGet(t, p.c, "pub/p1/model"))); slices.Contains(m.frameIDs(), string(bID)) {
 		t.Fatalf("b is in the model with MaxPageBytes=%d", budget)
 	}
 	var shown pageShowOut
@@ -426,7 +419,7 @@ func TestPageShowFindsADiffNodeTheModelLeftOut(t *testing.T) {
 			Name string `json:"name"`
 		} `json:"path"`
 	}
-	raw := pageGet(t, out.URL, "pub/p1/frame/"+url.PathEscape(string(bID)))
+	raw := pageGet(t, p.c, "pub/p1/frame/"+string(bID))
 	if err := json.Unmarshal([]byte(raw), &frame); err != nil {
 		t.Fatalf("frame %s: %v", raw, err)
 	}
@@ -437,58 +430,9 @@ func TestPageShowFindsADiffNodeTheModelLeftOut(t *testing.T) {
 	if frame.Node != string(bID) || frame.Frame.Name != "b" || frame.Frame.DeltaAbs == "" || !slices.Equal(names, []string{"main", "a", "b"}) {
 		t.Errorf("frame of b: %s", raw)
 	}
-	res, body := httpGet(t, out.URL+"pub/p1/focus/"+url.PathEscape(string(bID)), nil)
-	wantStatus(t, "focus on b", res, body, http.StatusOK)
+	body := []byte(pageGet(t, p.c, "pub/p1/focus/"+string(bID)))
 	if m := diffModelOf(t, body); len(m.Drawn) == 0 || !slices.Contains(m.frameIDs(), string(bID)) {
 		t.Errorf("focus on b: %.300s", body)
-	}
-}
-
-// The page fetches a union node with its "/" escaped; only that escape,
-// between two node IDs, on a diff's frame and focus routes, is served.
-func TestOnlyAUnionIDMayBeEscaped(t *testing.T) {
-	p := openLivePair(t, nil, pmfixture.CPUBasic(), pmfixture.CPUBasicNew())
-	b, d := p.unionID(t, "b"), p.unionID(t, "d")
-	out, _ := p.pageDiff(t, nil)
-	var pub pageExplainOut
-	p.c.callOK("page_explain", p.base.args(map[string]any{"explanations": []any{}}), &pub)
-	base := out.URL
-	bBase, bNew, _ := strings.Cut(b, "/")
-	dBase, dNew, _ := strings.Cut(d, "/")
-	if dBase != "-" {
-		t.Fatalf("d is new only, its union ID is %s", d)
-	}
-	for _, route := range []string{"pub/p1/frame/" + bBase + "%2F" + bNew, "pub/p1/focus/" + bBase + "%2F" + bNew, "pub/p1/frame/-%2F" + dNew} {
-		res, body := httpGet(t, base+route, nil)
-		wantStatus(t, route, res, body, http.StatusOK)
-	}
-	plain := p.base.nodeID(t, "b")
-	for _, route := range []string{
-		"pub/p1/frame/" + bBase + "%2f" + bNew,
-		"pub/p1/frame/" + bBase + "%2F" + bNew + "%2F" + bNew,
-		"pub/p1/frame/" + bBase + "%2F",
-		"pub/p1/frame/%2F" + bNew,
-		"pub/p1/frame/" + bBase + "%2F" + strings.ToUpper(bNew),
-		"pub/p1/frame/" + bBase + "%2Fx" + bNew[1:],
-		"pub/p1/frame/" + bBase + "%2F" + bNew + "0",
-		"pub/p1/frame/%2D%2F" + dNew,
-		"pub/p1/frame/" + bBase + "/" + bNew,
-		"pub/p1/frame/" + bBase + "%252F" + bNew,
-		"pub/p1/model%2F" + bNew,
-		"pub/p1/history/" + bBase + "%2F" + bNew,
-		"pub/p1/export/" + bBase + "%2F" + bNew,
-		"pub/p%31/frame/" + bBase + "%2F" + bNew,
-		"pub%2Fp1/frame/" + bBase + "%2F" + bNew,
-		"pub/p1/frame/" + plain,
-		"pub/p2/frame/" + bBase + "%2F" + bNew,
-		"pub/p2/focus/" + bBase + "%2F" + bNew,
-		"pub/p1/frame/0000000000000000%2F" + bNew,
-	} {
-		res, body := httpGet(t, base+route, nil)
-		wantStatus(t, route, res, body, http.StatusNotFound)
-		if loc := res.Header.Get("Location"); loc != "" {
-			t.Errorf("%s: redirected to %q", route, loc)
-		}
 	}
 }
 
@@ -496,14 +440,14 @@ func TestOnlyAUnionIDMayBeEscaped(t *testing.T) {
 // nothing, and says which limit to raise.
 func TestPageDiffThatCannotBeDrawnSaysWhy(t *testing.T) {
 	p := openLivePair(t, func(c *Config) { c.Limits.MaxPageBytes = 600 }, pmfixture.CPUBasic(), pmfixture.CPUBasicNew())
-	url := pageOpen(t, p.c).URL
-	before := pageState(t, url)
+	pageOpen(t, p.c)
+	before := pageState(t, p.c)
 	text, isErr := p.c.call("page_diff", p.args(nil))
 	if !isErr || !strings.HasPrefix(text, "the diff cannot be drawn within this server's MaxPageBytes=600: ") ||
 		!strings.HasSuffix(text, "; restart perf-agent-mcp with a larger --limit MaxPageBytes=N; nothing was published") {
 		t.Errorf("isError=%v %s", isErr, text)
 	}
-	if after := pageState(t, url); after.Seq != before.Seq || len(after.Publications) != 0 {
+	if after := pageState(t, p.c); after.Seq != before.Seq || len(after.Publications) != 0 {
 		t.Errorf("the page changed: %+v, then %+v", before, after)
 	}
 }

@@ -16,8 +16,25 @@ import (
 )
 
 func TestGuideIsShortAndStatesTheRules(t *testing.T) {
-	if strings.Contains(guideText, "page_") || strings.Contains(guideText, "--live") {
-		t.Error("the stdio guide mentions the live page, which this server does not expose")
+	// The guide serves both binaries: the page tools are named only on
+	// the one line that says they are the hub's, and points at the docs.
+	var pointer []string
+	for line := range strings.SplitSeq(guideText, "\n") {
+		if strings.Contains(line, "--live") {
+			t.Errorf("the guide names --live, which no binary has: %q", line)
+		}
+		if strings.Contains(line, "page_") {
+			pointer = append(pointer, line)
+		}
+	}
+	if len(pointer) != 1 || !strings.HasPrefix(pointer[0], "With perf-agent-hub, the page tools and `page_state` exist (see docs/mcp.md).") {
+		t.Errorf("the page tools are named outside the one hub pointer line: %q", pointer)
+	} else {
+		for _, want := range []string{"reading its resource, marks the asks it returns read", "`user` is best effort"} {
+			if !strings.Contains(pointer[0], want) {
+				t.Errorf("the hub pointer does not say %q", want)
+			}
+		}
 	}
 	if len(guideText) > 12288 {
 		t.Errorf("guide is %d bytes, want at most 12288", len(guideText))

@@ -12,9 +12,16 @@ import (
 //go:embed guide.md
 var guideText string
 
-// instructions are sent to the client at initialize.
-const instructions = "perf-agent-mcp answers questions about perf-agent profiles. " +
-	"Read the perf-agent-guide prompt (or resource perf-agent://guide) before the first call."
+// instructions are sent to the client at initialize, naming the binary
+// the server runs as; with the live page, they say when to read it.
+func (s *Server) instructions() string {
+	text := s.command() + " answers questions about perf-agent profiles. " +
+		"Read the perf-agent-guide prompt (or resource perf-agent://guide) before the first call."
+	if s.live != nil {
+		text += " " + pageStateInstruction
+	}
+	return text
+}
 
 // guidePrompts and guideResources serve the guide both ways, since clients
 // differ in which of the two they surface.

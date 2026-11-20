@@ -51,8 +51,8 @@ func CheckSelf(status []byte) error {
 		}
 	}
 	if euid == 0 {
-		return Errorf(CodeDisabled, "run perf-agent-mcp as your own user; perf-agent gets its capabilities from setcap",
-			"perf-agent-mcp runs with euid 0; capture is disabled, since the same-uid target rule would cover every root process")
+		return Errorf(CodeDisabled, "run "+CommandMark+" as your own user; perf-agent gets its capabilities from setcap",
+			CommandMark+" runs with euid 0; capture is disabled, since the same-uid target rule would cover every root process")
 	}
 	for _, f := range []string{"CapEff", "CapPrm"} {
 		v := fields[f]
@@ -61,15 +61,15 @@ func CheckSelf(status []byte) error {
 			return unreadable(f)
 		}
 		if n != 0 {
-			return Errorf(CodeDisabled, "run perf-agent-mcp without capabilities; only perf-agent is setcap'd",
-				"perf-agent-mcp holds capabilities (%s %s: %s); the server must hold none",
+			return Errorf(CodeDisabled, "run "+CommandMark+" without capabilities; only perf-agent is setcap'd",
+				CommandMark+" holds capabilities (%s %s: %s); the server must hold none",
 				f, v, strings.Join(CapSet(n).Names(), ","))
 		}
 	}
 	switch fields["NoNewPrivs"] {
 	case "0":
 	case "1":
-		return Errorf(CodeDisabled, "start perf-agent-mcp outside the sandbox",
+		return Errorf(CodeDisabled, "start "+CommandMark+" outside the sandbox",
 			"this server inherited no_new_privs (a sandbox?); perf-agent's file capabilities cannot apply")
 	default:
 		return unreadable("NoNewPrivs")
@@ -105,7 +105,7 @@ func CheckBounding(status []byte, need CapSet) error {
 		return Errorf(CodeDisabled, "", "cannot read CapBnd from /proc/self/status")
 	}
 	if missing := need &^ CapSet(n); missing != 0 {
-		return Errorf(CodeDisabled, "start perf-agent-mcp where the capability bounding set keeps perf-agent's capabilities",
+		return Errorf(CodeDisabled, "start "+CommandMark+" where the capability bounding set keeps perf-agent's capabilities",
 			"this server's capability bounding set lacks %s, which perf-agent's file grants; at exec they would be refused or dropped",
 			strings.Join(missing.Names(), ","))
 	}

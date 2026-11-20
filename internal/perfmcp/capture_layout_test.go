@@ -184,7 +184,7 @@ func writeFile(t *testing.T, root *os.Root, name, content string) {
 }
 
 func TestOwnerFileRefusesTheOtherKind(t *testing.T) {
-	for _, order := range [][2]string{{ownerStdio, ownerServe}, {ownerServe, ownerStdio}} {
+	for _, order := range [][2]string{{ownerStdio, ownerHub}, {ownerHub, ownerStdio}} {
 		t.Run(order[0]+"-first", func(t *testing.T) {
 			profiles := t.TempDir()
 			first := newKindServer(t, profiles, order[0], "shared")
@@ -237,14 +237,14 @@ func TestOwnerFileRefusesTheOtherKind(t *testing.T) {
 
 	t.Run("default-dirs-differ", func(t *testing.T) {
 		profiles := t.TempDir()
-		for _, kind := range []string{ownerStdio, ownerServe} {
+		for _, kind := range []string{ownerStdio, ownerHub} {
 			d, e := newKindServer(t, profiles, kind, "").openCaptureDir()
 			if e != nil {
 				t.Fatalf("%s: %v", kind, e)
 			}
 			d.close()
 		}
-		for _, dir := range []string{"captures", "captures-serve"} {
+		for _, dir := range []string{"captures", "captures-hub"} {
 			if _, err := os.Stat(filepath.Join(profiles, dir, ownerFile)); err != nil {
 				t.Errorf("%s: %v", dir, err)
 			}

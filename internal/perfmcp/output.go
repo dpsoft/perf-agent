@@ -15,8 +15,10 @@ import (
 
 // errRenderDisabled is every render call's answer on a server without an
 // output root.
-var errRenderDisabled = errors.New("DISABLED: start perf-agent-mcp with --output DIR to enable rendering. " +
-	"This server has no output root, so it writes no pages")
+func (s *Server) errRenderDisabled() error {
+	return errors.New("DISABLED: " + s.startAdvice("--output DIR to enable rendering. ") +
+		"This server has no output root, so it writes no pages")
+}
 
 // pageExt is the extension every page's name must end in.
 const pageExt = ".html"
@@ -99,15 +101,15 @@ func (s *Server) linkNoReplace(root *os.Root, kind, tmp, name string) error {
 		return takenError{fmt.Errorf("%s already exists under the %s root and is never replaced", echo(name), kind)}
 	case kind == rootOutput:
 		return fmt.Errorf("cannot publish %s under the output root %s with a hard link: %v; "+
-			"perf-agent-mcp publishes a page only with a hard link, which never replaces a file, so it wrote no page. "+
-			"Start perf-agent-mcp with --output on a filesystem that supports hard links", echo(name), root.Name(), pathless(err))
+			"%[4]s publishes a page only with a hard link, which never replaces a file, so it wrote no page. "+
+			"Start %[4]s with --output on a filesystem that supports hard links", echo(name), root.Name(), pathless(err), s.command())
 	}
 	// The message names the final name and the root by its kind only: the
 	// temporary carries an owner token, and the root's path is the
 	// server's.
 	return wrapped{fmt.Sprintf("cannot publish %s under the %s root with a hard link: %s; "+
-		"perf-agent-mcp publishes a capture's files only with a hard link, which never replaces a file, so it wrote nothing. "+
-		"Start perf-agent-mcp with --captures on a filesystem that supports hard links", echo(name), kind, errnoText(err)), err}
+		"%[4]s publishes a capture's files only with a hard link, which never replaces a file, so it wrote nothing. "+
+		"Start %[4]s with --captures on a filesystem that supports hard links", echo(name), kind, errnoText(err), s.command()), err}
 }
 
 // wrapped is an error with its own text that still unwraps to its cause,
@@ -152,7 +154,7 @@ func errnoText(err error) string {
 // names anything that exists.
 func (s *Server) pageName(out string) (string, error) {
 	if s.output == nil {
-		return "", errRenderDisabled
+		return "", s.errRenderDisabled()
 	}
 	root := s.output
 	for part := range strings.SplitSeq(filepath.ToSlash(out), "/") {

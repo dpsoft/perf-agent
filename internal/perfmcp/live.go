@@ -2,42 +2,20 @@ package perfmcp
 
 import (
 	"cmp"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"log/slog"
 	"maps"
-	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/dpsoft/perf-agent/internal/explain"
 	"github.com/dpsoft/perf-agent/internal/flamegraph"
-	"github.com/dpsoft/perf-agent/internal/livehttp"
 	"github.com/dpsoft/perf-agent/internal/profilemodel"
 )
-
-// liveAddr is where the live page listens: the IPv4 loopback, on a port
-// the kernel picks. livehttp.Listen checks it is loopback.
-const liveAddr = "127.0.0.1:0"
-
-// The live page's stream: a keep-alive comment after this long without an
-// event, and this long for each write before the stream is dropped.
-const (
-	liveKeepAlive    = 15 * time.Second
-	liveWriteTimeout = 10 * time.Second
-)
-
-// liveShutdown is how long Close lets the page's responses finish before
-// it drops their connections. Close may run during a forced exit, so it
-// must not wait on a tab that stopped reading.
-const liveShutdown = 500 * time.Millisecond
 
 // pubKind is what a publication shows.
 type pubKind string
@@ -48,7 +26,7 @@ const (
 )
 
 // publication is one page the live page can show. It is complete before
-// the snapshot holds it, and never changes after: HTTP handlers read it
+// the snapshot holds it, and never changes after: a PageView reads it
 // from any goroutine. It pins the engine objects its routes compute from,
 // so it stays valid after the store lets them go: an explained one its
 // Profile and View, a diff its Diff, the Diff's index and both sides'
@@ -63,8 +41,18 @@ type publication struct {
 	titleSegs json.RawMessage
 	view      string
 	digest    profilemodel.Digest
-	// attempt is the attempt the publication was made for.
+	// attempt is the attempt the publication was made for, and by the
+	// label of the session that made it ("" for none).
 	attempt string
+	by      string
+	// files are the files the publication's profiles were read from, by
+	// device and inode, as the store opened them, and for a capture's
+	// publication the capture's own files too (a profile whose bytes equal
+	// one open already shares its entry, opened from the other file):
+	// retention keeps them while the publication is kept. Unlike the rest,
+	// they are read only under the engine, which may add the capture's
+	// before it lets go.
+	files []fileKey
 
 	prof   *profilemodel.Profile
 	v      *profilemodel.View
@@ -258,12 +246,13 @@ func trimRejected(rejected []explain.RejectedAttempt, keepFailures, keepAttempts
 	return out, from
 }
 
-// liveSnapshot is what the live page's HTTP handlers read: the steering,
-// the kept publications and their histories, and the state JSON every page
-// is sent. A snapshot never changes once stored; commit replaces it.
+// liveSnapshot is what a PageView reads: the steering, the kept
+// publications and their histories, and the state JSON every page is
+// sent. A snapshot never changes once stored; commit replaces it.
 type liveSnapshot struct {
 	seq                      int64
 	current, selected, focus string
+	by                       string
 	pubs                     map[string]*publication
 	// order lists the publications as the state does, oldest first.
 	order   []string
@@ -275,15 +264,18 @@ type liveSnapshot struct {
 //
 // The engine holder alone changes the publications, the steering and the
 // snapshot: every field below snap is its own, and commit, the only writer
-// of snap, runs under the engine. HTTP handlers read only what snap points
-// to, and the hub, which never changes. The listener's lifecycle is the
-// exception: the engine holder starts it and Close may end it from another
-// goroutine (a forced exit), so it is behind mu.
+// of snap, runs under the engine. A PageView reads only what snap points
+// to, and the bus's envelope. The exceptions: bus and inbox keep their
+// state under their own locks, which never wait for the engine; and Close
+// may set closed from another goroutine (a forced exit), so it is behind
+// mu.
 type live struct {
 	snap atomic.Pointer[liveSnapshot]
 
 	// pubs are the kept publications, least recently shown first; the
-	// current one is last. history is the history of each explained one.
+	// current one, the last shown, is last. A publication kept without
+	// being shown goes just before the current one. history is the
+	// history of each explained one.
 	pubs    []*publication
 	history map[string]*liveHistory
 	// next is the number of the last publication made.
@@ -291,37 +283,46 @@ type live struct {
 	seq  int64
 	// current, selected and focus are what the page is told to show: a
 	// publication, a node of it ("" for none) and the node its layout
-	// starts at ("" for the whole view).
+	// starts at ("" for the whole view). by is the label of the session
+	// that last set them, by publishing or with page_show.
 	current, selected, focus string
+	by                       string
 
-	hub  *livehttp.Hub
+	// url is the page's address, and viewers counts the open streams (see
+	// PageConfig). opened is set by the first ensureLive, which commits.
+	url     string
+	viewers func() int
+	opened  bool
+	// bus joins each committed state with the inbox's into the envelope
+	// the page is sent, and hands it to PageConfig.Notify. inbox is what
+	// the user reported from the page; it has its own lock.
+	bus   *stateBus
+	inbox *inbox
+	// claimed is set by ClaimPage, on whichever goroutine routes the page.
+	claimed atomic.Bool
+
 	lim  Limits
 	pins *pins
-	// heavySlots holds a token per export or focus request being served;
-	// see heavy.
-	heavySlots chan struct{}
 
 	mu sync.Mutex
-	// closed is set by close; nothing starts after it.
+	// closed is set by close; the page tools refuse after it.
 	closed bool
-	// srv serves the page once start has run, from ln; url is the page's
-	// address.
-	srv *http.Server
-	ln  io.Closer
-	url string
 }
 
-func newLive(lim Limits, pins *pins) *live {
+func newLive(lim Limits, pins *pins, page PageConfig) *live {
 	l := &live{
-		history:    map[string]*liveHistory{},
-		hub:        livehttp.NewHub(lim.MaxPageClients, liveKeepAlive, liveWriteTimeout),
-		lim:        lim,
-		pins:       pins,
-		heavySlots: make(chan struct{}, liveHeavy),
+		history: map[string]*liveHistory{},
+		url:     page.URL,
+		viewers: page.Viewers,
+		lim:     lim,
+		pins:    pins,
+		inbox:   newInbox(lim.Hub.MaxInboxEntries, randHex(askNonceBytes)),
 	}
 	snap := &liveSnapshot{pubs: map[string]*publication{}, history: map[string]*liveHistory{}}
 	snap.state = stateOf(snap)
 	l.snap.Store(snap)
+	l.bus = newStateBus(snap.state, l.inbox.state(), page.Notify)
+	l.inbox.bus = l.bus
 	return l
 }
 
@@ -329,78 +330,34 @@ func newLive(lim Limits, pins *pins) *live {
 func (l *live) snapshot() *liveSnapshot { return l.snap.Load() }
 
 // errLiveClosed is ensureLive's answer once the server is closing.
-var errLiveClosed = errors.New("the live page is shut down: perf-agent-mcp is exiting")
+var errLiveClosed = errors.New("the live page is shut down: this server is exiting")
 
-// close stops the live page. It may run on any goroutine, more than once.
-// The hub goes first, so every stream returns and its connection can go
-// idle; then the server gets liveShutdown to finish the other responses,
-// and the connections still busy, a tab that stopped reading, are
-// dropped. It logs nothing: stderr may be blocked during a forced exit.
+// close marks the live page closed, so no page tool runs after it. It may
+// run on any goroutine, more than once. Whoever serves the page stops
+// that on its own; close neither waits nor logs, since stderr may be
+// blocked during a forced exit.
 func (l *live) close() {
 	l.mu.Lock()
-	l.closed = true
-	srv, ln := l.srv, l.ln
-	l.mu.Unlock()
-	l.hub.Close()
-	if srv == nil {
-		return
-	}
-	// Serve may not have taken the listener yet; closing it here refuses
-	// new connections at once either way.
-	_ = ln.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), liveShutdown)
-	defer cancel()
-	_ = srv.Shutdown(ctx)
-	_ = srv.Close()
-}
-
-// start listens on liveAddr with a new token and serves mux() behind the
-// guard, unless the page is already served or close has run. It returns
-// the page's URL, the address it listens on and whether this call
-// started it.
-func (l *live) start(mux func() http.Handler, log *slog.Logger) (url, addr string, started bool, err error) {
-	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.closed {
-		return "", "", false, errLiveClosed
-	}
-	if l.url != "" {
-		return l.url, "", false, nil
-	}
-	tok, err := livehttp.NewToken()
-	if err != nil {
-		return "", "", false, err
-	}
-	ln, err := livehttp.Listen(liveAddr)
-	if err != nil {
-		return "", "", false, fmt.Errorf("live page: %w", err)
-	}
-	srv := livehttp.NewServer(livehttp.Guard(tok, mux()), log)
-	go func() { _ = srv.Serve(ln) }()
-	// A TCP address prints an IPv6 host in brackets.
-	addr = ln.Addr().String()
-	l.srv, l.ln, l.url = srv, ln, "http://"+addr+"/s/"+string(tok)+"/"
-	return l.url, addr, true, nil
+	l.closed = true
 }
 
-// ensureLive starts the live page on first use and returns its URL; later
-// calls return the same URL. It runs under the engine, and refuses
-// once Close has run. The first start commits, so a page that connects
+// ensureLive returns the page's URL, and refuses once Close has run. It
+// runs under the engine. The first call commits, so a page that connects
 // before anything is published is still sent a state.
 func (s *Server) ensureLive() (string, error) {
 	if s.live == nil {
 		return "", errLiveDisabled
 	}
-	url, addr, started, err := s.live.start(s.liveMux, s.log)
-	if err != nil {
-		return "", err
+	l := s.live
+	if l.isClosed() {
+		return "", errLiveClosed
 	}
-	if started {
-		// The address only: the token is in the URL, never in a log line.
-		s.log.Info("live page listening", "addr", addr)
+	if !l.opened {
+		l.opened = true
 		s.commit()
 	}
-	return url, nil
+	return l.url, nil
 }
 
 // isClosed reports whether close has run.
@@ -411,17 +368,17 @@ func (l *live) isClosed() bool {
 }
 
 // show makes publication id current, with node selected and, when focus
-// is set, the layout starting at node. It checks only that id is kept;
-// whether node may be shown is the caller's to check. Nothing reaches the
-// page until commit.
-func (l *live) show(id, node string, focus bool) error {
+// is set, the layout starting at node, as the session labelled by asked.
+// It checks only that id is kept; whether node may be shown is the
+// caller's to check. Nothing reaches the page until commit.
+func (l *live) show(id, node string, focus bool, by string) error {
 	i := slices.IndexFunc(l.pubs, func(p *publication) bool { return p.id == id })
 	if i < 0 {
 		return fmt.Errorf("publication %q is not kept", echo(id))
 	}
 	p := l.pubs[i]
 	l.pubs = append(slices.Delete(l.pubs, i, i+1), p)
-	l.current, l.selected, l.focus = id, node, ""
+	l.current, l.selected, l.focus, l.by = id, node, "", by
 	if focus {
 		l.focus = node
 	}
@@ -429,12 +386,12 @@ func (l *live) show(id, node string, focus bool) error {
 }
 
 // publishExplained publishes view v (named view) of e's profile with the
-// passing check r, titled title, made for attempt. The model is built
+// passing check r, titled title, made for attempt by the session labelled
+// by. The model is built
 // within the page limits; one that cannot be built publishes nothing. An
-// admitted publication becomes current with its first explained node
-// selected (none for a facts-only page) and no focus, and the page is
-// told. A model that cannot be built is a *modelError.
-func (s *Server) publishExplained(e *entry, v *profilemodel.View, view string, r explain.Result, title, attempt string) (*publication, error) {
+// admitted publication is steered to as admit says, and the page is told.
+// A model that cannot be built is a *modelError.
+func (s *Server) publishExplained(e *entry, v *profilemodel.View, view string, r explain.Result, title, attempt, by string, steer bool) (*publication, error) {
 	opts := flamegraph.LiveOptions{
 		Title: title, ProfileName: e.name, Digest: e.prof.Digest.String(), Attempt: attempt,
 		MaxNodes: s.lim.MaxPageNodes, MaxBytes: s.lim.MaxPageBytes,
@@ -445,26 +402,58 @@ func (s *Server) publishExplained(e *entry, v *profilemodel.View, view string, r
 	}
 	p := &publication{
 		kind: pubExplained, title: title, titleSegs: flamegraph.LiveTitleSegments(title, e.name),
-		view: view, digest: e.prof.Digest, attempt: attempt,
+		view: view, digest: e.prof.Digest, attempt: attempt, by: by, files: filesOf(e),
 		prof: e.prof, v: v, result: r, resultSize: resultBytes(r), opts: opts, model: model,
 	}
-	if err := s.admit(p); err != nil {
+	if err := s.admit(p, steer); err != nil {
 		return nil, err
 	}
-	l := s.live
-	l.selected, l.focus = p.firstSelected(), ""
 	s.commit()
 	return p, nil
 }
 
+// filesOf is the files es were read from, by device and inode, each once.
+func filesOf(es ...*entry) []fileKey {
+	var out []fileKey
+	for _, e := range es {
+		for _, fi := range e.opened {
+			if st, ok := statOf(fi); ok {
+				out = addFiles(out, fileKey{st.dev, st.ino})
+			}
+		}
+	}
+	return out
+}
+
+// addFiles is files with each of keys it does not hold yet.
+func addFiles(files []fileKey, keys ...fileKey) []fileKey {
+	for _, k := range keys {
+		if !slices.Contains(files, k) {
+			files = append(files, k)
+		}
+	}
+	return files
+}
+
+// publishedFiles is the files of every kept publication, which retention
+// keeps. It runs under the engine, as retention's protection does.
+func (s *Server) publishedFiles() []fileKey {
+	var out []fileKey
+	for _, p := range s.live.pubs {
+		out = append(out, p.files...)
+	}
+	return out
+}
+
 // publishDiff publishes d, the comparison of base's view with next's,
-// titled title, with node selected ("" for none). It indexes the whole
+// titled title, with node selected ("" for none), for the session
+// labelled by. It indexes the whole
 // union once and measures it once, for every model and export the page
 // asks for later. A node that is not in the union publishes nothing, and
 // neither does a model that cannot be built within the page limits (a
-// *modelError). An admitted publication becomes current, unfocused, and
+// *modelError). An admitted publication is steered to as admit says, and
 // the page is told.
-func (s *Server) publishDiff(d *profilemodel.Diff, base, next diffSide, title, node string) (*publication, error) {
+func (s *Server) publishDiff(d *profilemodel.Diff, base, next diffSide, title, node, by string, steer bool) (*publication, error) {
 	ix := profilemodel.NewDiffIndex(d)
 	if node != "" {
 		if _, ok := ix.Node(profilemodel.UnionID(node)); !ok {
@@ -483,14 +472,12 @@ func (s *Server) publishDiff(d *profilemodel.Diff, base, next diffSide, title, n
 	}
 	p := &publication{
 		kind: pubDiff, title: title, titleSegs: flamegraph.LiveTitleSegments(title, "Diff of "+base.e.name+" and "+next.e.name),
-		view: d.View, prof: base.e.prof, v: base.v, model: model,
+		view: d.View, by: by, files: filesOf(base.e, next.e), prof: base.e.prof, v: base.v, model: model,
 		diff: d, index: ix, newProf: next.e.prof, newV: next.v, node: node, diffOpts: opts, export: export,
 	}
-	if err := s.admit(p); err != nil {
+	if err := s.admit(p, steer); err != nil {
 		return nil, err
 	}
-	l := s.live
-	l.selected, l.focus = p.firstSelected(), ""
 	s.commit()
 	return p, nil
 }
@@ -511,14 +498,21 @@ type modelError struct{ err error }
 func (e *modelError) Error() string { return e.err.Error() }
 func (e *modelError) Unwrap() error { return e.err }
 
-// admit keeps p as the current publication, with its history. It first
-// tries the change on a copy: it drops the least recently shown other
-// publications while more than MaxPublications would be kept, or while
-// the estimated memory of what is kept and p goes over MaxRetainedBytes.
-// Only if that fits does it drop them, number p and hold its pins. A
-// publication that does not fit even alone is refused, and nothing
-// changes.
-func (s *Server) admit(p *publication) error {
+// admit keeps p, with its history. It first tries the change on a copy:
+// it drops the least recently shown other publications while more than
+// MaxPublications would be kept, or while the estimated memory of what is
+// kept and p goes over MaxRetainedBytes. Only if that fits does it drop
+// them, number p and hold its pins. A publication that does not fit even
+// alone is refused, and nothing changes.
+//
+// With steer, p becomes current, with its first explained node selected
+// (none for a facts-only page; for a diff the node it selects), no focus,
+// and by its maker. Without steer, current, selected and focus stay as
+// they were and p goes just before the current one, so it is dropped
+// before anything shown more recently; only when the current one had to
+// be dropped to make room is p shown in its place, since the page must
+// show a kept publication.
+func (s *Server) admit(p *publication, steer bool) error {
 	l := s.live
 	n := l.next + 1
 	id := "p" + strconv.Itoa(n)
@@ -545,8 +539,8 @@ func (s *Server) admit(p *publication) error {
 			what, smaller = "the profiles and views of both sides, the diff and its index, and the page model", "compare smaller views"
 		}
 		return fmt.Errorf("the page would keep %d bytes in memory (%s), over MaxRetainedBytes=%d; "+
-			"%s or restart perf-agent-mcp with a larger --limit MaxRetainedBytes=N",
-			cost(nil), what, s.lim.MaxRetainedBytes, smaller)
+			"%s or %s",
+			cost(nil), what, s.lim.MaxRetainedBytes, smaller, s.raiseAdvice("MaxRetainedBytes"))
 	}
 
 	for _, d := range l.pubs[:len(l.pubs)-len(kept)] {
@@ -558,8 +552,21 @@ func (s *Server) admit(p *publication) error {
 	if h != nil {
 		l.history[id] = h
 	}
-	l.pubs = append(slices.Clone(kept), p)
-	l.current = id
+	cur := slices.IndexFunc(kept, func(k *publication) bool { return k.id == l.current })
+	if !steer && l.current != "" && cur < 0 {
+		// The current one was dropped: p is all the page has to show.
+		steer = true
+	}
+	switch {
+	case steer:
+		l.pubs = append(slices.Clone(kept), p)
+		l.current, l.selected, l.focus, l.by = id, p.firstSelected(), "", p.by
+	case cur < 0:
+		// Nothing is shown yet.
+		l.pubs = append(slices.Clone(kept), p)
+	default:
+		l.pubs = slices.Insert(slices.Clone(kept), cur, p)
+	}
 	return nil
 }
 
@@ -700,13 +707,13 @@ func (l *live) heldByKept() int64 {
 }
 
 // commit stores a new snapshot of the live state, at the next seq, and
-// sends its state to every page. It is the only writer of the snapshot,
-// and runs under the engine.
+// hands its state to the state bus, which notifies the envelope. It is
+// the only writer of the snapshot, and runs under the engine.
 func (s *Server) commit() {
 	l := s.live
 	l.seq++
 	snap := &liveSnapshot{
-		seq: l.seq, current: l.current, selected: l.selected, focus: l.focus,
+		seq: l.seq, current: l.current, selected: l.selected, focus: l.focus, by: l.by,
 		pubs: make(map[string]*publication, len(l.pubs)), history: maps.Clone(l.history),
 	}
 	for _, p := range slices.SortedFunc(slices.Values(l.pubs), func(a, b *publication) int { return cmp.Compare(a.n, b.n) }) {
@@ -716,12 +723,13 @@ func (s *Server) commit() {
 	snap.state = stateOf(snap)
 	l.snap.Store(snap)
 	// The state is compact JSON from encoding/json: never empty and never
-	// more than one line, the only data Publish refuses.
-	_ = l.hub.Publish(snap.state)
+	// more than one line.
+	l.bus.setEngine(snap.seq, snap.state)
 }
 
 // liveStateEntry is a publication as the state lists it. history is its
-// history's version, "0" for a publication without one.
+// history's version, "0" for a publication without one; by is the label
+// of the session that made it, "" for none.
 type liveStateEntry struct {
 	ID        string          `json:"id"`
 	Kind      pubKind         `json:"kind"`
@@ -730,13 +738,17 @@ type liveStateEntry struct {
 	View      string          `json:"view"`
 	Digest    string          `json:"digest"`
 	History   string          `json:"history"`
+	By        string          `json:"by"`
 }
 
+// liveState is the page's state. by is the label of the session that last
+// set the steering (current, selected and focus), "" for none.
 type liveState struct {
 	Seq          string           `json:"seq"`
 	Current      string           `json:"current"`
 	Selected     string           `json:"selected"`
 	Focus        string           `json:"focus"`
+	By           string           `json:"by"`
 	Publications []liveStateEntry `json:"publications"`
 }
 
@@ -744,12 +756,12 @@ type liveState struct {
 // it can switch to. Integers are decimal strings.
 func stateOf(snap *liveSnapshot) []byte {
 	st := liveState{
-		Seq: strconv.FormatInt(snap.seq, 10), Current: snap.current, Selected: snap.selected, Focus: snap.focus,
+		Seq: strconv.FormatInt(snap.seq, 10), Current: snap.current, Selected: snap.selected, Focus: snap.focus, By: snap.by,
 		Publications: []liveStateEntry{},
 	}
 	for _, id := range snap.order {
 		p := snap.pubs[id]
-		e := liveStateEntry{ID: p.id, Kind: p.kind, Title: p.title, TitleSegs: p.titleSegs, View: p.view, History: "0"}
+		e := liveStateEntry{ID: p.id, Kind: p.kind, Title: p.title, TitleSegs: p.titleSegs, View: p.view, History: "0", By: p.by}
 		if p.kind == pubExplained && p.prof != nil {
 			e.Digest = p.digest.String()
 		}

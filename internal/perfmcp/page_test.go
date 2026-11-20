@@ -6,13 +6,13 @@ import (
 	"flag"
 	"fmt"
 	"maps"
-	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"unicode"
 	"unicode/utf8"
@@ -79,13 +79,13 @@ func TestRenderIsUnchangedByTheRefactor(t *testing.T) {
 	}
 }
 
-// pageClient is a stdio server with the live page on, an output root for
-// render_flamegraph and fixtures in its profiles root. Tests drive it only
-// through tool calls and the page's own routes.
+// pageClient is a stdio server with the live page engine on, an output
+// root for render_flamegraph and fixtures in its profiles root. Tests
+// drive it only through tool calls and its PageView.
 func pageClient(t *testing.T, edit func(*Config), fixtures map[string][]byte) *testClient {
 	t.Helper()
 	cfg := testConfig(t)
-	cfg.Live = true
+	cfg.Page = livePage()
 	cfg.OutputDir = t.TempDir()
 	if edit != nil {
 		edit(&cfg)
@@ -149,29 +149,50 @@ func pageOpen(t *testing.T, c *testClient) pageOpenOut {
 	return out
 }
 
-// pageState is the page's state as a browser reads it.
-func pageState(t *testing.T, url string) stateJSON {
+// pageState is the page's state as c's PageView holds it: its envelope's
+// engine part.
+func pageState(t *testing.T, c *testClient) stateJSON {
 	t.Helper()
-	res, body := httpGet(t, url+"state", nil)
-	wantStatus(t, "state", res, body, http.StatusOK)
-	var st stateJSON
-	if err := json.Unmarshal(body, &st); err != nil {
-		t.Fatalf("state %s: %v", body, err)
-	}
-	return st
+	return envelopeOf(t, c.srv.PageSnapshot().State()).Engine
 }
 
-// pageGet is a route of the page that must answer 200.
-func pageGet(t *testing.T, url, route string) string {
+// pageGet is what c's PageView answers for route, "pub/<id>/<what>" or
+// "pub/<id>/<what>/<node>" as the page names it but unescaped, which must
+// not be an error.
+func pageGet(t *testing.T, c *testClient, route string) string {
 	t.Helper()
-	res, body := httpGet(t, url+route, nil)
-	wantStatus(t, route, res, body, http.StatusOK)
-	return string(body)
+	rest, ok := strings.CutPrefix(route, "pub/")
+	id, rest, _ := strings.Cut(rest, "/")
+	what, node, _ := strings.Cut(rest, "/")
+	v := c.srv.PageSnapshot()
+	var out []byte
+	var err error
+	switch what {
+	case "model":
+		out, err = v.Model(id)
+	case "history":
+		out, err = v.History(id)
+	case "frame":
+		out, err = v.Frame(id, node)
+	case "focus":
+		out, err = v.Focus(id, node)
+	case "export":
+		out, err = v.Export(id)
+	default:
+		ok = false
+	}
+	if !ok {
+		t.Fatalf("no route %q", route)
+	}
+	if err != nil {
+		t.Fatalf("%s: %v", route, err)
+	}
+	return string(out)
 }
 
 var pageTools = []string{"page_open", "page_explain", "page_show", "page_diff"}
 
-// Without Live no page tool is registered: the stdio server lists none and
+// Without Page no page tool is registered: the stdio server lists none and
 // answers a call to one as an unknown tool, and records nothing.
 func TestNoPageToolsWithoutLive(t *testing.T) {
 	cfg := testConfig(t)
@@ -196,7 +217,7 @@ func TestNoPageToolsWithoutLive(t *testing.T) {
 		}
 	}
 	if c.srv.live != nil {
-		t.Error("a server without Live has a live page")
+		t.Error("a server without Page has a live page")
 	}
 	if c.srv.attempts.next != 0 {
 		t.Errorf("a page tool call recorded %d attempts", c.srv.attempts.next)
@@ -209,13 +230,14 @@ func TestPageOpenGivesTheURLAndStartsOnce(t *testing.T) {
 	if first.URL == "" || first.URL != second.URL {
 		t.Fatalf("page_open gave %q, then %q", first.URL, second.URL)
 	}
+	if first.URL != testPageURL {
+		t.Errorf("page_open gave %q, not the configured %q", first.URL, testPageURL)
+	}
 	if first.Viewers != "0" || first.Current != "" || first.Publications == nil || len(first.Publications) != 0 {
 		t.Errorf("page_open before any publication: %+v", first)
 	}
-	res, body := httpGet(t, first.URL, nil)
-	wantStatus(t, "shell", res, body, http.StatusOK)
-	if !strings.HasPrefix(res.Header.Get("Content-Type"), "text/html") {
-		t.Errorf("shell Content-Type %q", res.Header.Get("Content-Type"))
+	if st := pageState(t, c); st.Seq != "1" {
+		t.Errorf("two page_open calls committed to seq %s, want 1", st.Seq)
 	}
 	text := c.callOK("page_open", map[string]any{}, nil)
 	if !strings.Contains(text, `"viewers":"0"`) {
@@ -240,10 +262,10 @@ func TestPageExplainPublishesCheckedClaims(t *testing.T) {
 	if out.ReferencesChecked != "0" {
 		t.Errorf("references_checked %q without a frame reference", out.ReferencesChecked)
 	}
-	if st := pageState(t, url); st.Current != "p1" || st.Selected != b || st.Focus != "" || len(st.Publications) != 1 {
+	if st := pageState(t, c); st.Current != "p1" || st.Selected != b || st.Focus != "" || len(st.Publications) != 1 {
 		t.Errorf("state %+v", st)
 	}
-	if model := pageGet(t, url, "pub/p1/model"); !strings.Contains(model, "41.1%") {
+	if model := pageGet(t, c, "pub/p1/model"); !strings.Contains(model, "41.1%") {
 		t.Errorf("the model lacks the checked figure: %.300s", model)
 	}
 
@@ -276,7 +298,7 @@ func TestPageExplainCountsTheReferencesItChecked(t *testing.T) {
 	if out.FiguresChecked != "2" || out.ReferencesChecked != "3" {
 		t.Errorf("figures_checked %q and references_checked %q, want 2 and 3: %s", out.FiguresChecked, out.ReferencesChecked, text)
 	}
-	if model := pageGet(t, out.URL, "pub/"+out.Publication+"/model"); !strings.Contains(model, `"checked_pill":"5 figures and references checked"`) {
+	if model := pageGet(t, c, "pub/"+out.Publication+"/model"); !strings.Contains(model, `"checked_pill":"5 figures and references checked"`) {
 		t.Errorf("the pill does not count both: %.400s", model)
 	}
 	// render_flamegraph's result does not change.
@@ -300,8 +322,8 @@ func sameRejection(text string, ids ...string) string {
 func TestPageExplainRejectsExactlyLikeRender(t *testing.T) {
 	c := pageClient(t, nil, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
 	o, _ := openOn(t, c, "cpu.pb.gz", "")
-	url := pageOpen(t, c).URL
-	before := pageState(t, url)
+	pageOpen(t, c)
+	before := pageState(t, c)
 	exps := shareClaim(o.nodeID(t, "b"), "0.62", "b takes {c1}")
 	page, pageErr := c.call("page_explain", o.args(map[string]any{"explanations": exps, "rounding": "0.1"}))
 	render, renderErr := c.call("render_flamegraph", o.args(map[string]any{"explanations": exps, "rounding": "0.1", "out": "r.html"}))
@@ -315,7 +337,7 @@ func TestPageExplainRejectsExactlyLikeRender(t *testing.T) {
 	if got, want := sameRejection(page, "a1"), sameRejection(render, "a2"); got != want {
 		t.Errorf("the rejections differ:\npage_explain      %s\nrender_flamegraph %s", got, want)
 	}
-	if after := pageState(t, url); after.Current != before.Current || len(after.Publications) != 0 {
+	if after := pageState(t, c); after.Current != before.Current || len(after.Publications) != 0 {
 		t.Errorf("a rejection changed the page: %+v", after)
 	}
 
@@ -333,7 +355,7 @@ func TestPageExplainRejectsExactlyLikeRender(t *testing.T) {
 			t.Errorf("unknown attempt: %s", text)
 		}
 	}
-	if st := pageState(t, url); len(st.Publications) != 0 {
+	if st := pageState(t, c); len(st.Publications) != 0 {
 		t.Errorf("a refused call published %+v", st.Publications)
 	}
 }
@@ -350,7 +372,7 @@ func TestPageExplainSharesTheAttemptRecord(t *testing.T) {
 	if out.Attempt != "a2" || out.Publication != "p1" {
 		t.Errorf("the retry %+v", out)
 	}
-	history := pageGet(t, out.URL, "pub/p1/history")
+	history := pageGet(t, c, "pub/p1/history")
 	if !strings.Contains(history, `"a1"`) || !strings.Contains(history, "1 claim rejected") {
 		t.Errorf("p1's history does not show a1: %s", history)
 	}
@@ -364,17 +386,28 @@ func TestPageExplainSharesTheAttemptRecord(t *testing.T) {
 }
 
 func TestLiveHistoryFollowsNewRejections(t *testing.T) {
-	c := pageClient(t, nil, map[string][]byte{"gpu.pb.gz": pmfixture.GPUBasic(), "gpu.execlog": pmfixture.GPUBasicExeclog(t)})
+	var log stateLog
+	c := pageClient(t, func(c *Config) { c.Page.Notify = log.notify }, map[string][]byte{"gpu.pb.gz": pmfixture.GPUBasic(), "gpu.execlog": pmfixture.GPUBasicExeclog(t)})
 	bare, _ := openOn(t, c, "gpu.pb.gz", "")
 	conv := bare.nodeID(t, "conv")
 	var out pageExplainOut
 	c.callOK("page_explain", bare.args(map[string]any{"explanations": shareClaim(conv, "0.8", "conv is {c1}")}), &out)
-	st := pageState(t, out.URL)
+	st := pageState(t, c)
 	if len(st.Publications) != 1 || st.Publications[0].History != "1" {
 		t.Fatalf("state %+v", st)
 	}
-	ev := openEvents(t, out.URL)
-	ev.next(t)
+	// historyNotified reports whether a state notified since the first n
+	// lists p1 alone at history version.
+	historyNotified := func(n int, version string) bool {
+		for _, raw := range log.all()[n:] {
+			st := envelopeOf(t, raw).Engine
+			if len(st.Publications) == 1 && st.Publications[0].History == version {
+				return true
+			}
+		}
+		return false
+	}
+	seen := len(log.all())
 
 	withLog, wop := openOn(t, c, "gpu.pb.gz", "gpu.execlog")
 	if wop.Handle == bare.handle {
@@ -383,13 +416,11 @@ func TestLiveHistoryFollowsNewRejections(t *testing.T) {
 	if text, isErr := c.call("render_flamegraph", withLog.args(map[string]any{"explanations": shareClaim(conv, "0.62", "conv is {c1}"), "out": "r.html"})); !isErr {
 		t.Fatalf("render_flamegraph: %s", text)
 	}
-	for {
-		st := ev.next(t)
-		if len(st.Publications) == 1 && st.Publications[0].History == "2" {
-			break
-		}
+	if !historyNotified(seen, "2") {
+		t.Fatal("no state with p1's history at version 2 was notified")
 	}
-	history := pageGet(t, out.URL, "pub/p1/history")
+	seen = len(log.all())
+	history := pageGet(t, c, "pub/p1/history")
 	if !strings.Contains(history, "made with handle "+wop.Handle[:12]) {
 		t.Errorf("the row is not labelled with the other handle: %s", history)
 	}
@@ -398,11 +429,8 @@ func TestLiveHistoryFollowsNewRejections(t *testing.T) {
 	if text, isErr := c.call("page_explain", withLog.args(map[string]any{"explanations": shareClaim(conv, "0.61", "conv is {c1}")})); !isErr {
 		t.Fatalf("page_explain: %s", text)
 	}
-	for {
-		st := ev.next(t)
-		if len(st.Publications) == 1 && st.Publications[0].History == "3" {
-			break
-		}
+	if !historyNotified(seen, "3") {
+		t.Error("no state with p1's history at version 3 was notified")
 	}
 }
 
@@ -418,11 +446,11 @@ func TestALaterRejectionIsNotCalledEarlier(t *testing.T) {
 	if text, isErr := c.call("page_explain", o.args(map[string]any{"explanations": shareClaim(b, "0.62", "b takes {c1}")})); !isErr {
 		t.Fatalf("the later rejection: %s", text)
 	}
-	history := pageGet(t, out.URL, "pub/"+out.Publication+"/history")
+	history := pageGet(t, c, "pub/"+out.Publication+"/history")
 	if !strings.Contains(history, `"a2"`) || !strings.Contains(history, `"rejected_pill":"1 claim rejected"`) {
 		t.Errorf("the history of %s: %s", out.Publication, history)
 	}
-	page := pageGet(t, out.URL, "pub/"+out.Publication+"/export")
+	page := pageGet(t, c, "pub/"+out.Publication+"/export")
 	for _, want := range []string{
 		"<h5>Rejected attempts on this profile and view</h5>",
 		"before or after this publication (attempt " + out.Attempt + ").",
@@ -450,10 +478,10 @@ func TestAFactsOnlyPageStillShowsRejections(t *testing.T) {
 	if out.Status != "published" || out.FiguresChecked != "0" {
 		t.Errorf("facts-only %+v", out)
 	}
-	if st := pageState(t, out.URL); st.Current != out.Publication || st.Selected != "" {
+	if st := pageState(t, c); st.Current != out.Publication || st.Selected != "" {
 		t.Errorf("state %+v", st)
 	}
-	if history := pageGet(t, out.URL, "pub/"+out.Publication+"/history"); !strings.Contains(history, "1 claim rejected") {
+	if history := pageGet(t, c, "pub/"+out.Publication+"/history"); !strings.Contains(history, "1 claim rejected") {
 		t.Errorf("the facts-only page hides the rejection: %s", history)
 	}
 }
@@ -465,7 +493,7 @@ func TestPageShowSelectsAndFocuses(t *testing.T) {
 	var pub pageExplainOut
 	c.callOK("page_explain", o.args(map[string]any{"explanations": shareClaim(b, "0.411", "b takes {c1}")}), &pub)
 	var model liveModelJSON
-	if err := json.Unmarshal([]byte(pageGet(t, pub.URL, "pub/p1/model")), &model); err != nil {
+	if err := json.Unmarshal([]byte(pageGet(t, c, "pub/p1/model")), &model); err != nil {
 		t.Fatal(err)
 	}
 	if slices.Contains(model.drawnIDs(t), cn) {
@@ -477,15 +505,15 @@ func TestPageShowSelectsAndFocuses(t *testing.T) {
 	if out.Publication != "p1" || out.Selected != cn || out.Focus != "" || out.URL != pub.URL || out.Viewers != "0" {
 		t.Errorf("page_show node = %s", text)
 	}
-	if st := pageState(t, pub.URL); st.Current != "p1" || st.Selected != cn || st.Focus != "" {
+	if st := pageState(t, c); st.Current != "p1" || st.Selected != cn || st.Focus != "" {
 		t.Errorf("state after selecting c: %+v", st)
 	}
 	c.callOK("page_show", map[string]any{"focus": true}, &out)
-	if st := pageState(t, pub.URL); out.Focus != cn || st.Selected != cn || st.Focus != cn {
+	if st := pageState(t, c); out.Focus != cn || st.Selected != cn || st.Focus != cn {
 		t.Errorf("focus on the selection: result %+v, state %+v", out, st)
 	}
 	c.callOK("page_show", map[string]any{"focus": false}, &out)
-	if st := pageState(t, pub.URL); st.Selected != cn || st.Focus != "" {
+	if st := pageState(t, c); st.Selected != cn || st.Focus != "" {
 		t.Errorf("unfocused: state %+v", st)
 	}
 
@@ -497,7 +525,7 @@ func TestPageShowSelectsAndFocuses(t *testing.T) {
 	// p1 was left with c selected; coming back to it selects its first
 	// explained node, b.
 	c.callOK("page_show", map[string]any{"publication": "p1"}, &out)
-	if st := pageState(t, pub.URL); st.Current != "p1" || st.Selected != b || st.Focus != "" || out.Selected != b {
+	if st := pageState(t, c); st.Current != "p1" || st.Selected != b || st.Focus != "" || out.Selected != b {
 		t.Errorf("back to p1: result %+v, state %+v", out, st)
 	}
 	// Steering the current publication without node keeps its selection.
@@ -507,7 +535,7 @@ func TestPageShowSelectsAndFocuses(t *testing.T) {
 		t.Errorf("p1 again while current: selected %q, want c kept", out.Selected)
 	}
 	c.callOK("page_show", map[string]any{"publication": "p2", "node": cn, "focus": true}, &out)
-	if st := pageState(t, pub.URL); st.Current != "p2" || st.Selected != cn || st.Focus != cn {
+	if st := pageState(t, c); st.Current != "p2" || st.Selected != cn || st.Focus != cn {
 		t.Errorf("p2 focused on c: state %+v", st)
 	}
 	// focus on a facts-only page with nothing selected names what to pass.
@@ -529,7 +557,7 @@ func TestPageShowRefusesWhatIsNotThere(t *testing.T) {
 	var pub pageExplainOut
 	c.callOK("page_explain", o.args(map[string]any{"explanations": []any{}}), &pub)
 	c.callOK("page_explain", o.args(map[string]any{"explanations": []any{}}), &pub)
-	before := pageState(t, pub.URL)
+	before := pageState(t, c)
 
 	text, isErr := c.call("page_show", map[string]any{"publication": "p9"})
 	if !isErr || !strings.Contains(text, `publication "p9" is not kept; the kept ones are: p1, p2; call page_explain or page_diff to publish again`) {
@@ -548,19 +576,23 @@ func TestPageShowRefusesWhatIsNotThere(t *testing.T) {
 			t.Errorf("a 4 KiB name: isError=%v %d bytes %.200s", isErr, len(text), text)
 		}
 	}
-	if after := pageState(t, pub.URL); after.Seq != before.Seq {
+	if after := pageState(t, c); after.Seq != before.Seq {
 		t.Errorf("a refused page_show changed the state: %+v, then %+v", before, after)
 	}
 }
 
+// The page tools' viewers is what PageConfig.Viewers counts at the call.
 func TestViewersCountsOpenStreams(t *testing.T) {
-	c := pageClient(t, nil, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
+	var streams atomic.Int64
+	c := pageClient(t, func(c *Config) { c.Page.Viewers = func() int { return int(streams.Load()) } },
+		map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
 	o, _ := openOn(t, c, "cpu.pb.gz", "")
 	var pub pageExplainOut
 	c.callOK("page_explain", o.args(map[string]any{"explanations": []any{}}), &pub)
-	one, two := openEvents(t, pub.URL), openEvents(t, pub.URL)
-	one.next(t)
-	two.next(t)
+	if pub.Viewers != "0" {
+		t.Errorf("viewers %q with no stream open", pub.Viewers)
+	}
+	streams.Store(2)
 	var out pageShowOut
 	c.callOK("page_show", map[string]any{"publication": "p1"}, &out)
 	if out.Viewers != "2" {
@@ -569,8 +601,6 @@ func TestViewersCountsOpenStreams(t *testing.T) {
 	if got := pageOpen(t, c).Viewers; got != "2" {
 		t.Errorf("page_open viewers %q", got)
 	}
-	one.close()
-	two.close()
 }
 
 func TestPageShowCarriesGPUNotes(t *testing.T) {
@@ -665,7 +695,9 @@ func gluedPlaceholder(text string) string {
 func TestPageCopyHasNoGluedPlaceholder(t *testing.T) {
 	for _, live := range []bool{false, true} {
 		cfg := testConfig(t)
-		cfg.Live = live
+		if live {
+			cfg.Page = livePage()
+		}
 		s := must(New(cfg))(t)
 		t.Cleanup(func() { _ = s.Close() })
 		for _, tl := range []mcpstdio.Tool{s.pageOpenTool(), s.pageExplainTool(), s.pageShowTool(), s.pageDiffTool()} {
@@ -695,8 +727,8 @@ func TestPageCopyHasNoGluedPlaceholder(t *testing.T) {
 func TestPageExplainThatCannotBePublishedSaysWhy(t *testing.T) {
 	c := pageClient(t, func(c *Config) { c.Limits.MaxPageBytes = 2048 }, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
 	o, _ := openOn(t, c, "cpu.pb.gz", "")
-	url := pageOpen(t, c).URL
-	before := pageState(t, url)
+	pageOpen(t, c)
+	before := pageState(t, c)
 	text, isErr := c.call("page_explain", o.args(map[string]any{"explanations": shareClaim(o.nodeID(t, "b"), "0.411", "b takes {c1}")}))
 	want := "attempt a1: the explanations passed, but the page cannot be built within this server's MaxPageBytes=2048: "
 	if !isErr || !strings.HasPrefix(text, want) ||
@@ -706,7 +738,7 @@ func TestPageExplainThatCannotBePublishedSaysWhy(t *testing.T) {
 	if at := c.srv.attempts.byID["a1"]; at == nil || at.outcome != outcomeFailed {
 		t.Errorf("attempt a1 %+v, want outcome failed", at)
 	}
-	if after := pageState(t, url); after.Seq != before.Seq || len(after.Publications) != 0 {
+	if after := pageState(t, c); after.Seq != before.Seq || len(after.Publications) != 0 {
 		t.Errorf("the page changed: %+v, then %+v", before, after)
 	}
 }

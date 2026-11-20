@@ -20,9 +20,11 @@ import (
 // so a Limits that sets only some of the server's own fields still loads
 // profiles and checks explanations. MaxRows, MaxCachedDiffs, MaxDiffRows,
 // MaxPageBytes, MaxPageNodes, MaxAttemptsPerView, MaxAttemptViews,
-// MaxHistoryBytes, MaxPublications, MaxRetainedBytes, MaxPageClients and
-// Source are filled in when zero, and Capture when all of it is zero. Any
-// other non-positive field is refused (Capture.TTL may be zero). A capture
+// MaxHistoryBytes, MaxPublications, MaxRetainedBytes, MaxPageClients,
+// MaxEngineWait and Source are filled in when zero, and Capture and Hub
+// each when all of it is zero. Any other non-positive field is refused
+// (Capture.TTL may be zero); the Hub limits only on a server with the live
+// page, since only the hub, which serves it, has a transport they bound. A capture
 // limit left at its default follows the limit it depends on (see
 // CaptureLimits), so lowering that limit alone is never refused; New logs
 // each one it moves.
@@ -85,9 +87,71 @@ type Limits struct {
 	// tab's stream holds one, so the default leaves two for the tabs'
 	// fetches: a tab beyond it is refused a stream and polls instead.
 	MaxPageClients int
+	// MaxEngineWait bounds how long a tool call waits for the engine while
+	// another call, or a capture job, holds it (at most 55 s, under the
+	// shortest client timeout); the call is then answered with who holds
+	// it. A capture job's own waits for the engine are not bounded by it.
+	MaxEngineWait time.Duration
 	// Capture bounds the capture tools.
 	Capture CaptureLimits
+	// Hub bounds perf-agent-hub's transport. stdio has no such transport:
+	// it never reads them, and its flags refuse them.
+	Hub HubLimits
 }
+
+// HubLimits bound perf-agent-hub's Streamable HTTP transport, its
+// admission of calls and the page's inbox. Each is settable with --limit
+// Hub.Name=V. New refuses, on a server with the live page, a cap that
+// another makes unreachable: MaxCallsPerSession over MaxCalls, and
+// MaxIngressBytes or MaxRequestBytes under MaxMessageBytes, which a
+// single message may take; and IngressBodyTimeout over 30 s.
+type HubLimits struct {
+	// MaxSessions is how many MCP sessions the hub keeps; one more evicts
+	// the least recently used idle one.
+	MaxSessions int
+	// MaxIngressReaders is how many request bodies are read at once, and
+	// MaxIngressBytes the bytes their Content-Lengths may reserve.
+	MaxIngressReaders int
+	MaxIngressBytes   int64
+	// IngressBodyTimeout is how long a request body may take to arrive
+	// (at most 30 s).
+	IngressBodyTimeout time.Duration
+	// MaxControlInFlight bounds the control messages answered at once
+	// (cancels, pings, initialize, the list methods, capture_cancel), and
+	// MaxPageStateInFlight the page_state reads.
+	MaxControlInFlight   int
+	MaxPageStateInFlight int
+	// MaxCalls bounds the other calls running or waiting, server-wide,
+	// MaxCallsPerSession those of one session, and MaxRequestBytes the
+	// bytes of arguments they hold.
+	MaxCalls           int
+	MaxCallsPerSession int
+	MaxRequestBytes    int64
+	// MaxInboxEntries is how many of the user's asks the inbox keeps.
+	MaxInboxEntries int
+}
+
+// defaultHubLimits are the hub's transport limits unless told otherwise.
+func defaultHubLimits() HubLimits {
+	return HubLimits{
+		MaxSessions:          32,
+		MaxIngressReaders:    16,
+		MaxIngressBytes:      8 << 20,
+		IngressBodyTimeout:   2 * time.Second,
+		MaxControlInFlight:   32,
+		MaxPageStateInFlight: 4,
+		MaxCalls:             16,
+		MaxCallsPerSession:   4,
+		MaxRequestBytes:      16 << 20,
+		MaxInboxEntries:      32,
+	}
+}
+
+// The ceilings of the engine wait and of a request body's arrival.
+const (
+	maxEngineWait         = 55 * time.Second
+	maxIngressBodyTimeout = 30 * time.Second
+)
 
 // CaptureLimits bound what a capture may ask for and keep. Each is
 // settable with --limit Capture.Name=V, up to a ceiling compiled in where
@@ -202,6 +266,10 @@ const (
 	defaultMaxPageClients   = 4
 )
 
+// defaultMaxEngineWait is the MaxEngineWait a server runs with unless told
+// otherwise.
+const defaultMaxEngineWait = 45 * time.Second
+
 // DefaultLimits are the limits a server runs with unless told otherwise.
 func DefaultLimits() Limits {
 	return Limits{
@@ -224,8 +292,10 @@ func DefaultLimits() Limits {
 		MaxPublications:  defaultMaxPublications,
 		MaxRetainedBytes: defaultMaxRetainedBytes,
 		MaxPageClients:   defaultMaxPageClients,
+		MaxEngineWait:    defaultMaxEngineWait,
 
 		Capture: defaultCaptureLimits(profilemodel.DefaultLimits()),
+		Hub:     defaultHubLimits(),
 	}
 }
 
@@ -289,8 +359,14 @@ func (l Limits) resolve() (Limits, []limitChange) {
 	if l.MaxPageClients == 0 {
 		l.MaxPageClients = defaultMaxPageClients
 	}
+	if l.MaxEngineWait == 0 {
+		l.MaxEngineWait = defaultMaxEngineWait
+	}
 	if l.Capture == (CaptureLimits{}) {
 		l.Capture = defaultCaptureLimits(l.Model)
+	}
+	if l.Hub == (HubLimits{}) {
+		l.Hub = defaultHubLimits()
 	}
 	var changes []limitChange
 	l.Capture, changes = l.Capture.fit(l)
@@ -331,9 +407,11 @@ func fittedTail(l Limits) int {
 // failure. Together they may take a quarter of MaxResponseBytes.
 const maxTailsPerResult = 4
 
-// validate refuses limits a server cannot run with. live says the live
-// page is on: only then must the retained budget hold a whole page.
-func (l Limits) validate(live bool) error {
+// validate refuses limits a server cannot run with. page says the live
+// page engine is on: only then must the retained budget hold a whole page,
+// and only then are the Hub limits checked, since only the hub serves the
+// page.
+func (l Limits) validate(page bool) error {
 	for _, f := range []struct {
 		name string
 		v    int
@@ -367,11 +445,60 @@ func (l Limits) validate(live bool) error {
 	if l.MaxRetainedBytes <= 0 {
 		return fmt.Errorf("perfmcp: limit MaxRetainedBytes must be positive, got %d", l.MaxRetainedBytes)
 	}
-	if live && l.MaxRetainedBytes < int64(l.MaxPageBytes) {
+	if page && l.MaxRetainedBytes < int64(l.MaxPageBytes) {
 		return fmt.Errorf("perfmcp: MaxRetainedBytes must be at least MaxPageBytes: a live page keeps its model, so a budget of %d bytes cannot hold a %d-byte page",
 			l.MaxRetainedBytes, l.MaxPageBytes)
 	}
+	switch {
+	case l.MaxEngineWait <= 0:
+		return fmt.Errorf("perfmcp: limit MaxEngineWait must be positive, got %v", l.MaxEngineWait)
+	case l.MaxEngineWait > maxEngineWait:
+		return fmt.Errorf("perfmcp: limit MaxEngineWait is %v, over its ceiling of %v: a client gives up on a call before then", l.MaxEngineWait, maxEngineWait)
+	}
+	if page {
+		if err := l.Hub.validate(l); err != nil {
+			return err
+		}
+	}
 	return l.Capture.validate(l)
+}
+
+// validate refuses hub limits that are not positive, are over their
+// ceiling, or make another limit unreachable.
+func (h HubLimits) validate(l Limits) error {
+	for _, f := range []struct {
+		name string
+		v    int64
+	}{
+		{"MaxSessions", int64(h.MaxSessions)},
+		{"MaxIngressReaders", int64(h.MaxIngressReaders)},
+		{"MaxIngressBytes", h.MaxIngressBytes},
+		{"IngressBodyTimeout", int64(h.IngressBodyTimeout)},
+		{"MaxControlInFlight", int64(h.MaxControlInFlight)},
+		{"MaxPageStateInFlight", int64(h.MaxPageStateInFlight)},
+		{"MaxCalls", int64(h.MaxCalls)},
+		{"MaxCallsPerSession", int64(h.MaxCallsPerSession)},
+		{"MaxRequestBytes", h.MaxRequestBytes},
+		{"MaxInboxEntries", int64(h.MaxInboxEntries)},
+	} {
+		if f.v <= 0 {
+			return fmt.Errorf("perfmcp: limit Hub.%s must be positive, got %d", f.name, f.v)
+		}
+	}
+	switch {
+	case h.MaxCallsPerSession > h.MaxCalls:
+		return fmt.Errorf("perfmcp: limit Hub.MaxCallsPerSession is %d, over Hub.MaxCalls (%d): no session could reach it",
+			h.MaxCallsPerSession, h.MaxCalls)
+	case h.MaxIngressBytes < int64(l.MaxMessageBytes):
+		return fmt.Errorf("perfmcp: limit Hub.MaxIngressBytes is %d, under MaxMessageBytes (%d): a message the server accepts could never be read",
+			h.MaxIngressBytes, l.MaxMessageBytes)
+	case h.MaxRequestBytes < int64(l.MaxMessageBytes):
+		return fmt.Errorf("perfmcp: limit Hub.MaxRequestBytes is %d, under MaxMessageBytes (%d): a call the server accepts could never be admitted",
+			h.MaxRequestBytes, l.MaxMessageBytes)
+	case h.IngressBodyTimeout > maxIngressBodyTimeout:
+		return fmt.Errorf("perfmcp: limit Hub.IngressBodyTimeout is %v, over its ceiling of %v", h.IngressBodyTimeout, maxIngressBodyTimeout)
+	}
+	return nil
 }
 
 // validate refuses capture limits that are not positive (TTL may be zero),

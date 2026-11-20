@@ -117,7 +117,7 @@ func toResultError(w *wireError) resultError {
 // defaultNext is what to do after a failure of each code, for an error
 // whose own next says nothing more precise: every wire error has a next.
 var defaultNext = map[capture.Code]string{
-	capture.CodeDisabled:             "the message says what this server lacks: tell the user, who restarts perf-agent-mcp with it",
+	capture.CodeDisabled:             "the message says what this server lacks: tell the user, who restarts " + capture.CommandMark + " with it",
 	capture.CodeInvalidArgument:      "fix the argument as the message says; the tool's input schema gives each argument's type and range",
 	capture.CodeIncomparable:         "drop the setting to inherit the baseline's, or start a new series",
 	capture.CodeUnknownBaseline:      "pass compare_with an id of this series as capture_list shows it",
@@ -126,7 +126,7 @@ var defaultNext = map[capture.Code]string{
 	capture.CodeTargetChanged:        "capture again; the target changed while it was profiled",
 	capture.CodeOwnerMismatch:        "give this server its own directory with --captures",
 	capture.CodeBudget:               "retry after retry_after",
-	capture.CodeDisk:                 "free space in the capture directory, or tell the user to start perf-agent-mcp with --captures naming another directory",
+	capture.CodeDisk:                 "free space in the capture directory, or tell the user to start " + capture.CommandMark + " with --captures naming another directory",
 	capture.CodeExists:               "pass another label",
 	capture.CodeTargetRefused:        "capture an ordinary process of yours, or launch the program with command",
 	capture.CodeTargetNotFound:       "check the pid, or capture a command instead",
@@ -135,28 +135,34 @@ var defaultNext = map[capture.Code]string{
 	capture.CodeGPUNotInjected:       "launch the CUDA program with command and modes gpu, so the CUPTI adapter is injected at its start",
 	capture.CodePerfAgentRefusedArgs: "tell the user: this server and its perf-agent do not match; use a perf-agent of the version this server was built with",
 	capture.CodePerfAgentFailed:      "capture again; if it fails the same way, tell the user what stderr_tail says",
-	capture.CodePerfAgentUnstartable: "tell the user: perf-agent cannot start; check the binary and its libraries, then restart perf-agent-mcp",
-	capture.CodeBinaryChanged:        "tell the user to restart perf-agent-mcp",
+	capture.CodePerfAgentUnstartable: "tell the user: perf-agent cannot start; check the binary and its libraries, then restart " + capture.CommandMark,
+	capture.CodeBinaryChanged:        "tell the user to restart " + capture.CommandMark,
 	capture.CodeStartTimeout:         "capture again; if it times out again, tell the user",
 	capture.CodeFinishTimeout:        "capture again; if it times out again, tell the user",
 	capture.CodeTooLarge:             "capture with a shorter duration or a lower sample_rate",
 	capture.CodeNoOutput:             "capture again",
 	capture.CodeStuckChild:           "do not retry; tell the user which processes survived",
 	capture.CodeCancelled:            "capture again if you still need it",
-	capture.CodeClosing:              "start a new perf-agent-mcp to capture",
+	capture.CodeClosing:              "start a new " + capture.CommandMark + " to capture",
 }
 
-// toWireError is e as the wire shows it, nil for nil. A retryable failure
-// always says when to retry, in whole seconds, "0s" meaning at once.
-func toWireError(e *capture.Error) *wireError {
+// wire is e as this server's wire shows it, nil for nil: its message and
+// next name the binary the server runs as.
+func (s *Server) wire(e *capture.Error) *wireError { return wireErrorFor(e, s.command()) }
+
+// wireErrorFor is e as the wire shows it, on a server running as the
+// binary command, nil for nil: capture.CommandMark in its message and next
+// is replaced by command. A retryable failure always says when to retry,
+// in whole seconds, "0s" meaning at once.
+func wireErrorFor(e *capture.Error, command string) *wireError {
 	if e == nil {
 		return nil
 	}
 	w := &wireError{
 		Code:          string(e.Code),
-		Message:       e.Message,
+		Message:       named(e.Message, command),
 		Retryable:     e.Retryable,
-		Next:          cmp.Or(e.Next, defaultNext[e.Code], "tell the user what the message says"),
+		Next:          named(cmp.Or(e.Next, defaultNext[e.Code], "tell the user what the message says"), command),
 		PerfAgentExit: e.PerfAgentExit,
 		StderrTail:    e.StderrTail,
 		Changed:       e.Changed,

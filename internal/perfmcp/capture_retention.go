@@ -40,8 +40,9 @@ func captureKey(series, id string) string { return series + "/" + id }
 // server's stranded rollbacks and every intent name, baseline (the call's
 // own, a captureKey, or ""), and each series' newest compare_with. It runs
 // under the engine, which the store belongs to. It never reads the live
-// page: a publication holds its profile in memory, so removing its files
-// loses nothing it shows; serve protects them through captureProtect.
+// page itself: a publication holds its profile in memory, so removing its
+// files loses nothing it shows, but with the live page captureProtect
+// names them, so its recipe can reopen them.
 func (s *Server) protected(d *captureDir, baseline string) protection {
 	p := protection{files: map[fileKey]bool{}, captures: map[string]bool{}, skipped: map[string]bool{}}
 	if baseline != "" {
@@ -679,7 +680,7 @@ func (r *retention) fail(err error) error {
 		return err
 	}
 	return capture.Errorf(capture.CodeDisk,
-		"free space there, or start perf-agent-mcp with --captures naming another directory inside the profiles root",
+		"free space there, or "+r.s.startAdvice("--captures naming another directory inside the profiles root"),
 		"retention stopped in the capture directory %s inside the profiles root: %s; the next pass goes on from there", r.d.rel, causeText(err))
 }
 

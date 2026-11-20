@@ -59,7 +59,7 @@ func Guard(tok Token, next http.Handler) http.Handler {
 			http.Error(w, "only GET and HEAD are served", http.StatusMethodNotAllowed)
 			return
 		}
-		if !loopbackHost(r.Host) {
+		if !LoopbackHost(r.Host) {
 			http.Error(w, "bad Host", http.StatusForbidden)
 			return
 		}
@@ -110,10 +110,10 @@ func isShellNavigation(r *http.Request) bool {
 	return seg != "" && after == ""
 }
 
-// loopbackHost accepts host:port where host is localhost, an IPv4 loopback
+// LoopbackHost accepts host:port where host is localhost, an IPv4 loopback
 // literal or ::1, and port is any decimal port. A Host without a port is
 // refused: the browser always sends the random port.
-func loopbackHost(hostport string) bool {
+func LoopbackHost(hostport string) bool {
 	host, port, err := net.SplitHostPort(hostport)
 	if err != nil {
 		return false

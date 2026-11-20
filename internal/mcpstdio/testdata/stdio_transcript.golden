@@ -1,0 +1,16 @@
+{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"send initialize first"}}
+{"jsonrpc":"2.0","id":2,"result":{"capabilities":{"prompts":{"listChanged":false},"resources":{"subscribe":false,"listChanged":false},"tools":{"listChanged":false}},"instructions":"be nice","protocolVersion":"2025-06-18","serverInfo":{"name":"test-server","title":"Test","version":"0.0.1"}}}
+{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"echo","title":"Echo","description":"echoes","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}},{"name":"fail","description":"fails","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},{"name":"boom","description":"panics","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}},{"name":"ctl","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false}}]}}
+{"jsonrpc":"2.0","id":"s4","result":{"resources":[{"uri":"mem://r","name":"r","mimeType":"text/plain"}]}}
+{"jsonrpc":"2.0","id":5,"result":{"contents":[{"mimeType":"text/plain","text":"body","uri":"mem://r"}]}}
+{"jsonrpc":"2.0","id":6,"error":{"code":-32602,"message":"unknown resource: \"mem://nope\""}}
+{"jsonrpc":"2.0","id":7,"result":{"prompts":[{"name":"p","description":"d"}]}}
+{"jsonrpc":"2.0","id":8,"result":{"description":"d","messages":[{"content":{"type":"text","text":"hello"},"role":"user"}]}}
+{"jsonrpc":"2.0","id":9,"result":{"content":[{"type":"text","text":"{\"a\":\"<b>&\"}"}],"isError":false}}
+{"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"call open first"}],"isError":true}}
+{"jsonrpc":"2.0","id":11,"error":{"code":-32603,"message":"internal error: tool boom failed"}}
+{"jsonrpc":"2.0","id":12,"result":{"content":[{"type":"text","text":"ctl:{\"x\":1}"}],"isError":false}}
+{"jsonrpc":"2.0","id":13,"error":{"code":-32601,"message":"method not found: \"nope/nothing\""}}
+{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"batches are not supported"}}
+{"jsonrpc":"2.0","id":14,"error":{"code":-32600,"message":"invalid request: jsonrpc must be \"2.0\""}}
+{"jsonrpc":"2.0","id":15,"result":{}}

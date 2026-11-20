@@ -111,6 +111,10 @@ type Tool struct {
 	// wait on nothing and take no lock that is held across I/O or across
 	// another handler. Progress does nothing in it.
 	Control bool `json:"-"`
+	// Snapshot marks a call a transport with its own admission classes
+	// admits in a small class of its own: one that never waits on the
+	// state the other calls share.
+	Snapshot bool `json:"-"`
 }
 
 // Prompt is a static prompt that expands to one user message.
@@ -129,6 +133,15 @@ type Resource struct {
 	Description string `json:"description,omitempty"`
 	MIMEType    string `json:"mimeType,omitempty"`
 	Text        string `json:"-"`
+	// Snapshot marks a read a transport with its own admission classes
+	// admits in a small class of its own.
+	Snapshot bool `json:"-"`
+	// Read, when set, produces the text on every resources/read, with the
+	// request's context, in place of Text. An error answers -32603
+	// carrying its text, cut like a tool error; a panic answers -32603
+	// "internal error: resource <uri> failed". The text goes to the client
+	// verbatim, so it must never carry an absolute path or a token.
+	Read func(ctx context.Context) (string, error) `json:"-"`
 }
 
 // Options configures a Server.

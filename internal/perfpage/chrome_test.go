@@ -1,4 +1,4 @@
-package perfmcp
+package perfpage
 
 import (
 	"bufio"
@@ -14,13 +14,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dpsoft/perf-agent/internal/pmfixture"
+	"github.com/dpsoft/perf-agent/internal/perfmcp"
 )
 
 // A headless Chrome driven over --remote-debugging-pipe, in real time: the
 // page keeps an event stream open, so a virtual-time --dump-dom would
-// never return. It loads the page from the server's real listener, guard
-// and routes.
+// never return. It loads the page from a real listener, the guard and
+// Routes.
 
 type cdpMessage struct {
 	ID        int             `json:"id,omitzero"`
@@ -239,13 +239,14 @@ func (tab *chromeTab) waitText(what, expr string) string {
 }
 
 // A diff's node the model leaves out is fetched by the page, its union ID
-// escaped, through the server's own routes, and shown.
+// escaped, through the page's own routes, and shown.
 func TestADiffNodeOutsideTheModelIsShownInChrome(t *testing.T) {
 	c := startChrome(t)
-	p := openLivePair(t, func(c *Config) { c.Limits.MaxPageNodes = 4 }, pmfixture.CPUBasic(), pmfixture.CPUBasicNew())
-	b := p.unionID(t, "b")
-	out, _ := p.pageDiff(t, map[string]any{"node": b})
-	if m := diffModelOf(t, []byte(pageGet(t, out.URL, "pub/p1/model"))); slices.Contains(m.frameIDs(), b) {
+	p := newPage(t, func(c *perfmcp.Config) { c.Limits.MaxPageNodes = 4 })
+	pr := p.c.openPair("cpu.pb.gz", "new.pb.gz")
+	b := pr.unionID("b")
+	out := pr.pageDiff(map[string]any{"node": b})
+	if modelOf(t, p.get("pub/"+out.Publication+"/model")).has(b) {
 		t.Fatalf("b is in the model with MaxPageNodes=4")
 	}
 	tab := c.open(t, out.URL)
@@ -281,6 +282,14 @@ func TestADiffNodeOutsideTheModelIsShownInChrome(t *testing.T) {
 	}
 }
 
+// viewers is the viewers page_open counts.
+func (p *page) viewers() string {
+	p.t.Helper()
+	var out published
+	p.c.callJSON("page_open", map[string]any{}, &out)
+	return out.Viewers
+}
+
 // A browser opens at most six connections to one host and port, and every
 // tab's event stream holds one. With six tabs open on the page, the server
 // still lets every tab follow a new publication: the tabs beyond
@@ -288,28 +297,27 @@ func TestADiffNodeOutsideTheModelIsShownInChrome(t *testing.T) {
 // free for every tab's fetches.
 func TestSixTabsAllFollowThePageInChrome(t *testing.T) {
 	c := startChrome(t)
-	srv := pageClient(t, nil, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
-	o, _ := openOn(t, srv, "cpu.pb.gz", "")
-	url := pageOpen(t, srv).URL
+	p := newPage(t, nil)
+	o := p.c.open("cpu.pb.gz")
+	p.call("page_open", map[string]any{})
 	const tabs = 6
 	var open []*chromeTab
 	for range tabs {
-		open = append(open, c.open(t, url))
+		open = append(open, c.open(t, p.url))
 	}
 	// Every tab has loaded and has its stream or its refusal.
-	streams := strconv.Itoa(min(tabs, DefaultLimits().MaxPageClients))
+	streams := strconv.Itoa(min(tabs, perfmcp.DefaultLimits().MaxPageClients))
 	deadline := time.Now().Add(10 * time.Second)
-	for pageOpen(t, srv).Viewers != streams {
+	for p.viewers() != streams {
 		if time.Now().After(deadline) {
-			t.Fatalf("viewers %s with %d tabs open; want %s", pageOpen(t, srv).Viewers, tabs, streams)
+			t.Fatalf("viewers %s with %d tabs open; want %s", p.viewers(), tabs, streams)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	time.Sleep(time.Second)
 
-	var pub pageExplainOut
-	srv.callOK("page_explain", o.args(map[string]any{"explanations": []any{}}), &pub)
-	seq := pageState(t, url).Seq
+	o.explain(nil)
+	seq := p.state().Seq
 	probe := `(() => document.body && document.body.dataset.seq === ` + strconv.Quote(seq) + ` && document.getElementById('waiting').hidden ? 'ok' : '')()`
 	deadline = time.Now().Add(15 * time.Second)
 	for i, tab := range open {
@@ -329,13 +337,12 @@ func TestSixTabsAllFollowThePageInChrome(t *testing.T) {
 // says the rejections may come before or after it.
 func TestTheLivePageWordsRejectionsForAnyOrderInChrome(t *testing.T) {
 	c := startChrome(t)
-	srv := pageClient(t, nil, map[string][]byte{"cpu.pb.gz": pmfixture.CPUBasic()})
-	o, _ := openOn(t, srv, "cpu.pb.gz", "")
-	b := o.nodeID(t, "b")
-	var out pageExplainOut
-	srv.callOK("page_explain", o.args(map[string]any{"explanations": shareClaim(b, "0.411", "b takes {c1}")}), &out)
+	p := newPage(t, nil)
+	o := p.c.open("cpu.pb.gz")
+	b := o.nodeID("b")
+	out := o.explain(shareClaim(b, "0.411", "b takes {c1}"))
 	tab := c.open(t, out.URL)
-	if text, isErr := srv.call("page_explain", o.args(map[string]any{"explanations": shareClaim(b, "0.62", "b takes {c1}")})); !isErr {
+	if text, isErr := o.c.try("page_explain", o.args(map[string]any{"explanations": shareClaim(b, "0.62", "b takes {c1}")})); !isErr {
 		t.Fatalf("the later rejection: %s", text)
 	}
 	const probe = `(() => {
@@ -419,15 +426,15 @@ func (tab *chromeTab) chromeAt(seq string) pageChrome {
 // and offers follow-up prompts only when it has some.
 func TestThePageChromeFitsThePublicationInChrome(t *testing.T) {
 	c := startChrome(t)
-	p := openLivePair(t, nil, pmfixture.CPUBasic(), pmfixture.CPUBasicNew())
-	srv, o := p.c, p.base
-	b := o.nodeID(t, "b")
-	var out pageExplainOut
-	srv.callOK("page_explain", o.args(map[string]any{"explanations": shareClaim(b, "0.411", "b takes {c1}")}), &out)
+	p := newPage(t, nil)
+	pr := p.c.openPair("cpu.pb.gz", "new.pb.gz")
+	o := pr.base
+	b := o.nodeID("b")
+	out := o.explain(shareClaim(b, "0.411", "b takes {c1}"))
 	tab := c.open(t, out.URL)
 	agentPills := []string{"✦ Explained by an agent via MCP", "prose is not verified"}
 
-	explained := tab.chromeAt(pageState(t, out.URL).Seq)
+	explained := tab.chromeAt(p.state().Seq)
 	for _, want := range agentPills {
 		if !slices.Contains(explained.Pills, want) {
 			t.Errorf("an explained page's pills %q lack %q", explained.Pills, want)
@@ -437,8 +444,8 @@ func TestThePageChromeFitsThePublicationInChrome(t *testing.T) {
 		t.Errorf("an explained page hides its follow-up prompts: %+v", explained)
 	}
 
-	srv.callOK("page_explain", o.args(map[string]any{"explanations": []any{}}), &out)
-	facts := tab.chromeAt(pageState(t, out.URL).Seq)
+	o.explain(nil)
+	facts := tab.chromeAt(p.state().Seq)
 	if !slices.Contains(facts.Pills, "Facts from perf-agent") || slices.ContainsFunc(facts.Pills, func(s string) bool { return slices.Contains(agentPills, s) }) {
 		t.Errorf("a facts-only page's pills %q", facts.Pills)
 	}
@@ -446,8 +453,8 @@ func TestThePageChromeFitsThePublicationInChrome(t *testing.T) {
 		t.Errorf("a facts-only page, which selects nothing, says %q", facts.Toast)
 	}
 
-	diff, _ := p.pageDiff(t, nil)
-	shown := tab.chromeAt(pageState(t, diff.URL).Seq)
+	pr.pageDiff(nil)
+	shown := tab.chromeAt(p.state().Seq)
 	if slices.ContainsFunc(shown.Pills, func(s string) bool { return slices.Contains(agentPills, s) }) || len(shown.Pills) != 1 {
 		t.Errorf("a diff's pills %q", shown.Pills)
 	}
@@ -459,9 +466,8 @@ func TestThePageChromeFitsThePublicationInChrome(t *testing.T) {
 	}
 
 	// A selection the agent makes is still announced.
-	var show pageShowOut
-	srv.callOK("page_show", map[string]any{"publication": "p1", "node": b}, &show)
-	if got := tab.chromeAt(pageState(t, diff.URL).Seq); !strings.HasPrefix(got.Toast, "Your agent selected ") || !got.FollowUp {
+	p.call("page_show", map[string]any{"publication": "p1", "node": b})
+	if got := tab.chromeAt(p.state().Seq); !strings.HasPrefix(got.Toast, "Your agent selected ") || !got.FollowUp {
 		t.Errorf("after page_show: %+v", got)
 	}
 	if errs := c.errors(); len(errs) != 0 {

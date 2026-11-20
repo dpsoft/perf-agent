@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -53,7 +54,7 @@ func TestLiveShellHasNoInlineScriptOrStyle(t *testing.T) {
 	}
 
 	for _, id := range []string{"chart", "sel-ref", "sel-name", "sel-id", "facts", "exp", "noexp", "path", "chips", "copybox", "toast",
-		"pubs", "banner", "rejected", "pills", "notes", "quality", "rows", "legend", "axis", "export", "focus-btn", "whole-btn"} {
+		"pubs", "banner", "rejected", "pills", "notes", "quality", "rows", "legend", "axis", "export", "focus-btn", "whole-btn", "inbox", "by", "sw-warn"} {
 		assert.Equal(t, 1, strings.Count(shell, ` id="`+id+`"`), "region %s", id)
 	}
 	assert.Contains(t, shell, `<link rel="stylesheet" href="assets/live.css">`)
@@ -62,6 +63,10 @@ func TestLiveShellHasNoInlineScriptOrStyle(t *testing.T) {
 	assert.Less(t, strings.Index(shell, "assets/panel.js"), strings.Index(shell, "assets/live.js"), "the panel is defined before the page uses it")
 	assert.Contains(t, shell, "Waiting for your agent to publish a page (page_explain or page_diff).")
 	assert.Regexp(t, `<a [^>]*id="export"[^>]*\bdownload\b`, shell)
+	assert.Regexp(t, `<span [^>]*id="inbox"[^>]*\bhidden\b`, shell, "no count before the first envelope")
+	assert.Less(t, strings.Index(shell, `id="inbox"`), strings.Index(shell, `id="pills"`), "the count sits before the pills")
+	assert.Regexp(t, `<span [^>]*id="by"[^>]*\bhidden\b`, shell, "no label before the first state")
+	assert.Regexp(t, `<div [^>]*id="sw-warn"[^>]*\bhidden\b`, shell)
 }
 
 // fetchArgs are the argument lists of every fetch and EventSource call.
@@ -85,10 +90,29 @@ func TestLiveScriptRules(t *testing.T) {
 	for _, m := range fetchArgs.FindAllStringSubmatch(live, -1) {
 		assert.NotContains(t, m[1], "/", "%s: the transport names its paths only through its callers", m[1])
 	}
-	// seq is a decimal string compared by newer; it never becomes a number.
-	for _, s := range []string{"Number(", "parseInt", "BigInt", "+st.seq", "seq -", "seq +", "seq >", "seq <"} {
+	// seq and rev are decimal strings compared by newer; neither ever
+	// becomes a number.
+	for _, s := range []string{"Number(", "parseInt", "BigInt", "+st.seq", "seq -", "seq +", "seq >", "seq <",
+		"+ib.rev", "rev -", "rev +", "rev >", "rev <", "Rev >", "Rev <", "> acceptedRev", "< acceptedRev", "> acceptedSeq", "< acceptedSeq"} {
 		assert.NotContains(t, live, s)
 	}
+	// The page's one write is a POST to its inbox, with the headers the
+	// inbox guard requires. A report is told to the server and forgotten:
+	// it touches no accepted revision and no generation.
+	assert.Equal(t, 1, strings.Count(live, "method: 'POST'"), "one request writes")
+	posts := regexp.MustCompile(`transport\.post\(([^,)]*)`).FindAllStringSubmatch(live, -1)
+	require.Len(t, posts, 1, "one caller posts")
+	assert.Equal(t, "'inbox'", posts[0][1])
+	assert.Contains(t, live, "'Content-Type': 'application/json'")
+	assert.Contains(t, live, "'X-Perf-Agent-Page': '1'")
+	_, reports, ok := strings.Cut(live, "// --- Reports to the inbox ---")
+	require.True(t, ok, "the reports have their own section")
+	reports, _, _ = strings.Cut(reports, "// ---")
+	assert.Contains(t, reports, "transport.post(")
+	assert.NotRegexp(t, `\bgen\b|acceptedSeq|acceptedRev|retrySeq|loadingGen`, reports, "a report changes no state of the page")
+	assert.NotContains(t, panel, "inbox", "the shared panel reports nothing: the static page has no server")
+	assert.Contains(t, live, "newer(ib.rev, acceptedRev)", "the inbox is accepted by its own rev")
+	assert.NotContains(t, live, "innerText", "the reader's label is set as text")
 	assert.Contains(t, live, "cache: 'no-store'")
 	assert.Contains(t, live, "new EventSource('events')")
 	assert.Contains(t, live, "getJSON('state')")
@@ -341,6 +365,13 @@ type liveDOM struct {
 	Violations int      `json:"violations"`
 	FocusOff   bool     `json:"focus_disabled"`
 	WholeOff   bool     `json:"whole_disabled"`
+	Inbox      string   `json:"inbox"`
+	InboxHid   bool     `json:"inbox_hidden"`
+	Rev        string   `json:"rev"`
+	Images     int      `json:"images"`
+	AskOff     bool     `json:"ask_disabled"`
+	AskText    string   `json:"ask_text"`
+	Seq        string   `json:"seq"`
 }
 
 const domProbe = `(() => {
@@ -378,6 +409,13 @@ const domProbe = `(() => {
     violations: window.livePageProbe ? window.livePageProbe.violations : -1,
     focus_disabled: $('focus-btn').disabled,
     whole_disabled: $('whole-btn').disabled,
+    inbox: $('inbox') ? $('inbox').textContent : '',
+    inbox_hidden: !$('inbox') || $('inbox').hidden,
+    rev: document.body.dataset.rev || '',
+    images: document.querySelectorAll('img').length,
+    ask_disabled: !$('ask-btn') || $('ask-btn').disabled,
+    ask_text: $('ask-btn') ? $('ask-btn').textContent : '',
+    seq: document.body.dataset.seq || '',
   });
 })()`
 
@@ -446,19 +484,25 @@ type liveServer struct {
 	srv *httptest.Server
 	url string
 
-	mu        sync.Mutex
-	state     []byte // what GET state answers
-	stateGets int
-	sse       []byte // the last state pushed on the stream, sent first on connect
-	streams   map[chan []byte]bool
-	refuse    bool // the stream answers 503
-	pubs      map[string]*livePub
-	history   map[string][]byte // pub -> its current history JSON
-	delay     map[string]time.Duration
-	delayOnce map[string][]time.Duration // per-request delays by path, first request first
-	served    []string
-	gone      chan struct{}
-	closeOnce sync.Once
+	mu         sync.Mutex
+	state      []byte // what GET state answers
+	stateGets  int
+	sse        []byte // the last state pushed on the stream, sent first on connect
+	streams    map[chan []byte]bool
+	refuse     bool // the stream answers 503
+	pubs       map[string]*livePub
+	history    map[string][]byte // pub -> its current history JSON
+	delay      map[string]time.Duration
+	delayOnce  map[string][]time.Duration // per-request delays by path, first request first
+	served     []string
+	reports    []map[string]string // the inbox's reports, in order
+	answer     map[string]int      // node -> the inbox's status for a report about it; 204 otherwise
+	answerOnce map[string][]int    // node -> statuses for its next reports, first first, before answer
+	guard      http.Handler        // the real inbox guard in front of inbox
+	guarded    []int               // the status of every POST inbox, the guard's refusals included
+	tok        livehttp.Token
+	gone       chan struct{}
+	closeOnce  sync.Once
 }
 
 func newLiveServer(t *testing.T) *liveServer {
@@ -466,7 +510,7 @@ func newLiveServer(t *testing.T) *liveServer {
 	tok, err := livehttp.NewToken()
 	require.NoError(t, err)
 	s := &liveServer{streams: map[chan []byte]bool{}, pubs: map[string]*livePub{}, history: map[string][]byte{},
-		delay: map[string]time.Duration{}, delayOnce: map[string][]time.Duration{}, gone: make(chan struct{})}
+		delay: map[string]time.Duration{}, delayOnce: map[string][]time.Duration{}, answer: map[string]int{}, answerOnce: map[string][]int{}, tok: tok, gone: make(chan struct{})}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		shell := liveAsset(t, "")
@@ -517,7 +561,34 @@ func newLiveServer(t *testing.T) *liveServer {
 		w.Header().Set("Content-Disposition", `attachment; filename="`+r.PathValue("id")+`.html"`)
 		_, _ = w.Write([]byte("<!doctype html>"))
 	})
-	s.srv = httptest.NewServer(livehttp.Guard(tok, mux))
+	// The hub's front door, with the real guards. The inbox guard's own
+	// rate is high unless a test sets one, so the scripted answers decide
+	// the status.
+	s.setInboxRate(livehttp.Rate{PerSecond: 1000, Burst: 1000})
+	inbox := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		g := s.guard
+		s.mu.Unlock()
+		rec := &statusWriter{ResponseWriter: w, code: http.StatusOK}
+		g.ServeHTTP(rec, r)
+		s.mu.Lock()
+		s.guarded = append(s.guarded, rec.code)
+		s.mu.Unlock()
+	})
+	front := livehttp.Front(tok, http.NotFoundHandler(), inbox, livehttp.Guard(tok, mux))
+	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A service worker of the kind a port squatter would register,
+		// served beside the front door, which refuses every worker
+		// script: it takes control of the pages in its scope at once.
+		if r.URL.Path == "/test-sw.js" {
+			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+			_, _ = w.Write([]byte(`self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+`))
+			return
+		}
+		front.ServeHTTP(w, r)
+	}))
 	t.Cleanup(s.close)
 	s.url = s.srv.URL + "/s/" + string(tok) + "/"
 	return s
@@ -608,6 +679,65 @@ func (s *liveServer) events(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// inbox records a report, which must be one object of strings, and
+// answers the status set for its node, 204 by default.
+func (s *liveServer) inbox(w http.ResponseWriter, r *http.Request) {
+	var rep map[string]string
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&rep); err != nil || dec.More() {
+		http.Error(w, "not a report", http.StatusUnprocessableEntity)
+		return
+	}
+	s.mu.Lock()
+	s.reports = append(s.reports, rep)
+	code := cmp.Or(s.answer[rep["node"]], http.StatusNoContent)
+	if q := s.answerOnce[rep["node"]]; len(q) > 0 {
+		code, s.answerOnce[rep["node"]] = q[0], q[1:]
+	}
+	if code == http.StatusTooManyRequests {
+		w.Header().Set("Retry-After", "1")
+	}
+	s.mu.Unlock()
+	s.wait(r, "inbox")
+	w.WriteHeader(code)
+}
+
+// setInboxRate puts a new inbox guard, with rate, in front of the inbox.
+func (s *liveServer) setInboxRate(rate livehttp.Rate) {
+	g := livehttp.InboxGuard(s.tok, rate, http.HandlerFunc(s.inbox))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.guard = g
+}
+
+// guardedCodes are the statuses of every POST inbox so far.
+func (s *liveServer) guardedCodes() []int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.guarded)
+}
+
+// statusWriter records the status a handler answers.
+type statusWriter struct {
+	http.ResponseWriter
+	code int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.code = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// Unwrap lets the guard's ResponseController reach the connection.
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// reportsSeen are the inbox's reports so far.
+func (s *liveServer) reportsSeen() []map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.reports)
 }
 
 // servedPaths lists the paths the server was asked for, in order.
@@ -732,6 +862,7 @@ type livePubEntry struct {
 	View      string      `json:"view"`
 	Digest    string      `json:"digest"`
 	History   string      `json:"history"`
+	By        string      `json:"by,omitzero"`
 }
 
 type liveStateJSON struct {
@@ -739,11 +870,36 @@ type liveStateJSON struct {
 	Current      string         `json:"current"`
 	Selected     string         `json:"selected"`
 	Focus        string         `json:"focus"`
+	By           string         `json:"by,omitzero"`
 	Publications []livePubEntry `json:"publications"`
 }
 
-// state is a state JSON; pubs are "id" or "id@historyVersion".
+// noAsks is the inbox part of an envelope before the user asked anything.
+const noAsks = `{"rev":"0","asks":"0","unread":"0","read_by":""}`
+
+// liveInbox is the inbox part of an envelope.
+func liveInbox(rev, asks, unread, readBy string) string {
+	out, err := json.Marshal(map[string]string{"rev": rev, "asks": asks, "unread": unread, "read_by": readBy})
+	if err != nil {
+		panic(err)
+	}
+	return string(out)
+}
+
+// envelope is the state envelope of the engine's state and inbox, the
+// inbox part's JSON.
+func envelope(engine []byte, inbox string) []byte {
+	return []byte(`{"engine":` + string(engine) + `,"inbox":` + inbox + `}`)
+}
+
+// liveState is a state envelope with no asks; pubs are "id" or
+// "id@historyVersion".
 func liveState(seq, current string, selected, focus profilemodel.NodeID, pubs ...string) []byte {
+	return envelope(engineState(seq, current, selected, focus, pubs...), noAsks)
+}
+
+// engineState is the engine part of liveState.
+func engineState(seq, current string, selected, focus profilemodel.NodeID, pubs ...string) []byte {
 	st := liveStateJSON{Seq: seq, Current: current, Selected: string(selected), Focus: string(focus), Publications: []livePubEntry{}}
 	for _, p := range pubs {
 		id, version, _ := strings.Cut(p, "@")
@@ -805,7 +961,7 @@ func newLiveDiff(t *testing.T) *liveDiff {
 	return ld
 }
 
-// diffState is a state showing p4, the diff, with node selected.
+// diffState is a state envelope showing p4, the diff, with node selected.
 func diffState(seq string, selected profilemodel.UnionID) []byte {
 	st := liveStateJSON{Seq: seq, Current: "p4", Selected: string(selected), Publications: []livePubEntry{{
 		ID: "p4", Kind: "diff", Title: "b went down by 111",
@@ -815,7 +971,7 @@ func diffState(seq string, selected profilemodel.UnionID) []byte {
 	if err != nil {
 		panic(err)
 	}
-	return out
+	return envelope(out, noAsks)
 }
 
 const factsProbe = `[...document.querySelectorAll('#facts .v')].map((e) => e.textContent + '|' + e.title).join('\n')`
@@ -882,7 +1038,8 @@ func TestLivePageInChrome(t *testing.T) {
 		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" })
 		s.close()
 		d := tab.waitFor("the banner", func(d liveDOM) bool { return !d.BannerHid })
-		assert.Equal(t, "perf-agent-mcp is not running; this is the last state it sent. Ask your agent for a new page URL, or download a static copy while it runs.", d.Banner)
+		assert.Equal(t, "The perf-agent server is not running; this is the last state it sent. Ask your agent for a new page URL, or download a static copy while it runs.", d.Banner)
+		assert.NotContains(t, d.Banner, "perf-agent-mcp", "the page may be served by either binary")
 		assert.Equal(t, "b", d.SelName)
 		assert.Equal(t, []string{"all", "main", "a", "✦b"}, d.Frames)
 		assert.Equal(t, "first look at 3 frames", d.Title)
@@ -998,6 +1155,7 @@ func TestLivePageInChrome(t *testing.T) {
 		d := tab.dom()
 		assert.True(t, d.Waiting)
 		assert.True(t, d.ExportHid)
+		assert.True(t, d.AskOff, "nothing is selected to ask about")
 		assert.Empty(t, d.Frames)
 		assert.True(t, d.BannerHid)
 		assert.Empty(t, tab.errors())
@@ -1182,6 +1340,374 @@ func TestLivePageOrderingInChrome(t *testing.T) {
 		assert.Equal(t, "pub/p2/export", d.Export)
 		s.push(liveState("2", "p1", f.a, "", "p1", "p2"))
 		d = tab.waitFor("the agent's p1", func(d liveDOM) bool { return d.Title == "first look at 3 frames" && d.SelName == "a" })
+		assert.Empty(t, tab.errors())
+	})
+}
+
+// §D4: the page accepts the envelope's two parts each by its own
+// revision. An inbox update with an old seq moves only the count, and
+// keeps the generation, so the user's own fetch in flight still lands; an
+// engine state with an old rev leaves the count. The reader's label is
+// the client's own choice and is shown as text.
+func TestLivePageReadsTheEnvelopeInChrome(t *testing.T) {
+	c := startChrome(t)
+	f := newLiveFixture(t)
+	settle := func() { time.Sleep(1200 * time.Millisecond) }
+
+	t.Run("a new rev with an old seq updates only the count", func(t *testing.T) {
+		seq2 := engineState("2", "p1", f.b, "", "p1", "p2")
+		s, tab := newLivePage(t, c, f, envelope(seq2, noAsks), func(s *liveServer) {
+			s.setDelay("pub/p1/focus/"+string(f.a), 800*time.Millisecond)
+		})
+		d := tab.waitFor("seq 2", func(d liveDOM) bool { return d.SelName == "b" })
+		assert.True(t, d.InboxHid, "no asks, no count")
+		tab.eval(`[...document.querySelectorAll('#chart .frame')].find((e) => e.textContent === 'a').click(), ''`)
+		tab.waitFor("a clicked", func(d liveDOM) bool { return d.SelName == "a" && !d.FocusOff })
+		// The user's focus on a loads slowly.
+		tab.eval(`document.getElementById('focus-btn').click(), ''`)
+		time.Sleep(100 * time.Millisecond)
+		s.push(envelope(seq2, liveInbox("1", "1", "1", "")))
+		d = tab.waitFor("the count", func(d liveDOM) bool { return d.Inbox == "1 ask · 1 unread" && !d.InboxHid })
+		assert.NotContains(t, d.Axis, "relative to", "the focus is still loading")
+		settle()
+		d = tab.dom()
+		assert.Contains(t, d.Axis, "relative to a", "the user's own focus landed: the generation did not move")
+		assert.Equal(t, []string{"a", "✦b"}, d.Frames)
+		assert.Equal(t, "a", d.SelName)
+		assert.Equal(t, "first look at 3 frames", d.Title)
+		assert.Equal(t, "1", d.Rev)
+		s.mu.Lock()
+		assert.Equal(t, 1, countOf(s.served, "pub/p1/model"), "the shown publication was not loaded again")
+		s.mu.Unlock()
+		s.push(envelope(seq2, liveInbox("2", "2", "1", "codex")))
+		d = tab.waitFor("the second count", func(d liveDOM) bool { return d.Inbox == "2 asks · 1 unread · read by codex" })
+		assert.Contains(t, d.Axis, "relative to a")
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a new seq with an old rev leaves the count", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, envelope(engineState("1", "p1", f.b, "", "p1"), liveInbox("3", "2", "1", "codex")), nil)
+		const shown = "2 asks · 1 unread · read by codex"
+		tab.waitFor("seq 1 and its count", func(d liveDOM) bool { return d.SelName == "b" && d.Inbox == shown })
+		s.push(envelope(engineState("2", "p1", f.c, "", "p1"), liveInbox("2", "5", "5", "")))
+		d := tab.waitFor("seq 2", func(d liveDOM) bool { return d.SelName == "c" })
+		assert.Equal(t, shown, d.Inbox)
+		s.push(envelope(engineState("3", "p1", f.a, "", "p1"), liveInbox("3", "9", "9", "")))
+		d = tab.waitFor("seq 3", func(d liveDOM) bool { return d.SelName == "a" })
+		assert.Equal(t, shown, d.Inbox, "an equal rev is not newer")
+		assert.Equal(t, "3", d.Rev)
+		// rev 10 is newer than rev 3, whatever the seq.
+		s.push(envelope(engineState("1", "p1", f.b, "", "p1"), liveInbox("10", "4", "0", "codex")))
+		d = tab.waitFor("rev 10", func(d liveDOM) bool { return d.Inbox == "4 asks · 0 unread · read by codex" })
+		assert.Equal(t, "a", d.SelName, "seq 1 is old")
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("read_by is shown", func(t *testing.T) {
+		const label = `<img src=x onerror=alert(1)>`
+		seq1 := engineState("1", "p1", f.b, "", "p1")
+		s, tab := newLivePage(t, c, f, envelope(seq1, noAsks), nil)
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" })
+		s.push(envelope(seq1, liveInbox("1", "1", "0", label)))
+		d := tab.waitFor("read by", func(d liveDOM) bool { return strings.Contains(d.Inbox, "read by") })
+		assert.Equal(t, "1 ask · 0 unread · read by "+label, d.Inbox)
+		assert.Equal(t, 0, d.Images, "the label is text, not markup")
+		assert.Equal(t, 0, d.Violations)
+		assert.Equal(t, "b", d.SelName)
+		assert.Empty(t, tab.errors())
+	})
+}
+
+// The page's answers to an ask, by the inbox's status.
+const (
+	liveAskSent    = "Sent. Ask your agent to look (it reads page_state)."
+	liveAskGone    = "That frame is no longer on the page; nothing was sent."
+	liveAskTooMany = "Too many reports; try again in a moment."
+	liveAskNoReply = "Could not reach perf-agent; nothing was sent."
+)
+
+// liveReport is a report as the page sends it: all four members, strings.
+func liveReport(kind, pub string, node, focus profilemodel.NodeID) map[string]string {
+	return map[string]string{"kind": kind, "publication": pub, "node": string(node), "focus": string(focus)}
+}
+
+// waitReports waits until the inbox has n reports and returns them.
+func waitReports(t *testing.T, s *liveServer, n int) []map[string]string {
+	t.Helper()
+	require.Eventually(t, func() bool { return len(s.reportsSeen()) >= n }, 10*time.Second, 20*time.Millisecond, "%d reports", n)
+	return s.reportsSeen()
+}
+
+// clickFrame clicks the drawn frame whose text is name.
+func clickFrame(tab *liveTab, name string) {
+	tab.eval(`[...document.querySelectorAll('#chart .frame')].find((e) => e.textContent === '` + name + `').click(), ''`)
+}
+
+// clickFrames clicks the drawn frames named, one after another in one task,
+// as fast as a user never could.
+func clickFrames(tab *liveTab, names ...string) {
+	list, err := json.Marshal(names)
+	if err != nil {
+		panic(err)
+	}
+	tab.eval(`(() => {
+  const frames = [...document.querySelectorAll('#chart .frame')];
+  for (const n of ` + string(list) + `) frames.find((e) => e.textContent === n).click();
+  return '';
+})()`)
+}
+
+// lastNav is the newest report that is not an ask, or nil.
+func lastNav(s *liveServer) map[string]string {
+	reps := s.reportsSeen()
+	for i := len(reps) - 1; i >= 0; i-- {
+		if reps[i]["kind"] != "ask" {
+			return reps[i]
+		}
+	}
+	return nil
+}
+
+// waitNav waits until the newest report that is not an ask is want.
+func waitNav(t *testing.T, s *liveServer, want map[string]string) {
+	t.Helper()
+	require.Eventually(t, func() bool { return maps.Equal(lastNav(s), want) }, 10*time.Second, 20*time.Millisecond,
+		"the last report is %v; all: %v", want, s.reportsSeen())
+}
+
+// §D4: the page reports the user's own selections and focus to the inbox,
+// and the "Ask my agent about this" chip posts an ask and says how it went.
+// A report touches neither the accepted revisions nor the generation, so
+// an agent chain under way is never cut short by one. Selections and focus
+// go one at a time, the newest replacing any still waiting, so they keep
+// their order, a burst of clicks costs the inbox's rate little, and a
+// busy inbox loses no selection.
+func TestLivePageInboxInChrome(t *testing.T) {
+	c := startChrome(t)
+	f := newLiveFixture(t)
+	ask := func(tab *liveTab) { tab.eval(`document.getElementById('ask-btn').click(), ''`) }
+
+	t.Run("an ask posts and the toast shows", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), nil)
+		d := tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.AskOff })
+		assert.Equal(t, "Ask my agent about this", d.AskText)
+		assert.Equal(t, "ask-btn", tab.eval(`document.getElementById('focus-btn').nextElementSibling.id`), "the chip sits next to Focus here")
+		assert.Empty(t, d.Toast)
+		assert.Empty(t, s.reportsSeen(), "the agent's own selection is not reported")
+		ask(tab)
+		d = tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast != "" })
+		assert.Equal(t, liveAskSent, d.Toast)
+		assert.Equal(t, []map[string]string{liveReport("ask", "p1", f.b, "")}, s.reportsSeen())
+		assert.Equal(t, "1", d.Seq)
+		assert.Equal(t, "b", d.SelName)
+		time.Sleep(3 * time.Second)
+		assert.Equal(t, "true", tab.eval(`String(document.getElementById('toast').classList.contains('on'))`), "an ask's answer stays long enough to read")
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("the user's navigation is reported", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1", "p2"), nil)
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && len(d.Pubs) == 2 })
+		clickFrame(tab, "a")
+		assert.Equal(t, []map[string]string{liveReport("select", "p1", f.a, "")}, waitReports(t, s, 1))
+		tab.waitFor("a clicked", func(d liveDOM) bool { return d.SelName == "a" && !d.FocusOff })
+		tab.eval(`document.getElementById('focus-btn').click(), ''`)
+		assert.Equal(t, liveReport("focus", "p1", f.a, f.a), waitReports(t, s, 2)[1], "focus names the frame the layout starts at")
+		tab.waitFor("a's focus", func(d liveDOM) bool { return strings.Contains(d.Axis, "relative to a") })
+		ask(tab)
+		assert.Equal(t, liveReport("ask", "p1", f.a, f.a), waitReports(t, s, 3)[2], "an ask carries the focus")
+		tab.eval(`document.getElementById('whole-btn').click(), ''`)
+		assert.Equal(t, liveReport("focus", "p1", "", ""), waitReports(t, s, 4)[3], "the whole view is the empty focus")
+		tab.waitFor("the whole view", func(d liveDOM) bool { return len(d.Frames) == 4 && d.SelName == "a" })
+		tab.eval(`document.querySelector('#rows .exrow').click(), ''`)
+		assert.Equal(t, liveReport("select", "p1", f.b, ""), waitReports(t, s, 5)[4])
+		// A path entry selects its node.
+		tab.eval(`document.querySelector('#path button[data-node="` + string(f.main) + `"]').click(), ''`)
+		assert.Equal(t, liveReport("select", "p1", f.main, ""), waitReports(t, s, 6)[5])
+		tab.eval(`document.querySelector('#pubs button[data-pub="p2"]').click(), ''`)
+		tab.waitFor("p2", func(d liveDOM) bool { return d.Title == "second" && d.SelName == "c" })
+		assert.Equal(t, liveReport("select", "p2", f.c, ""), waitReports(t, s, 7)[6], "the publication the user chose, with its own selection")
+		time.Sleep(300 * time.Millisecond)
+		d := tab.dom()
+		assert.Len(t, s.reportsSeen(), 7, "a selection shown again is not reported again")
+		assert.Equal(t, "1", d.Seq, "no report moved the agent's state")
+		assert.Equal(t, "0", d.Rev, "nor the inbox's: only an envelope does")
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a 422 says nothing was sent", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), func(s *liveServer) {
+			s.answer[string(f.b)] = http.StatusUnprocessableEntity
+		})
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.AskOff })
+		ask(tab)
+		d := tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast != "" })
+		assert.Equal(t, liveAskGone, d.Toast)
+		assert.Len(t, s.reportsSeen(), 1)
+		assert.Equal(t, "b", d.SelName, "the page stays as it was")
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a 429 says try again", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), func(s *liveServer) {
+			s.answer[string(f.b)] = http.StatusTooManyRequests
+		})
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.AskOff })
+		start := time.Now()
+		ask(tab)
+		d := tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast != "" })
+		assert.Equal(t, liveAskTooMany, d.Toast)
+		assert.GreaterOrEqual(t, time.Since(start), 900*time.Millisecond, "the ask was tried again after Retry-After")
+		assert.Equal(t, []map[string]string{liveReport("ask", "p1", f.b, ""), liveReport("ask", "p1", f.b, "")}, s.reportsSeen(), "once")
+		// The answer to a select is not shown.
+		s.mu.Lock()
+		s.answer[string(f.a)] = http.StatusTooManyRequests
+		s.mu.Unlock()
+		tab.eval(`document.getElementById('toast').textContent = '', ''`)
+		clickFrame(tab, "a")
+		waitReports(t, s, 4)
+		time.Sleep(500 * time.Millisecond)
+		d = tab.dom()
+		assert.Equal(t, "a", d.SelName)
+		assert.Empty(t, d.Toast)
+		assert.Len(t, s.reportsSeen(), 4, "a refused select is tried again once")
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("an unreachable server says so", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), nil)
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.AskOff })
+		s.close()
+		tab.waitFor("the banner", func(d liveDOM) bool { return !d.BannerHid })
+		ask(tab)
+		d := tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast != "" })
+		assert.Equal(t, liveAskNoReply, d.Toast)
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a burst of clicks costs at most two reports", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), nil)
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" })
+		clickFrames(tab, "main", "a", "✦b", "main", "a", "main", "✦b", "a")
+		tab.waitFor("a", func(d liveDOM) bool { return d.SelName == "a" })
+		waitReports(t, s, 1)
+		time.Sleep(600 * time.Millisecond)
+		reps := s.reportsSeen()
+		assert.LessOrEqual(t, len(reps), 2, "%v", reps)
+		assert.Equal(t, liveReport("select", "p1", f.a, ""), reps[len(reps)-1], "the last report is the last selection")
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a busy inbox loses no selection", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), func(s *liveServer) {
+			s.answerOnce[string(f.a)] = []int{http.StatusTooManyRequests}
+		})
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" })
+		clickFrames(tab, "main", "✦b", "a")
+		waitReports(t, s, 2)
+		time.Sleep(300 * time.Millisecond)
+		want := liveReport("select", "p1", f.a, "")
+		assert.Equal(t, []map[string]string{want, want}, s.reportsSeen(), "refused once, sent again after Retry-After")
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a newer selection replaces a refused one", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), func(s *liveServer) {
+			s.answerOnce[string(f.a)] = []int{http.StatusTooManyRequests}
+		})
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.FocusOff })
+		clickFrame(tab, "a")
+		waitReports(t, s, 1)
+		// While a's report waits to be tried again, the user selects main
+		// and lays the graph out from it: the newest report stands for both.
+		clickFrame(tab, "main")
+		tab.waitFor("main", func(d liveDOM) bool { return d.SelName == "main" && !d.FocusOff })
+		tab.eval(`document.getElementById('focus-btn').click(), ''`)
+		waitNav(t, s, liveReport("select", "p1", f.main, f.main))
+		time.Sleep(1300 * time.Millisecond)
+		assert.Equal(t, []map[string]string{liveReport("select", "p1", f.a, ""), liveReport("select", "p1", f.main, f.main)}, s.reportsSeen(),
+			"a is not sent again after main")
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a focus right after a select keeps their order", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.a, "", "p1"), func(s *liveServer) {
+			s.setDelay("inbox", 200*time.Millisecond)
+		})
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "a" && !d.FocusOff })
+		tab.eval(`document.getElementById('focus-btn').click(), ''`)
+		tab.waitFor("a's focus", func(d liveDOM) bool { return strings.Contains(d.Axis, "relative to a") })
+		waitReports(t, s, 1)
+		// a's focus is in flight; b's select and then b's focus follow it,
+		// and the server must end with b selected and focused.
+		clickFrame(tab, "✦b")
+		tab.waitFor("b", func(d liveDOM) bool { return d.SelName == "b" && !d.FocusOff })
+		tab.eval(`document.getElementById('focus-btn').click(), ''`)
+		waitNav(t, s, liveReport("select", "p1", f.b, f.b))
+		time.Sleep(600 * time.Millisecond)
+		reps := s.reportsSeen()
+		assert.Equal(t, liveReport("focus", "p1", f.a, f.a), reps[0])
+		assert.Equal(t, liveReport("select", "p1", f.b, f.b), reps[len(reps)-1], "%v", reps)
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("an ask after a burst of clicks is not refused", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), func(s *liveServer) {
+			s.setInboxRate(livehttp.Rate{PerSecond: 1, Burst: 3})
+		})
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" })
+		clickFrames(tab, "main", "a", "✦b", "main", "a", "main", "✦b", "a")
+		ask(tab)
+		d := tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast != "" })
+		assert.Equal(t, liveAskSent, d.Toast)
+		waitNav(t, s, liveReport("select", "p1", f.a, ""))
+		time.Sleep(300 * time.Millisecond)
+		assert.NotContains(t, s.guardedCodes(), http.StatusTooManyRequests, "the burst left the ask its token")
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a report during an agent chain's switch keeps the chain", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1", "p2"), func(s *liveServer) {
+			s.setDelay("pub/p2/model", 1500*time.Millisecond)
+			s.setDelay("inbox", 300*time.Millisecond)
+		})
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" })
+		// a's select report is still unanswered when the agent switches.
+		clickFrame(tab, "a")
+		tab.waitFor("a clicked", func(d liveDOM) bool { return d.SelName == "a" })
+		waitReports(t, s, 1)
+		s.push(liveState("2", "p2", f.c, "", "p1", "p2"))
+		time.Sleep(200 * time.Millisecond)
+		// The ask is about what is still shown, and is sent and answered
+		// while p2 loads.
+		ask(tab)
+		d := tab.waitFor("the ask's toast", func(d liveDOM) bool { return d.Toast == liveAskSent })
+		assert.Equal(t, "first look at 3 frames", d.Title, "p2 is still loading")
+		d = tab.waitFor("the agent's p2", func(d liveDOM) bool { return d.Title == "second" && d.SelName == "c" })
+		assert.Equal(t, "2", d.Seq, "the agent's chain finished")
+		assert.True(t, strings.HasPrefix(d.Toast, "Your agent selected "), "the chain ran to its end: %q", d.Toast)
+		assert.Equal(t, []map[string]string{liveReport("select", "p1", f.a, ""), liveReport("ask", "p1", f.a, "")}, s.reportsSeen())
+		s.mu.Lock()
+		assert.Equal(t, 1, countOf(s.served, "pub/p2/model"), "the switch ran once, never cut short and redone")
+		s.mu.Unlock()
+		assert.Empty(t, d.LoadNote)
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("no CSP violation", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), nil)
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.FocusOff })
+		tab.eval(`document.getElementById('focus-btn').click(), ''`)
+		tab.waitFor("b's focus", func(d liveDOM) bool { return strings.Contains(d.Axis, "relative to b") })
+		waitNav(t, s, liveReport("focus", "p1", f.b, f.b))
+		ask(tab)
+		tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast == liveAskSent })
+		tab.eval(`document.getElementById('whole-btn').click(), ''`)
+		waitNav(t, s, liveReport("focus", "p1", "", ""))
+		lines := strings.Split(tab.waitText(`(document.getElementById('probe') || {}).textContent || ''`), "\n")
+		require.Len(t, lines, 3)
+		assert.Equal(t, "0", lines[1], "no content-security-policy violation")
+		assert.Equal(t, 0, tab.dom().Violations)
 		assert.Empty(t, tab.errors())
 	})
 }
@@ -1411,6 +1937,78 @@ func TestLivePageConnectionInChrome(t *testing.T) {
 		assert.True(t, d.BannerHid, "an old failed fallback must not mark a recovered connection gone: %q", d.Banner)
 		assert.Empty(t, tab.errors())
 	})
+}
+
+// withBy is the state envelope st with by as the steering's label and
+// pubBy as each publication's.
+func withBy(t *testing.T, st []byte, by string, pubBy map[string]string) []byte {
+	t.Helper()
+	var env struct {
+		Engine liveStateJSON   `json:"engine"`
+		Inbox  json.RawMessage `json:"inbox"`
+	}
+	require.NoError(t, json.Unmarshal(st, &env))
+	env.Engine.By = by
+	for i, p := range env.Engine.Publications {
+		env.Engine.Publications[i].By = pubBy[p.ID]
+	}
+	engine, err := json.Marshal(env.Engine)
+	require.NoError(t, err)
+	return envelope(engine, string(env.Inbox))
+}
+
+// The page names who published each publication and who put the shown one
+// on screen. A label is the client's own text, so a hostile one is shown
+// as text: it makes no element and runs nothing.
+func TestLivePageShowsByInChrome(t *testing.T) {
+	c := startChrome(t)
+	f := newLiveFixture(t)
+	const hostile = `<img src=x onerror="window.pwned=1">`
+	byText := func(tab *liveTab) string {
+		return tab.eval(`(() => { const e = document.getElementById('by'); return e.hidden ? '' : e.textContent; })()`)
+	}
+	pubBy := map[string]string{"p1": hostile, "p2": "codex"}
+	s, tab := newLivePage(t, c, f, withBy(t, liveState("1", "p1", f.b, "", "p1", "p2"), "claude-code", pubBy), nil)
+	d := tab.waitFor("p1 b", func(d liveDOM) bool { return d.SelName == "b" && len(d.Pubs) == 2 })
+	assert.True(t, strings.HasSuffix(d.Pubs[0], hostile), "p1's entry %q ends with its label", d.Pubs[0])
+	assert.True(t, strings.HasSuffix(d.Pubs[1], "codex"), "p2's entry %q ends with its label", d.Pubs[1])
+	assert.Equal(t, "Published by "+hostile+" · shown by claude-code", byText(tab))
+	assert.Equal(t, 0, d.Images)
+	assert.Equal(t, "undefined", tab.eval(`String(window.pwned)`))
+
+	// The same session published and showed it: it is named once.
+	s.push(withBy(t, liveState("2", "p2", f.c, "", "p1", "p2"), "codex", pubBy))
+	tab.waitFor("p2", func(d liveDOM) bool { return d.Title == "second" && d.Seq == "2" })
+	assert.Equal(t, "Published by codex", byText(tab))
+
+	// The user went back to p1: the steering's label is not p1's.
+	tab.eval(`document.querySelector('#pubs button[data-pub="p1"]').click(), ''`)
+	tab.waitFor("p1 again", func(d liveDOM) bool { return d.Title == "first look at 3 frames" })
+	assert.Equal(t, "Published by "+hostile, byText(tab))
+
+	// A state with no labels shows none.
+	s.push(liveState("3", "p1", f.b, "", "p1", "p2"))
+	d = tab.waitFor("seq 3", func(d liveDOM) bool { return d.Seq == "3" })
+	assert.Empty(t, byText(tab))
+	assert.Equal(t, "p1", d.Pubs[0][:2])
+	assert.False(t, strings.Contains(d.Pubs[0], hostile))
+	assert.Equal(t, 0, d.Images)
+	assert.Empty(t, tab.errors())
+}
+
+// A service worker that controls the page was not the page's own: the page
+// warns, as text, and keeps working.
+func TestLivePageWarnsOfAServiceWorkerInChrome(t *testing.T) {
+	c := startChrome(t)
+	f := newLiveFixture(t)
+	_, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), nil)
+	tab.waitFor("p1 b", func(d liveDOM) bool { return d.SelName == "b" })
+	warn := `(() => { const e = document.getElementById('sw-warn'); return e.hidden ? '' : e.textContent; })()`
+	assert.Empty(t, tab.eval(warn), "no worker, no warning")
+	tab.eval(`navigator.serviceWorker.register('/test-sw.js'), ''`)
+	got := tab.waitText(warn)
+	assert.True(t, strings.HasPrefix(got, "A service worker that perf-agent did not install controls this page"), got)
+	assert.Empty(t, tab.errors())
 }
 
 func TestLiveFixtureLeavesCOut(t *testing.T) {

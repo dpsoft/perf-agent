@@ -44,7 +44,7 @@ const renderDescription = "Check structured explanations of a view's nodes again
 func (s *Server) renderTool() mcpstdio.Tool {
 	desc := renderDescription
 	if s.output == nil {
-		desc = errRenderDisabled.Error() + ". " + desc
+		desc = s.errRenderDisabled().Error() + ". " + desc
 	}
 	return mcpstdio.Tool{
 		Name: "render_flamegraph", Title: "Render an explained flame graph", Description: desc,
@@ -99,11 +99,13 @@ const shrinkRejected = "send fewer explanations or claims per call"
 
 // shrinkRender is the advice for a written result over MaxResponseBytes,
 // which only its notices can make large.
-const shrinkRender = "the page was written; its notices make the result large; restart perf-agent-mcp with a larger --limit MaxResponseBytes=N"
+func (s *Server) shrinkRender() string {
+	return "the page was written; its notices make the result large; " + s.raiseAdvice("MaxResponseBytes")
+}
 
 func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
 	if s.output == nil {
-		return mcpstdio.Result{}, errRenderDisabled
+		return mcpstdio.Result{}, s.errRenderDisabled()
 	}
 	var a renderArgs
 	if err := decodeArgs("render_flamegraph", raw, &a); err != nil {
@@ -145,7 +147,7 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 		s.attempts.setOutcome(id, outcomeFailed)
 		s.recorded()
 		return mcpstdio.Result{}, fmt.Errorf("attempt %s: the explanations passed, but the page cannot be rendered within this server's MaxPageBytes=%d: %v; "+
-			"explain fewer or shorter paths, or restart perf-agent-mcp with a larger --limit MaxPageBytes=N", id, s.lim.MaxPageBytes, err)
+			"explain fewer or shorter paths, or %s", id, s.lim.MaxPageBytes, err, s.raiseAdvice("MaxPageBytes"))
 	}
 	path, err := s.writePage(a.Out, page.Bytes())
 	if err != nil {
@@ -154,7 +156,7 @@ func (s *Server) handleRender(_ context.Context, raw json.RawMessage) (mcpstdio.
 		return mcpstdio.Result{}, fmt.Errorf("attempt %s: the explanations passed, but no page was written: %v", id, err)
 	}
 	s.log.Info("rendered", "attempt", id, "handle", a.Handle, "view", a.View, "path", path, "bytes", page.Len())
-	return s.respond("render_flamegraph", shrinkRender, renderWritten{
+	return s.respond("render_flamegraph", s.shrinkRender(), renderWritten{
 		Attempt: id, Status: outcomeWritten, Path: path, Bytes: wireInt(int64(page.Len())),
 		FiguresChecked: wireInt(int64(r.Figures)), UncheckedNumbers: wireInt(int64(uncheckedNumbers(r, a.Title))), Notices: notices, Notes: notes,
 	})

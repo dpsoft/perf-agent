@@ -254,7 +254,7 @@ func (s *Server) maintenance(full bool) time.Duration {
 	}
 	// What retention keeps is read under the engine; the hashing and the
 	// removals run without it.
-	if err := s.engine.acquire(s.ctx); err != nil {
+	if err := s.engine.acquire(s.ctx, holder{tool: "capture retention"}); err != nil {
 		return again
 	}
 	p := s.protected(d, "")

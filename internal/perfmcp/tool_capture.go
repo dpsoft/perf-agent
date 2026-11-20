@@ -49,11 +49,11 @@ func (s *Server) captureTools() []mcpstdio.Tool {
 
 // captureDescription is d, after the reason capture is off when it is.
 func (s *Server) captureDescription(d string) string {
-	switch s.captureDisabled {
-	case "":
+	switch {
+	case s.captureDisabled == "":
 		return d
-	case captureDisabledText:
-		return captureDisabledText + " " + d
+	case s.noPerfAgent:
+		return s.captureDisabled + " " + d
 	}
 	return "DISABLED: " + strings.TrimSuffix(s.captureDisabled, ".") + ". " + d
 }
@@ -66,8 +66,8 @@ func (s *Server) disabledError() *capture.Error {
 // toolError is a capture failure as the isError result an agent branches
 // on: one JSON object {"error": {...}} (§4.4), with j's id, capture id and
 // state when the failure is a job's.
-func toolError(e *capture.Error, j *job) mcpstdio.Result {
-	w := toWireError(e)
+func (s *Server) toolError(e *capture.Error, j *job) mcpstdio.Result {
+	w := s.wire(e)
 	if j != nil {
 		v := j.view()
 		w.Job, w.CaptureID, w.Status = v.Job, v.ID, v.Status
@@ -130,10 +130,10 @@ func (s *Server) captureTool() mcpstdio.Tool {
     "series": {"type": "string", "description": "The series this capture belongs to, one per loop: 1-%d bytes of [A-Za-z0-9._-], not starting with a dot. Default adhoc."},
     "label": {"type": "string", "description": "Names the capture in its series, as base or cand3: 1-%d bytes of [A-Za-z0-9._-], not starting with a dot. Default run."},
     "compare_with": {"type": "string", "description": "A capture id of this series, such as 001: the capture inherits its settings and the result carries the diff with it."},
-    "keep": {"type": "boolean", "description": "Exempt this capture from retention, as for a loop's baseline. Default false."}
+    "keep": {"type": "boolean", "description": "Exempt this capture from retention, as for a loop's baseline. Default false."}%s
   },
   "additionalProperties": false
-}`, maxPID, c.MaxDuration, c.MaxSampleRate, maxSeriesName, maxLabel)
+}`, maxPID, c.MaxDuration, c.MaxSampleRate, maxSeriesName, maxLabel, s.showSchema())
 	return mcpstdio.Tool{
 		Name:  "capture",
 		Title: "Capture a profile",
@@ -147,8 +147,19 @@ func (s *Server) captureTool() mcpstdio.Tool {
 	}
 }
 
+// showSchema is the show argument's schema, after a comma, on a server
+// with the live page; "" without it, where capture takes no show.
+func (s *Server) showSchema() string {
+	if s.live == nil {
+		return ""
+	}
+	return `,
+    "show": {"type": "boolean", "description": "Make the capture's publication on the live page current: the diff with compare_with, else the facts page. false only lists it, leaving what the page shows as it is. Default true."}`
+}
+
 // captureArgs are capture's arguments; a setting is a pointer so a passed
-// one is told from a default.
+// one is told from a default. Show is an argument only on a server with
+// the live page.
 type captureArgs struct {
 	PID          *int     `json:"pid"`
 	Command      []string `json:"command"`
@@ -162,6 +173,7 @@ type captureArgs struct {
 	Label        *string  `json:"label"`
 	CompareWith  string   `json:"compare_with"`
 	Keep         bool     `json:"keep"`
+	Show         *bool    `json:"show"`
 }
 
 // acceptedAnswer is capture's answer.
@@ -174,20 +186,20 @@ type acceptedAnswer struct {
 // handleCapture admits a capture job: every check is on the arguments,
 // the cached binary and owner, the slot and the windows, in memory only.
 // The job then runs on its own, and every later failure is its state.
-func (s *Server) handleCapture(_ context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
+func (s *Server) handleCapture(ctx context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
 	if s.captureDisabled != "" {
-		return toolError(s.disabledError(), nil), nil
+		return s.toolError(s.disabledError(), nil), nil
 	}
 	if e := s.ownerMismatch(); e != nil {
-		return toolError(e, nil), nil
+		return s.toolError(e, nil), nil
 	}
 	req, e := s.captureRequestOf(raw)
 	if e != nil {
-		return toolError(e, nil), nil
+		return s.toolError(e, nil), nil
 	}
-	j, e := s.startJob(req)
+	j, e := s.startJob(req, mcpstdio.ClientLabel(ctx))
 	if e != nil {
-		return toolError(e, nil), nil
+		return s.toolError(e, nil), nil
 	}
 	return answer(acceptedAnswer{Job: j.id, Status: string(jobAccepted), ETA: (j.reserve + etaSlack).Round(100 * time.Millisecond).String()})
 }
@@ -203,10 +215,14 @@ var unwinds = []string{"auto", "fp", "dwarf"}
 // limits and capabilities, the series and label, then compare_with.
 func (s *Server) captureRequestOf(raw json.RawMessage) (captureRequest, *capture.Error) {
 	var a captureArgs
-	if err := decodeArgs("capture", raw, &a); err != nil {
+	var hidden []string
+	if s.live == nil {
+		hidden = []string{"show"}
+	}
+	if err := decodeArgsHiding("capture", raw, &a, hidden...); err != nil {
 		return captureRequest{}, invalidArgument(argsNext, "%s", err.Error())
 	}
-	req := captureRequest{Cwd: a.Cwd, Explicit: map[string]bool{}, Keep: a.Keep, Series: defaultSeries, Label: defaultLabel}
+	req := captureRequest{Cwd: a.Cwd, Explicit: map[string]bool{}, Keep: a.Keep, Series: defaultSeries, Label: defaultLabel, Show: a.Show == nil || *a.Show}
 	if e := checkTarget(a); e != nil {
 		return req, e
 	}
@@ -284,7 +300,7 @@ func (s *Server) captureRequestOf(raw json.RawMessage) (captureRequest, *capture
 // capture answer shows.
 func (s *Server) syslogNext() string {
 	return "capture without kernel_stacks, or ask the user to run " +
-		strings.ReplaceAll(capture.SetcapLine, "<path>", s.perfAgent.Path) + " and restart perf-agent-mcp"
+		strings.ReplaceAll(capture.SetcapLine, "<path>", s.perfAgent.Path) + " and restart " + s.command()
 }
 
 // checkTarget checks that exactly one of pid and command names the
@@ -347,7 +363,7 @@ func (s *Server) checkModes(modes []string) ([]capture.Mode, *capture.Error) {
 		out = append(out, mode)
 	}
 	if slices.Contains(out, capture.ModeGPU) && s.shim.Path == "" {
-		return nil, capture.Errorf(capture.CodeDisabled, "start perf-agent-mcp with --gpu-shim PATH, or capture without gpu",
+		return nil, capture.Errorf(capture.CodeDisabled, s.startAdvice("--gpu-shim PATH, or capture without gpu"),
 			"mode gpu needs the CUPTI adapter, and this server has none")
 	}
 	return out, nil
@@ -422,21 +438,21 @@ type waitArgs struct {
 // through the lookup pool. It never takes the engine.
 func (s *Server) handleWait(ctx context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
 	if s.captureDisabled != "" {
-		return toolError(s.disabledError(), nil), nil
+		return s.toolError(s.disabledError(), nil), nil
 	}
 	var a waitArgs
 	if err := decodeArgs("capture_wait", raw, &a); err != nil {
-		return toolError(invalidArgument(argsNext, "%s", err.Error()), nil), nil
+		return s.toolError(invalidArgument(argsNext, "%s", err.Error()), nil), nil
 	}
 	if a.ID == "" {
-		return toolError(invalidArgument("pass the job id capture answered, or a capture id as <series>/NNN", "capture_wait needs id"), nil), nil
+		return s.toolError(invalidArgument("pass the job id capture answered, or a capture id as <series>/NNN", "capture_wait needs id"), nil), nil
 	}
 	if e := bareCaptureID("capture_wait", a.ID); e != nil {
-		return toolError(e, nil), nil
+		return s.toolError(e, nil), nil
 	}
 	d, e := waitTimeout(a.Timeout)
 	if e != nil {
-		return toolError(e, nil), nil
+		return s.toolError(e, nil), nil
 	}
 	d = fromReceipt(ctx, d)
 	if j, ok := s.registry.get(a.ID); ok {
@@ -445,7 +461,7 @@ func (s *Server) handleWait(ctx context.Context, raw json.RawMessage) (mcpstdio.
 	key, jobID := a.ID, ""
 	if al, ok := s.registry.final(a.ID); ok {
 		if al.captureID == "" {
-			return endedEarly(al), nil
+			return s.endedEarly(al), nil
 		}
 		if j, ok := s.registry.get(al.captureID); ok {
 			return s.waitJob(ctx, j, d, a.ID), nil
@@ -453,7 +469,7 @@ func (s *Server) handleWait(ctx context.Context, raw json.RawMessage) (mcpstdio.
 		key, jobID = al.captureID, al.jobID
 	}
 	if _, _, ok := splitCaptureKey(key); !ok {
-		return toolError(unknownCapture(a.ID, "no job of this server, and no capture id <series>/NNN", unknownNext), nil), nil
+		return s.toolError(unknownCapture(a.ID, "no job of this server, and no capture id <series>/NNN", unknownNext), nil), nil
 	}
 	return s.waitHistorical(ctx, key, jobID, d, a.ID), nil
 }
@@ -491,7 +507,7 @@ func splitCaptureKey(key string) (series string, id int, ok bool) {
 // endedEarly answers a wait for a job that ended before it had a capture
 // id and whose entry has since left the registry: its alias keeps the code
 // it failed with, not the rest of its error.
-func endedEarly(a jobAlias) mcpstdio.Result {
+func (s *Server) endedEarly(a jobAlias) mcpstdio.Result {
 	status, code := jobFailed, a.code
 	if a.answer == cancelAnswerCancelled {
 		status, code = jobCancelled, capture.CodeCancelled
@@ -499,7 +515,7 @@ func endedEarly(a jobAlias) mcpstdio.Result {
 	if code == "" {
 		code = capture.CodeUnknownCapture
 	}
-	w := toWireError(capture.Errorf(code, "capture again; capture_list shows the series' history",
+	w := s.wire(capture.Errorf(code, "capture again; capture_list shows the series' history",
 		"job %s ended %s with %s before it had a capture id; the rest of its error is no longer in this server's memory", a.jobID, status, code))
 	w.Job, w.Status = a.jobID, string(status)
 	return errorResult(w)
@@ -534,9 +550,35 @@ func (s *Server) waitJob(ctx context.Context, j *job, d time.Duration, asked str
 		case <-timer.C:
 			return s.stateAnswer(ctx, j, deadline, asked)
 		case <-ctx.Done():
+			if _, settled, _ := j.watch(); !settled && s.closing() {
+				return s.closingAnswer(j)
+			}
 			return s.stateAnswer(ctx, j, deadline, asked)
 		}
 	}
+}
+
+// closing reports that the server is closing: its captures were killed,
+// or its context ended. Then a wait's call ends because the server stops.
+func (s *Server) closing() bool { return s.killed.Load() || s.ctx.Err() != nil }
+
+// closingAnswer is a wait's answer when its call ends, before j settles,
+// because the server is closing: an error, not j's running state, naming
+// j's capture id, since after a restart only the capture id still means
+// anything. A call that ends otherwise (the client cancelled it, or ended
+// its session) answers j's state, as a timeout does: the code cancelled
+// is kept for a job that was itself cancelled.
+func (s *Server) closingAnswer(j *job) mcpstdio.Result {
+	v := j.view()
+	name := "job " + v.Job
+	next := "after the restart, capture_list shows whether the series kept a capture of job " + v.Job
+	if v.ID != "" {
+		name += " (capture " + v.ID + ")"
+		next = "after the restart, call capture_wait with the capture id " + v.ID + ", not the job id"
+	}
+	w := s.wire(capture.Errorf(capture.CodeClosing, next, "this server is closing: the wait for %s ended before the capture settled", name))
+	w.Job, w.CaptureID = v.Job, v.ID
+	return errorResult(w)
 }
 
 // stateAnswer is j's answer when a wait ends first: its state, or, when it
@@ -568,7 +610,7 @@ func (s *Server) settledAnswer(ctx context.Context, j *job, deadline time.Time, 
 		return loadingAnswer(asked)
 	case gone:
 		s.registry.forget(key)
-		return toolError(unknownCapture(key, "its manifest is gone: another server's retention, or a person, removed it",
+		return s.toolError(unknownCapture(key, "its manifest is gone: another server's retention, or a person, removed it",
 			"capture again if you need it; capture_list shows what the series still holds"), nil)
 	}
 	return s.jobAnswer(j)
@@ -615,12 +657,12 @@ func (s *Server) jobAnswer(j *job) mcpstdio.Result {
 	case jobDone:
 		return s.resultAnswer(j.id, result, derived, recipe)
 	case jobCancelled:
-		return toolError(cmp.Or(e, cancelledError()), j)
+		return s.toolError(cmp.Or(e, cancelledError()), j)
 	}
 	if e == nil {
 		return internalError(fmt.Errorf("job %s failed and recorded no error", j.id))
 	}
-	return toolError(e, j)
+	return s.toolError(e, j)
 }
 
 // resultAnswer is a done job's result b with its job id and status, its
@@ -734,9 +776,9 @@ func (s *Server) waitHistorical(ctx context.Context, key, jobID string, d time.D
 		// dead server left, which recovery is yet to record.
 		return loadingAnswerNext(asked, loadingRecoveryNext)
 	case errors.Is(err, errNoCapture):
-		return toolError(unknownCapture(key, "no capture of this server's capture directory", unknownNext), nil)
+		return s.toolError(unknownCapture(key, "no capture of this server's capture directory", unknownNext), nil)
 	case err != nil:
-		return toolError(unknownCapture(key, "its manifest cannot be read: "+causeText(err),
+		return s.toolError(unknownCapture(key, "its manifest cannot be read: "+causeText(err),
 			"tell the user: the capture's manifest in the capture directory cannot be read; capture_list shows the series' other captures"), nil)
 	}
 	return s.historicalAnswer(key, jobID, v.(*historical))
@@ -943,7 +985,7 @@ func (s *Server) historicalAnswer(key, jobID string, h *historical) mcpstdio.Res
 				status = string(jobCancelled)
 			}
 		}
-		w := toWireError(e)
+		w := s.wire(e)
 		w.Job, w.CaptureID, w.Status = jobID, key, status
 		return errorResult(w)
 	}
@@ -989,7 +1031,7 @@ func (s *Server) readCaptureDir() (*captureDir, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &captureDir{root: root, rel: rel, owner: s.ownerKind(), profiles: s.profiles.Name()}, nil
+	return &captureDir{root: root, rel: rel, owner: s.ownerKind(), profiles: s.profiles.Name(), cmd: s.command()}, nil
 }
 
 // loadHistorical reads capture key's manifest, and its baseline's when it
@@ -1125,19 +1167,19 @@ type cancelAnswer struct {
 // unknown_capture, answered from memory.
 func (s *Server) handleCancel(_ context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
 	if s.captureDisabled != "" {
-		return toolError(s.disabledError(), nil), nil
+		return s.toolError(s.disabledError(), nil), nil
 	}
 	var a struct {
 		ID string `json:"id"`
 	}
 	if err := decodeArgs("capture_cancel", raw, &a); err != nil {
-		return toolError(invalidArgument(argsNext, "%s", err.Error()), nil), nil
+		return s.toolError(invalidArgument(argsNext, "%s", err.Error()), nil), nil
 	}
 	if a.ID == "" {
-		return toolError(invalidArgument("pass the job id capture answered", "capture_cancel needs id"), nil), nil
+		return s.toolError(invalidArgument("pass the job id capture answered", "capture_cancel needs id"), nil), nil
 	}
 	if e := bareCaptureID("capture_cancel", a.ID); e != nil {
-		return toolError(e, nil), nil
+		return s.toolError(e, nil), nil
 	}
 	out := cancelAnswer{Job: a.ID}
 	if j, ok := s.registry.get(a.ID); ok {
@@ -1147,7 +1189,7 @@ func (s *Server) handleCancel(_ context.Context, raw json.RawMessage) (mcpstdio.
 	}
 	status, ok := s.registry.cancel(a.ID)
 	if !ok {
-		return toolError(unknownCapture(a.ID, "no job of this server: only this server's own running jobs can be cancelled",
+		return s.toolError(unknownCapture(a.ID, "no job of this server: only this server's own running jobs can be cancelled",
 			"capture_wait answers a capture another server ran or this server no longer holds; capture_list shows the running job"), nil), nil
 	}
 	out.Status = status
@@ -1210,8 +1252,8 @@ func (s *Server) fitResult(b []byte) mcpstdio.Result {
 	if len(out) <= max {
 		return mcpstdio.Result{Text: string(out)}
 	}
-	return toolError(capture.Errorf(capture.CodeTooLarge,
-		"restart perf-agent-mcp with a larger --limit MaxResponseBytes=N; capture_list shows the capture's paths, which open takes",
+	return s.toolError(capture.Errorf(capture.CodeTooLarge,
+		s.raiseAdvice("MaxResponseBytes")+"; capture_list shows the capture's paths, which open takes",
 		"the capture's result is over MaxResponseBytes=%d even cut to its paths", max), nil)
 }
 
@@ -1255,7 +1297,7 @@ func (s *Server) cutResult(b []byte, max int) []byte {
 		}
 	}
 	minimal := map[string]json.RawMessage{"notes": mustRaw([]string{cutMinimalNote})}
-	for _, k := range []string{"job", "status", "derived", "derive_error", "handles", "cancel", "recompute"} {
+	for _, k := range []string{"job", "status", "derived", "derive_error", "handles", "cancel", "recompute", "publication", "diff_publication"} {
 		if v, ok := top[k]; ok {
 			minimal[k] = v
 		}

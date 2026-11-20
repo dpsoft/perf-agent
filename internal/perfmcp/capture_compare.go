@@ -17,18 +17,21 @@ import (
 // memory: Derived says "failed" (DeriveError says why; the capture stays
 // committed) or, for an answer read back from a manifest, "recompute" with
 // the calls that make them again. Handles is "reopen" when the handles are
-// not this server's open ones.
+// not this server's open ones. Publication and DiffPublication are the
+// capture's pages on the live page, on a server that has one.
 type captureResult struct {
-	Capture     captureInfo     `json:"capture"`
-	Profiles    []profileResult `json:"profiles"`
-	Compare     *compareResult  `json:"compare,omitzero"`
-	Evicted     []string        `json:"evicted,omitzero"`
-	Notes       []string        `json:"notes,omitzero"`
-	Cancel      string          `json:"cancel,omitzero"`
-	Derived     string          `json:"derived,omitzero"`
-	DeriveError string          `json:"derive_error,omitzero"`
-	Handles     string          `json:"handles,omitzero"`
-	Recompute   *recompute      `json:"recompute,omitzero"`
+	Capture         captureInfo     `json:"capture"`
+	Profiles        []profileResult `json:"profiles"`
+	Compare         *compareResult  `json:"compare,omitzero"`
+	Evicted         []string        `json:"evicted,omitzero"`
+	Notes           []string        `json:"notes,omitzero"`
+	Cancel          string          `json:"cancel,omitzero"`
+	Derived         string          `json:"derived,omitzero"`
+	DeriveError     string          `json:"derive_error,omitzero"`
+	Handles         string          `json:"handles,omitzero"`
+	Recompute       *recompute      `json:"recompute,omitzero"`
+	Publication     string          `json:"publication,omitzero"`
+	DiffPublication string          `json:"diff_publication,omitzero"`
 }
 
 // captureInfo is the capture itself, as its manifest records it.
@@ -174,8 +177,13 @@ func (s *Server) captureInfo(m manifest) captureInfo {
 // its mode by the existing diff code, so a compare needs only two open
 // handles whatever its modes. What it opens stays pinned to j until the
 // job lets go of it. A failure (a profile over the model limits, say) is
-// reported as derived "failed" and never touches the files.
-func (s *Server) derive(j *job, m manifest, base *manifest) captureResult {
+// reported as derived "failed" and never touches the files. The diffs are
+// made from the pinned entries and views, so they need no more open
+// handles than one: an open may evict a handle derive opened before.
+//
+// It also returns what the publication is made from: the first mode's
+// pinned side and, when its view was diffed, the baseline's.
+func (s *Server) derive(j *job, m manifest, base *manifest) (captureResult, derivation) {
 	res := captureResult{Capture: s.captureInfo(m), Notes: slices.Clone(m.Notes)}
 	if base != nil {
 		res.Compare = &compareResult{
@@ -186,10 +194,11 @@ func (s *Server) derive(j *job, m manifest, base *manifest) captureResult {
 		}
 	}
 	var failures []string
-	for _, mode := range modesOf(m) {
+	d := derivation{base: base}
+	for i, mode := range modesOf(m) {
 		path, execlog := s.profilePaths(m, mode)
 		pr := profileResult{Mode: string(mode), Path: path, Execlog: execlog}
-		o, err := s.openPinned(j, path, execlog)
+		o, side, err := s.openPinned(j, path, execlog)
 		if err != nil {
 			pr.OpenError = err.Error()
 			failures = append(failures, err.Error())
@@ -197,13 +206,20 @@ func (s *Server) derive(j *job, m manifest, base *manifest) captureResult {
 			continue
 		}
 		pr.Open = o
-		if mode == capture.ModeGPU && s.viewTotal(o) == 0 {
+		if i == 0 {
+			d.first = &side
+		}
+		if mode == capture.ModeGPU && side.v.Total == 0 {
 			res.Notes = append(res.Notes, gpuNote())
 		}
 		res.Profiles = append(res.Profiles, pr)
 		if base != nil && len(failures) == 0 {
-			if err := s.compareMode(j, res.Compare, *base, mode, o); err != nil {
+			bs, err := s.compareMode(j, res.Compare, *base, mode, o, side)
+			if err != nil {
 				failures = append(failures, err.Error())
+			}
+			if i == 0 {
+				d.firstBase = bs
 			}
 		}
 	}
@@ -212,7 +228,17 @@ func (s *Server) derive(j *job, m manifest, base *manifest) captureResult {
 		res.Recompute = new(s.recomputeFor(m, base, ""))
 		s.log.Warn("capture derivation failed; the capture stays committed", "job", j.id, "err", res.DeriveError)
 	}
-	return res
+	return res, d
+}
+
+// derivation is what derive opened that a publication is made from, all
+// pinned to the job: the first mode's side (its entry and default view)
+// and, when that view was diffed with the baseline's, the baseline's side
+// of that diff (nil otherwise); base is the baseline's manifest, nil
+// without compare_with.
+type derivation struct {
+	first, firstBase *diffSide
+	base             *manifest
 }
 
 // underived is m's result when nothing could be derived, for why.
@@ -224,35 +250,25 @@ func (s *Server) underived(m manifest, base *manifest, why string) captureResult
 }
 
 // openPinned opens a capture's profile as open does and pins what it
-// loaded to j (j is their holder in the pin ledger).
-func (s *Server) openPinned(j *job, path, execlog string) (*openResult, error) {
+// loaded to j (j is their holder in the pin ledger): the profile and its
+// default view, returned as a side that stays valid after the store
+// evicts the handle.
+func (s *Server) openPinned(j *job, path, execlog string) (*openResult, diffSide, error) {
 	if err := s.fault(faultBeforeOpen); err != nil {
-		return nil, fmt.Errorf("open %s: %w", path, err)
+		return nil, diffSide{}, fmt.Errorf("open %s: %w", path, err)
 	}
 	o, err := s.openResultFor(path, execlog)
 	if err != nil {
-		return nil, err
+		return nil, diffSide{}, err
 	}
-	if e, ok := s.store.entries[o.Handle]; ok {
-		objs := []retained{e.prof}
-		if v, ok := e.views[o.DefaultView]; ok {
-			objs = append(objs, v)
-		}
-		s.pins.hold(j, objs...)
-	}
-	return &o, nil
-}
-
-// viewTotal is the total of o's default view, -1 when it cannot be read.
-func (s *Server) viewTotal(o *openResult) int64 {
-	if o == nil {
-		return -1
-	}
-	_, v, err := s.store.view(o.Handle, o.DefaultView)
+	// openResultFor has just opened the handle and built its default
+	// view, so both are in the store.
+	e, v, err := s.store.view(o.Handle, o.DefaultView)
 	if err != nil {
-		return -1
+		return nil, diffSide{}, err
 	}
-	return v.Total
+	s.pins.hold(j, e.prof, v)
+	return &o, diffSide{e: e, v: v}, nil
 }
 
 // gpuNote is the empty GPU profile's note, with a hint when no NVIDIA
@@ -265,13 +281,14 @@ func gpuNote() string {
 }
 
 // compareMode opens the baseline's profile of mode and diffs no's default
-// view with the baseline's view of that name, cut to CompareRows rows,
-// into cr.
-func (s *Server) compareMode(j *job, cr *compareResult, base manifest, mode capture.Mode, no *openResult) error {
+// view (ns, pinned) with the baseline's view of that name, cut to
+// CompareRows rows, into cr. It returns the baseline's side of the diff,
+// pinned to j, or nil when the baseline has no such view.
+func (s *Server) compareMode(j *job, cr *compareResult, base manifest, mode capture.Mode, no *openResult, ns diffSide) (*diffSide, error) {
 	path, execlog := s.profilePaths(base, mode)
-	bo, err := s.openPinned(j, path, execlog)
+	bo, bs, err := s.openPinned(j, path, execlog)
 	if err != nil {
-		return fmt.Errorf("baseline %s: %w", base.ID, err)
+		return nil, fmt.Errorf("baseline %s: %w", base.ID, err)
 	}
 	if cr.Base.Handle == "" {
 		cr.Base.Handle, cr.New.Handle = bo.Handle, no.Handle
@@ -279,20 +296,30 @@ func (s *Server) compareMode(j *job, cr *compareResult, base manifest, mode capt
 	view := no.DefaultView
 	if !slices.ContainsFunc(bo.Views, func(v viewInfo) bool { return v.View == view }) {
 		cr.Notes = append(cr.Notes, fmt.Sprintf("the baseline's %s profile has no view %s to compare with", mode, view))
-		return nil
+		return nil, nil
+	}
+	if view != bo.DefaultView {
+		// The baseline was opened just now, so its handle is open: the
+		// view of that name is built there and pinned too.
+		_, v, err := s.store.view(bo.Handle, view)
+		if err != nil {
+			return nil, fmt.Errorf("baseline %s: %w", base.ID, err)
+		}
+		s.pins.hold(j, v)
+		bs.v = v
 	}
 	if err := s.fault(faultBeforeDiff); err != nil {
-		return fmt.Errorf("diff %s: %w", view, err)
+		return nil, fmt.Errorf("diff %s: %w", view, err)
 	}
 	q := diffQuery{BaseHandle: bo.Handle, BaseView: view, NewHandle: no.Handle, NewView: view}
-	dr, err := s.diffPage(q, s.lim.Capture.CompareRows, "")
+	dr, err := s.diffPageOf(q, bs, ns, s.lim.Capture.CompareRows, "")
 	if err != nil {
-		return fmt.Errorf("diff %s: %w", view, err)
+		return nil, fmt.Errorf("diff %s: %w", view, err)
 	}
 	cr.Views = append(cr.Views, compareView{diffResult: dr, Next: toolCall{Tool: "diff", Arguments: map[string]any{
 		"base_handle": string(bo.Handle), "base_view": view, "new_handle": string(no.Handle), "new_view": view,
 	}}})
-	return nil
+	return &bs, nil
 }
 
 // comparability reports what may differ between a capture and its
@@ -327,7 +354,9 @@ func short(id string) string {
 // baseline's opens first, then m's, each bound by name, then a diff per
 // mode through the bindings, with CompareRows rows. A baseline that is
 // gone (baseGone says why) is left out with its diffs; without
-// compare_with there is none.
+// compare_with there is none. With the live page the recipe publishes
+// again as the capture did, under the same titles: the first mode's facts
+// page, then, with the baseline, its diff.
 func (s *Server) recomputeFor(m manifest, base *manifest, baseGone string) recompute {
 	r := recompute{Steps: []toolCall{}, Baseline: "none"}
 	modes := modesOf(m)
@@ -352,16 +381,36 @@ func (s *Server) recomputeFor(m manifest, base *manifest, baseGone string) recom
 		opens(*base, "base")
 	}
 	opens(m, "new")
-	if r.Baseline != "present" {
+	if r.Baseline == "present" {
+		for _, mode := range modes {
+			b, n := "base_"+string(mode), "new_"+string(mode)
+			r.Steps = append(r.Steps, toolCall{Tool: "diff", Arguments: map[string]any{
+				"base_handle": "${" + b + ".handle}", "base_view": "${" + n + ".default_view}",
+				"new_handle": "${" + n + ".handle}", "new_view": "${" + n + ".default_view}",
+				"limit": s.lim.Capture.CompareRows,
+			}})
+		}
+	}
+	if s.live == nil || len(modes) == 0 {
 		return r
 	}
-	for _, mode := range modes {
-		b, n := "base_"+string(mode), "new_"+string(mode)
-		r.Steps = append(r.Steps, toolCall{Tool: "diff", Arguments: map[string]any{
+	b, n := "base_"+string(modes[0]), "new_"+string(modes[0])
+	r.Steps = append(r.Steps, toolCall{Tool: "page_explain", Arguments: map[string]any{
+		"handle": "${" + n + ".handle}", "view": "${" + n + ".default_view}", "explanations": []any{},
+		"title": s.captureTitle(m, string(modes[0])),
+	}})
+	if r.Baseline == "present" {
+		r.Steps = append(r.Steps, toolCall{Tool: "page_diff", Arguments: map[string]any{
 			"base_handle": "${" + b + ".handle}", "base_view": "${" + n + ".default_view}",
 			"new_handle": "${" + n + ".handle}", "new_view": "${" + n + ".default_view}",
-			"limit": s.lim.Capture.CompareRows,
+			"title": s.diffTitle(m, *base, string(modes[0])),
 		}})
 	}
+	return r
+}
+
+// withoutTool is r without its steps that call tool.
+func withoutTool(r recompute, tool string) recompute {
+	r.Steps = slices.DeleteFunc(slices.Clone(r.Steps), func(c toolCall) bool { return c.Tool == tool })
 	return r
 }

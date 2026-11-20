@@ -131,7 +131,9 @@ func newJobEnv(t *testing.T, o jobOpts) *jobEnv {
 	if o.profiles != "" {
 		cfg.ProfilesDir = o.profiles
 	}
-	cfg.Live = o.live
+	if o.live {
+		cfg.Page = livePage()
+	}
 	cfg.Limits = jobLimits()
 	if o.limits != nil {
 		o.limits(&cfg.Limits)
@@ -274,7 +276,7 @@ func (e *jobEnv) request(d time.Duration) captureRequest {
 		Command:  []string{w, "sleep", "120s"},
 		Settings: capture.Settings{Modes: []capture.Mode{capture.ModeCPU}, Duration: d, SampleRate: 99, Unwind: "auto"},
 		Explicit: map[string]bool{"modes": true, "duration": true, "sample_rate": true, "unwind": true, "kernel_stacks": true},
-		Series:   "adhoc", Label: "run",
+		Series:   "adhoc", Label: "run", Show: true,
 	}
 }
 
@@ -290,7 +292,7 @@ func (e *jobEnv) compareRequest(id string) captureRequest {
 
 func (e *jobEnv) start(req captureRequest) *job {
 	e.t.Helper()
-	j, ce := e.s.startJob(req)
+	j, ce := e.s.startJob(req, "")
 	if ce != nil {
 		e.t.Fatalf("startJob: %v", ce)
 	}
@@ -514,7 +516,7 @@ func TestJobRunsThroughEveryState(t *testing.T) {
 	if r.Profiles[0].Path != "captures/adhoc/001-run-cpu.pb.gz" || r.Capture.ID != "001" || r.Capture.Series != "adhoc" {
 		t.Errorf("result %+v", r.Capture)
 	}
-	if err := e.s.engine.acquire(t.Context()); err != nil {
+	if err := e.s.engine.acquire(t.Context(), holder{tool: "test"}); err != nil {
 		t.Fatal(err)
 	}
 	_, open := e.s.store.entries[r.Profiles[0].Open.Handle]
@@ -542,7 +544,7 @@ func TestStartJobDoesNoIO(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(e.profiles, 0o700) })
 	begin := time.Now()
-	j, ce := e.s.startJob(e.request(500 * time.Millisecond))
+	j, ce := e.s.startJob(e.request(500*time.Millisecond), "")
 	took := time.Since(begin)
 	if ce != nil {
 		t.Fatalf("startJob refused: %v", ce)
@@ -593,7 +595,7 @@ func TestBlockedSeamsNeverBlockAdmissionOrWait(t *testing.T) {
 	}
 	t.Run("the engine", func(t *testing.T) {
 		e := newJobEnv(t, jobOpts{})
-		if err := e.s.engine.acquire(t.Context()); err != nil {
+		if err := e.s.engine.acquire(t.Context(), holder{tool: "test"}); err != nil {
 			t.Fatal(err)
 		}
 		held := true
@@ -1061,7 +1063,7 @@ func TestMaintenanceKeepsControlResponsive(t *testing.T) {
 	if _, ok := e.s.registry.cancel("j1-x"); ok {
 		t.Error("a cancel of an unknown job was answered")
 	}
-	j, ce := e.s.startJob(e.request(300 * time.Millisecond))
+	j, ce := e.s.startJob(e.request(300*time.Millisecond), "")
 	if ce != nil {
 		t.Fatal(ce)
 	}
@@ -1344,7 +1346,7 @@ func TestTheSlotIsFreeWhenAJobLooksEnded(t *testing.T) {
 			if a := e.s.registry.active.Load(); a != nil {
 				t.Errorf("the slot holds %s after %+v", a.id, v)
 			}
-			if _, ce := e.s.startJob(e.request(300 * time.Millisecond)); ce != nil {
+			if _, ce := e.s.startJob(e.request(300*time.Millisecond), ""); ce != nil {
 				t.Errorf("the next capture: %v", ce)
 			}
 		})

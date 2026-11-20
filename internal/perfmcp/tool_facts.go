@@ -30,8 +30,10 @@ type viewScope struct {
 
 // shrinkFacts is the advice for a facts response over MaxResponseBytes: the
 // node's own path names are what make it large, and path pages them.
-const shrinkFacts = "restart perf-agent-mcp with a larger --limit MaxResponseBytes=N; " +
-	"the path names and unresolved_by_module entries make it large, and path returns the frames page by page"
+func (s *Server) shrinkFacts() string {
+	return s.raiseAdvice("MaxResponseBytes") + "; " +
+		"the path names and unresolved_by_module entries make it large, and path returns the frames page by page"
+}
 
 type factsResult struct {
 	Handle              profilemodel.Handle `json:"handle"`
@@ -92,5 +94,5 @@ func (s *Server) handleFacts(_ context.Context, raw json.RawMessage) (mcpstdio.R
 		Domain: pf.Domain, DomainInferred: pf.DomainInferred, CollisionPossible: pf.CollisionPossible,
 		Notes: notes, Quality: wireQuality(q), CallSites: wireInt(int64(len(n.CallSites))),
 	}
-	return s.respond("facts", shrinkFacts, out)
+	return s.respond("facts", s.shrinkFacts(), out)
 }

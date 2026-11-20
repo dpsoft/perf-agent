@@ -44,8 +44,9 @@ const (
 // passed, else Capture.MaxDuration when it is to be inherited from a
 // baseline, else the default; the job reconciles it once it knows. A busy
 // slot or full windows refuse the job; otherwise it runs on its own
-// goroutine and every later failure is the job's state.
-func (s *Server) startJob(req captureRequest) (*job, *capture.Error) {
+// goroutine and every later failure is the job's state. by is the label of
+// the session that asked for it.
+func (s *Server) startJob(req captureRequest, by string) (*job, *capture.Error) {
 	if s.captureDisabled != "" {
 		return nil, capture.Errorf(capture.CodeDisabled, "", "%s", s.captureDisabled)
 	}
@@ -56,11 +57,11 @@ func (s *Server) startJob(req captureRequest) (*job, *capture.Error) {
 	s.jobsMu.Lock()
 	defer s.jobsMu.Unlock()
 	if s.closed {
-		return nil, capture.Errorf(capture.CodeClosing, "start a new perf-agent-mcp to capture", "this server is closing and starts no capture")
+		return nil, capture.Errorf(capture.CodeClosing, "start a new "+s.command()+" to capture", "this server is closing and starts no capture")
 	}
 	now := s.clock()
 	j := newJob(s.registry.newJobID(), now, reserve)
-	j.req, j.began = req, time.Now()
+	j.req, j.by, j.began = req, by, time.Now()
 	if e := s.registry.admit(j, now); e != nil {
 		return nil, e
 	}
@@ -483,7 +484,8 @@ func (r *jobRun) retain(p protection) error {
 // engine is released before retention hashes and removes files.
 func (r *jobRun) engineSection() (protection, error) {
 	s, j := r.s, r.j
-	if err := s.engine.acquire(r.ctx); err != nil {
+	// The capture has no id yet: the job holds the engine by its own.
+	if err := s.engine.acquire(r.ctx, holder{tool: "capture " + j.id, by: j.by}); err != nil {
 		return protection{}, cancelledError()
 	}
 	defer s.engine.release()
@@ -665,7 +667,7 @@ func (r *jobRun) effective() (capture.Settings, error) {
 		return eff, capture.Errorf(capture.CodeInvalidArgument, "pass a lower sample_rate, or start a new series",
 			"sample_rate %d%s is outside [1, Capture.MaxSampleRate=%d] of this server", eff.SampleRate, from(argSampleRate), c.MaxSampleRate)
 	case slices.Contains(eff.Modes, capture.ModeGPU) && r.s.shim.Path == "":
-		return eff, capture.Errorf(capture.CodeDisabled, "start perf-agent-mcp with --gpu-shim PATH",
+		return eff, capture.Errorf(capture.CodeDisabled, r.s.startAdvice("--gpu-shim PATH"),
 			"mode gpu%s needs the CUPTI adapter, and this server has none", from(argModes))
 	case eff.KernelStacks && !r.s.perfAgent.Caps.Has(capture.CapSyslog):
 		return eff, capture.Errorf(capture.CodeDisabled, r.s.syslogNext(),
@@ -703,13 +705,17 @@ func (r *jobRun) spaceCheck() error {
 	}
 	const next = "remove captures of that series by hand, or raise --limit Capture.MaxStoredBytes"
 	if !s.storeHasRoom(used, need) {
+		kept := ""
+		if s.live != nil {
+			kept = "; retention keeps every capture the live page shows for as long as the page keeps its publication"
+		}
 		return capture.Errorf(capture.CodeDisk, next,
-			"the capture directory %s holds %d bytes after retention, and this capture may write %d more, over Capture.MaxStoredBytes=%d%s",
-			r.d.rel, used, need, c.MaxStoredBytes, largestSeries(r.d))
+			"the capture directory %s holds %d bytes after retention, and this capture may write %d more, over Capture.MaxStoredBytes=%d%s%s",
+			r.d.rel, used, need, c.MaxStoredBytes, largestSeries(r.d), kept)
 	}
 	free, err := r.freeBytes()
 	if err != nil {
-		return capture.Errorf(capture.CodeDisk, "check that the capture directory's filesystem is mounted and readable, or start perf-agent-mcp with --captures naming another directory inside the profiles root",
+		return capture.Errorf(capture.CodeDisk, "check that the capture directory's filesystem is mounted and readable, or "+s.startAdvice("--captures naming another directory inside the profiles root"),
 			"cannot read the free space of the capture directory %s: %s", r.d.rel, causeText(err))
 	}
 	if free < c.MinFreeBytes {
@@ -1010,20 +1016,34 @@ func (r *jobRun) end(status jobStatus, e *capture.Error) {
 		r.s.log.Error("capture registry", "job", j.id, "err", err)
 	}
 	j.set(func() { j.status, j.phase, j.err = status, "", e })
-	r.s.logBounded(slog.LevelInfo, "capture ended", "job", j.id, "capture", j.captureIDNow(), "status", status, "code", e.Code, "message", e.Message)
+	r.s.logBounded(slog.LevelInfo, "capture ended", "job", j.id, "capture", j.captureIDNow(), "status", status, "code", e.Code, "message", named(e.Message, r.s.command()))
 }
 
 // done is a committed capture: it derives the open and compare results
-// under the engine, records them, and lets go of its pins.
+// under the engine, publishes them on the live page when there is one,
+// records them, and lets go of its pins.
 func (r *jobRun) done() {
 	s, j := r.s, r.j
 	m := r.txn.manifestOf(r.m, captureOK, nil)
 	j.set(func() { j.status, j.phase, j.derived, j.err = jobDone, "deriving", derivedPending, nil })
 	var res captureResult
-	if err := s.engine.acquire(s.ctx); err != nil {
+	if err := s.engine.acquire(s.ctx, holder{tool: "capture " + cmp.Or(j.captureIDNow(), j.id), by: j.by}); err != nil {
 		res = s.underived(m, r.base, "the server is shutting down")
 	} else {
-		res = s.derive(j, m, r.base)
+		var d derivation
+		res, d = s.derive(j, m, r.base)
+		if s.live != nil && res.Derived == "" {
+			if err := s.capturePublish(j, m, &res, d); err != nil {
+				rc := s.recomputeFor(m, r.base, "")
+				if res.Publication != "" {
+					// The facts page is kept: the recipe does not make it
+					// again.
+					rc = withoutTool(rc, "page_explain")
+				}
+				res.Derived, res.DeriveError, res.Recompute = derivedFailed, "publication: "+err.Error(), &rc
+				s.log.Warn("capture publication failed; the capture stays committed", "job", j.id, "err", res.DeriveError)
+			}
+		}
 		s.pins.release(j)
 		s.engine.release()
 	}

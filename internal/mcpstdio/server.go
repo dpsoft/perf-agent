@@ -48,9 +48,9 @@ func (s *Server) warn(kind, subject string, level slog.Level, args ...any) {
 	}
 }
 
-// reportWarnings logs, off the caller's goroutine, how many warnings of
+// FlushWarnings logs, off the caller's goroutine, how many warnings of
 // each kind went unlogged, and starts the counts again.
-func (s *Server) reportWarnings() {
+func (s *Server) FlushWarnings() {
 	s.warnMu.Lock()
 	var args []any
 	for kind, n := range s.warned {
@@ -135,7 +135,7 @@ func New(o Options) *Server {
 func (s *Server) Serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	ss := s.newSession(ctx, w)
 	defer ss.hcancel()
-	defer s.reportWarnings()
+	defer s.FlushWarnings()
 	go ss.out.run()
 	go ss.dispatch()
 	go ss.read(r)
@@ -259,10 +259,10 @@ var knownMethods = map[string]bool{
 	"resources/list": true, "resources/templates/list": true, "resources/read": true,
 }
 
-func (s *Server) handle(ctx context.Context, method string, params json.RawMessage) (any, *rpcError) {
+func (s *Server) handle(ctx context.Context, ps *Session, method string, params json.RawMessage) (any, *rpcError) {
 	switch method {
 	case "initialize":
-		return s.initialize(params)
+		return s.initialize(ps, params)
 	case "ping":
 		return struct{}{}, nil
 	case "tools/list":
@@ -284,7 +284,7 @@ func (s *Server) handle(ctx context.Context, method string, params json.RawMessa
 	case "resources/templates/list":
 		return map[string]any{"resourceTemplates": []struct{}{}}, nil
 	case "resources/read":
-		return s.readResource(params)
+		return s.readResource(ctx, params)
 	}
 	return nil, &rpcError{Code: codeMethodNotFound, Message: "method not found: " + echoName(method)}
 }
@@ -306,9 +306,12 @@ func decodeParams(params json.RawMessage, v any) *rpcError {
 	return nil
 }
 
-func (s *Server) initialize(params json.RawMessage) (any, *rpcError) {
+func (s *Server) initialize(ps *Session, params json.RawMessage) (any, *rpcError) {
 	var p struct {
 		ProtocolVersion string `json:"protocolVersion"`
+		ClientInfo      struct {
+			Name string `json:"name"`
+		} `json:"clientInfo"`
 	}
 	if e := decodeParams(params, &p); e != nil {
 		return nil, e
@@ -317,6 +320,7 @@ func (s *Server) initialize(params json.RawMessage) (any, *rpcError) {
 	if slices.Contains(SupportedVersions, p.ProtocolVersion) {
 		version = p.ProtocolVersion
 	}
+	ps.record(version, clientLabel(p.ClientInfo.Name))
 	type listChanged struct {
 		ListChanged bool `json:"listChanged"`
 	}
@@ -407,6 +411,14 @@ func (s *Server) MaxResultBytes() int {
 	return max((s.o.MaxOutBytes/2-resultEnvelopeBytes)/2, 0)
 }
 
+// MaxAnswerBytes is the longest answer, as Handle returns it (compact
+// JSON without the newline), that stdio sends as it is: its line, newline
+// included, is at most half of MaxOutBytes. A longer one stdio replaces by
+// a small answer for the same id ("result too large for the output
+// bound"), so a transport that replaces answers longer than this answers
+// as stdio does.
+func (s *Server) MaxAnswerBytes() int { return s.o.MaxOutBytes/2 - 1 }
+
 // runHandler calls the tool and turns a panic into a flag so one bad handler
 // cannot take the server down.
 func (s *Server) runHandler(ctx context.Context, t Tool, args json.RawMessage) (res Result, err error, panicked bool) {
@@ -444,7 +456,7 @@ func (s *Server) getPrompt(params json.RawMessage) (any, *rpcError) {
 	return res, nil
 }
 
-func (s *Server) readResource(params json.RawMessage) (any, *rpcError) {
+func (s *Server) readResource(ctx context.Context, params json.RawMessage) (any, *rpcError) {
 	var p struct {
 		URI string `json:"uri"`
 	}
@@ -456,11 +468,35 @@ func (s *Server) readResource(params json.RawMessage) (any, *rpcError) {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown resource: " + echoName(p.URI)}
 	}
 	r := s.o.Resources[i]
-	content := map[string]string{"uri": r.URI, "text": r.Text}
+	text := r.Text
+	if r.Read != nil {
+		var err error
+		var panicked bool
+		text, err, panicked = s.runRead(ctx, r)
+		if panicked {
+			return nil, &rpcError{Code: codeInternalError, Message: "internal error: resource " + echoName(r.URI) + " failed"}
+		}
+		if err != nil {
+			return nil, &rpcError{Code: codeInternalError, Message: cut(err.Error(), s.o.MaxToolErrorBytes)}
+		}
+	}
+	content := map[string]string{"uri": r.URI, "text": text}
 	if r.MIMEType != "" {
 		content["mimeType"] = r.MIMEType
 	}
 	return map[string]any{"contents": []map[string]string{content}}, nil
+}
+
+// runRead calls the resource's Read and turns a panic into a flag.
+func (s *Server) runRead(ctx context.Context, r Resource) (text string, err error, panicked bool) {
+	defer func() {
+		if p := recover(); p != nil {
+			s.warn("resource read panicked", r.URI, slog.LevelError, "uri", r.URI, "panic", fmt.Sprint(p))
+			panicked = true
+		}
+	}()
+	text, err = r.Read(ctx)
+	return text, err, false
 }
 
 // maxEchoName is the most characters of a client's tool, prompt or

@@ -1,12 +1,20 @@
-// The live page. It reads the state the agent drives (the event stream, and
-// GET state when the stream is down), fetches the shown publication's model
-// and rejected history, and draws them with the shared panel. Every request
-// is a relative GET. The only received strings that become part of a request
+// The live page. It reads the state envelope (the event stream, and GET
+// state when the stream is down): the state the agent drives, and the
+// count of the user's asks, each at its own revision. It fetches the shown
+// publication's model and rejected history, and draws them with the
+// shared panel. It reports the user's own selections, focus and asks to
+// the inbox. Every request is relative, and every one but the inbox's
+// POST is a GET. The only received strings that become part of a request
 // path are publication and node IDs, and only when they have their fixed
-// shapes. Every figure comes from the server: this script formats no number.
+// shapes. Every figure comes from the server: this script formats no
+// number.
 (() => {
   'use strict';
   const $ = (id) => document.getElementById(id);
+
+  // postHeaders mark a POST as the page's own: the inbox refuses any
+  // other content type, and a request without the custom header.
+  const postHeaders = {'Content-Type': 'application/json', 'X-Perf-Agent-Page': '1'};
 
   const transport = {
     getJSON: async (path) => {
@@ -14,7 +22,12 @@
       if (!r.ok) throw new Error('request refused: ' + path);
       return r.json();
     },
-    // subscribe opens the event stream. onState gets each state; onTrouble
+    // post sends body as JSON and resolves to the answer's status.
+    post: async (path, body) => {
+      const r = await fetch(path, {method: 'POST', headers: postHeaders, body: JSON.stringify(body)});
+      return r.status;
+    },
+    // subscribe opens the event stream. onState gets each envelope; onTrouble
     // gets true when the browser gave the stream up for good (a refusal,
     // such as too many open tabs) and false while it reconnects; onOpen is
     // called when the stream is open.
@@ -35,11 +48,11 @@
     },
   };
 
-  const GONE = 'perf-agent-mcp is not running; this is the last state it sent. Ask your agent for a new page URL, or download a static copy while it runs.';
+  const GONE = 'The perf-agent server is not running; this is the last state it sent. Ask your agent for a new page URL, or download a static copy while it runs.';
   const PAUSED = 'Live updates are paused because too many tabs have this page open. The page checks for changes every few seconds.';
 
-  // A seq is a decimal string. newer compares two by length, then
-  // lexically, so "10" is newer than "9" and no seq is ever a number.
+  // A seq or a rev is a decimal string. newer compares two by length, then
+  // lexically, so "10" is newer than "9" and neither is ever a number.
   const digits = /^[0-9]+$/;
   const canonical = (s) => s.replace(/^0+(?=[0-9])/, '');
   const newer = (a, b) => {
@@ -72,6 +85,10 @@
   // is still loading is refused. renderedSeq is the seq whose work finished.
   let acceptedSeq = '';
   let renderedSeq = '';
+  // acceptedRev is the highest inbox rev accepted so far. The inbox is
+  // applied by its own rev, whatever the engine's seq, and touches neither
+  // the engine's state nor gen.
+  let acceptedRev = '';
   // retrySeq is an accepted seq whose work failed: the same state may be
   // accepted once more. failures counts its failed attempts, and failGen
   // is the generation when the last one failed.
@@ -150,8 +167,24 @@
       titleSegments(t, p.title_segs);
       b.appendChild(t);
       b.appendChild(make('span', 'vw', p.view || ''));
+      if (strOf(p.by)) b.appendChild(make('span', 'by', p.by));
       nav.appendChild(b);
     }
+    renderBy();
+  };
+
+  // renderBy names the session that published the shown publication and,
+  // while it is the agent's current one, the session that put it on
+  // screen. A label is the client's own text: it is shown as text, never
+  // as markup.
+  const renderBy = () => {
+    const e = $('by');
+    const pub = view ? strOf((entryOf(agent, view.pub) || {}).by) : '';
+    const steered = view && agent && view.pub === agent.current ? strOf(agent.by) : '';
+    let text = pub ? 'Published by ' + pub : '';
+    if (steered && steered !== pub) text += text ? ' · shown by ' + steered : 'Shown by ' + steered;
+    e.textContent = text;
+    e.hidden = !text;
   };
 
   const renderPills = () => {
@@ -325,6 +358,7 @@
   const updateButtons = () => {
     $('focus-btn').disabled = !view || !view.selected || view.focus === view.selected;
     $('whole-btn').disabled = !view || !view.focus;
+    $('ask-btn').disabled = !view || !view.selected;
   };
 
   // drawModel draws m, the publication's whole model or a focus of it:
@@ -544,13 +578,106 @@
     applyHistory(await transport.getJSON(pubPath(id, 'history')));
   };
 
+  // TOAST_MS is how long a toast shows; ASK_TOAST_MS is longer, for the
+  // answer to an ask, which says what to do next.
+  const TOAST_MS = 2200;
+  const ASK_TOAST_MS = 5000;
   let toastTimer = 0;
-  const toast = (msg) => {
+  const toast = (msg, ms = TOAST_MS) => {
     const t = $('toast');
     t.textContent = msg;
     t.classList.add('on');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => t.classList.remove('on'), 2200);
+    toastTimer = setTimeout(() => t.classList.remove('on'), ms);
+  };
+
+  // --- Reports to the inbox ---
+
+  // A report tells the server what the user did on the shown publication:
+  // a select (node is the selection, "" for none), a focus (node is the
+  // frame the layout now starts at, "" for the whole view) or an ask about
+  // node. focus is always the layout's current start. A report changes
+  // nothing on the page: what the server makes of it comes back, if at
+  // all, in a later envelope.
+
+  // RETRY_AFTER_MS is the inbox's Retry-After on a 429, which is always
+  // one second; a refused report is tried again once, after it.
+  const RETRY_AFTER_MS = 1000;
+  // REPORT_QUIET_MS is how long selections and focus must settle before
+  // the newest is reported, so a burst of clicks costs one report.
+  const REPORT_QUIET_MS = 150;
+
+  const later = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  // post sends body to the inbox and resolves to the answer's status, or
+  // 0 when none came.
+  const post = (body) => transport.post('inbox', body).catch(() => 0);
+  const postOrRetry = async (body) => {
+    const status = await post(body);
+    if (status !== 429) return status;
+    await later(RETRY_AFTER_MS);
+    return post(body);
+  };
+
+  // Selections and focus are reported one at a time, so they reach the
+  // server in order. While one is in flight, or the clicks have not
+  // settled, only the newest waits (navNext). A report that replaces one
+  // never recorded, or follows one the server did not record, is sent as
+  // a select of the whole user view (publication, selection and focus),
+  // so nothing the server missed is lost. navLost says the last report
+  // was not recorded and nothing waits to carry the whole view.
+  let navNext = null;
+  let navBusy = false;
+  let navTimer = 0;
+  let navLost = false;
+
+  const report = (kind, node) => {
+    if (!view || !isPub(view.pub)) return;
+    const whole = {kind: 'select', publication: view.pub, node: view.selected, focus: view.focus};
+    const own = {kind, publication: view.pub, node, focus: view.focus};
+    navNext = {body: navNext || navLost ? whole : own, whole};
+    navLost = false;
+    clearTimeout(navTimer);
+    navTimer = setTimeout(() => {
+      navTimer = 0;
+      sendNext();
+    }, REPORT_QUIET_MS);
+  };
+
+  const sendNext = async () => {
+    if (navBusy || navTimer || !navNext) return;
+    const n = navNext;
+    navNext = null;
+    navBusy = true;
+    let status = await post(n.body);
+    if (status === 429) {
+      await later(RETRY_AFTER_MS);
+      // A newer report stands for this one rather than follow it.
+      if (!navNext) status = await post(n.body);
+    }
+    if (status !== 204) {
+      if (navNext) navNext.body = navNext.whole;
+      else navLost = true;
+    }
+    navBusy = false;
+    sendNext();
+  };
+
+  const askReplies = {
+    0: 'Could not reach perf-agent; nothing was sent.',
+    204: 'Sent. Ask your agent to look (it reads page_state).',
+    422: 'That frame is no longer on the page; nothing was sent.',
+    429: 'Too many reports; try again in a moment.',
+  };
+  const NOT_SENT = 'perf-agent did not take the ask; nothing was sent.';
+
+  // askAgent puts the selected frame in the inbox for the user's agent at
+  // once, and says how that went. It is not navigation, so it is allowed
+  // while an agent's publication switch loads: it asks about what is
+  // shown.
+  const askAgent = () => {
+    if (!view || !view.selected || !isPub(view.pub)) return;
+    const body = {kind: 'ask', publication: view.pub, node: view.selected, focus: view.focus};
+    postOrRetry(body).then((status) => toast(askReplies[status] || NOT_SENT, ASK_TOAST_MS));
   };
 
   // --- The user's own navigation: local until the next agent state ---
@@ -560,17 +687,26 @@
   // about to go: navigating them would only cancel the switch.
   const agentLoading = () => loadingGen === gen;
 
+  // Each navigation is reported once it is shown; one the page moved on
+  // from first is not. Showing the selection again after a focus change is
+  // not a new selection.
   const localSelect = (id, scroll) => {
     if (!view || !isNode(id) || agentLoading()) return;
     const g = ++gen;
-    quietly(selectIn(id, g, scroll));
+    quietly(selectIn(id, g, scroll).then((f) => {
+      if (f) report('select', f.id);
+    }));
   };
 
   const focusHere = () => {
     if (!view || !view.selected || agentLoading()) return;
     const id = view.selected;
     const g = ++gen;
-    quietly(focusOn(id, g).then((ok) => ok && selectIn(id, g, false)));
+    quietly(focusOn(id, g).then((ok) => {
+      if (!ok) return null;
+      report('focus', id);
+      return selectIn(id, g, false);
+    }));
   };
 
   const wholeView = () => {
@@ -579,15 +715,22 @@
     const id = view.selected;
     view.focus = '';
     drawModel(view.whole);
+    // The focus report keeps the selection on the server, so showing it
+    // again is not reported as a select.
+    report('focus', '');
     if (id) quietly(selectIn(id, g, true));
   };
 
+  // A publication the user chose is reported as a select of its own
+  // selection, or of none.
   const openPub = (id) => {
     if (!isPub(id)) return;
     const g = ++gen;
-    quietly(loadPub(id, g).then((ok) => {
-      const sel = ok && selectedOf(view.whole);
-      return sel && isNode(sel) ? selectIn(sel, g, true) : null;
+    quietly(loadPub(id, g).then(async (ok) => {
+      if (!ok) return;
+      const sel = selectedOf(view.whole);
+      const f = isNode(sel) ? await selectIn(sel, g, true) : null;
+      if (g === gen) report('select', f ? f.id : '');
     }));
   };
 
@@ -690,12 +833,13 @@
   const retryDelays = [1000, 2000, 5000, 10000];
   const quickRetries = 3;
 
-  // onState accepts st if its seq is newer than any accepted so far, and
-  // records that before any of its work starts. A quiet state (no agent
-  // chain pending or cut short, and the same publication, selection and
-  // focus as the last accepted) only refreshes history and keeps the
-  // generation, so the user's own fetches in flight still land.
-  const onState = (st) => {
+  // onEngine accepts st, the engine's state, if its seq is newer than any
+  // accepted so far, and records that before any of its work starts. A
+  // quiet state (no agent chain pending or cut short, and the same
+  // publication, selection and focus as the last accepted) only refreshes
+  // history and keeps the generation, so the user's own fetches in flight
+  // still land.
+  const onEngine = (st) => {
     if (!st || typeof st !== 'object') return;
     const again = retrySeq !== '' && st.seq === retrySeq && st.seq === acceptedSeq;
     if (!again && !newer(st.seq, acceptedSeq)) return;
@@ -729,6 +873,33 @@
       if (failures >= quickRetries) loadNote('trying');
       setTimeout(checkState, retryDelays[Math.min(failures, retryDelays.length) - 1]);
     });
+  };
+
+  // --- The inbox's count ---
+
+  const strOf = (v) => (typeof v === 'string' ? v : '');
+
+  // applyInbox shows ib, the inbox's state, if its rev is newer than any
+  // accepted so far. The reader's label is the client's own name: it is
+  // shown as text, never as markup.
+  const applyInbox = (ib) => {
+    if (!ib || typeof ib !== 'object' || !newer(ib.rev, acceptedRev)) return;
+    acceptedRev = ib.rev;
+    document.body.dataset.rev = acceptedRev;
+    const asks = strOf(ib.asks);
+    const e = $('inbox');
+    e.hidden = !asks || asks === '0';
+    e.textContent = asks + (asks === '1' ? ' ask' : ' asks') + ' · ' + strOf(ib.unread) + ' unread' +
+      (strOf(ib.read_by) ? ' · read by ' + ib.read_by : '');
+  };
+
+  // onState takes an envelope: the engine's state and the inbox's, each
+  // accepted by its own revision. Neither part's arrival resets the
+  // other's state or the generation.
+  const onState = (env) => {
+    if (!env || typeof env !== 'object') return;
+    applyInbox(env.inbox);
+    onEngine(env.engine);
   };
 
   // --- The connection ---
@@ -772,11 +943,13 @@
   // run is no longer pollRun stops, before and after each read.
   const poll = async (run) => {
     if (run !== pollRun) return;
-    const before = acceptedSeq;
+    const seqBefore = acceptedSeq;
+    const revBefore = acceptedRev;
     const r = await checkState();
     if (run !== pollRun) return;
     if (r === 'ok') banner('quiet', PAUSED);
-    pollStep = acceptedSeq !== before ? 0 : Math.min(pollStep + 1, pollDelays.length - 1);
+    const moved = acceptedSeq !== seqBefore || acceptedRev !== revBefore;
+    pollStep = moved ? 0 : Math.min(pollStep + 1, pollDelays.length - 1);
     polls++;
     if (polls % 3 === 0 && stream && stream.readyState === EventSource.CLOSED) connect();
     if (run === pollRun) setTimeout(() => poll(run), pollDelays[pollStep]);
@@ -808,9 +981,9 @@
     }
   };
 
-  const onStreamState = (st) => {
+  const onStreamState = (env) => {
     epoch++;
-    onState(st);
+    onState(env);
   };
 
   const connect = () => {
@@ -818,6 +991,30 @@
   };
 
   // --- Wiring ---
+
+  // The page registers no service worker. One that controls it was put
+  // there by something else, such as a program that held this port while
+  // the hub was down, and can read and change all the page shows.
+  const workerWarning = () => {
+    const sw = navigator.serviceWorker;
+    if (!sw || !sw.controller) return;
+    const e = $('sw-warn');
+    e.textContent = 'A service worker that perf-agent did not install controls this page: it can read and change ' +
+      "what you see. Close every tab of this address, clear this site's data in the browser, and open the page " +
+      'URL again while perf-agent-hub runs.';
+    e.hidden = false;
+  };
+  workerWarning();
+  if (navigator.serviceWorker) navigator.serviceWorker.addEventListener('controllerchange', workerWarning);
+
+  // The ask chip is the live page's own, so it is made here rather than
+  // in the shared panel: the static page has no server to ask.
+  const askBtn = make('button', 'chip', 'Ask my agent about this');
+  askBtn.type = 'button';
+  askBtn.id = 'ask-btn';
+  askBtn.title = "Puts this frame in your agent's inbox; your agent reads it with page_state";
+  askBtn.disabled = true;
+  $('focus-btn').after(askBtn);
 
   panel = perfAgentPanel(panelModel, {
     frameById: (id) => (view ? view.frames.get(id) : undefined),
@@ -864,6 +1061,7 @@
   });
   $('focus-btn').addEventListener('click', focusHere);
   $('whole-btn').addEventListener('click', wholeView);
+  askBtn.addEventListener('click', askAgent);
   document.addEventListener('click', (ev) => {
     const chip = ev.target.closest('[data-prompt]');
     if (chip) {

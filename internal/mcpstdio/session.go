@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -22,10 +21,10 @@ type session struct {
 	hctx    context.Context
 	hcancel context.CancelFunc
 	out     *outQueue
-	// initialized is set by the dispatcher once the answer to initialize
-	// is enqueued, so a Control call answered on the reader after it
-	// cannot overtake that answer.
-	initialized atomic.Bool
+	// proto is the protocol state. Its initialized flag is set by the
+	// dispatcher once the answer to initialize is enqueued, so a Control
+	// call answered on the reader after it cannot overtake that answer.
+	proto *Session
 
 	wake       chan struct{} // cap 1: the dispatcher has work or must stop
 	inputEnded chan struct{} // closed when the reader stops
@@ -52,8 +51,9 @@ type request struct {
 }
 
 type (
-	sessionKey struct{}
-	requestKey struct{}
+	sessionKey  struct{}
+	requestKey  struct{}
+	receivedKey struct{}
 )
 
 func (s *Server) newSession(ctx context.Context, w io.Writer) *session {
@@ -63,10 +63,11 @@ func (s *Server) newSession(ctx context.Context, w io.Writer) *session {
 		wake:       make(chan struct{}, 1),
 		inputEnded: make(chan struct{}),
 		dispatched: make(chan struct{}),
+		proto:      NewSession(),
 	}
 	// The handlers' contexts do not inherit ctx's cancellation: end
 	// cancels them after OnClose, on every path, ctx's end included.
-	ss.hctx, ss.hcancel = context.WithCancel(context.WithValue(context.WithoutCancel(ctx), sessionKey{}, ss))
+	ss.hctx, ss.hcancel = context.WithCancel(context.WithValue(withSession(context.WithoutCancel(ctx), ss.proto), sessionKey{}, ss))
 	return ss
 }
 
@@ -285,8 +286,8 @@ func (ss *session) take(line []byte, oversized bool) {
 		}
 		return
 	}
-	if ss.initialized.Load() && ss.s.isControlCall(env) {
-		if out, _ := ss.answer(ss.hctx, env); out != nil {
+	if ss.proto.Initialized() && ss.s.isControlCall(env) {
+		if out, _ := ss.s.answer(ss.hctx, ss.proto, env); out != nil {
 			ss.sendAnswer(env, out)
 		}
 		return
@@ -304,7 +305,7 @@ func (ss *session) take(line []byte, oversized bool) {
 		ss.send(errorResponse(env.ID, codeServerBusy, fmt.Sprintf("server busy: %d requests queued; retry", ss.s.o.MaxQueued)))
 		return
 	}
-	ss.queue = append(ss.queue, &request{env: env, key: compactID(env.ID), received: time.Now()})
+	ss.queue = append(ss.queue, &request{env: env, key: CompactID(env.ID), received: time.Now()})
 	ss.mu.Unlock()
 	ss.wakeDispatcher()
 }
@@ -334,7 +335,7 @@ func (ss *session) cancelRequest(params json.RawMessage) {
 	if json.Unmarshal(params, &p) != nil || !validID(p.RequestID) {
 		return
 	}
-	key := compactID(p.RequestID)
+	key := CompactID(p.RequestID)
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	if r := ss.running; r != nil && r.key == key {
@@ -347,7 +348,9 @@ func (ss *session) cancelRequest(params json.RawMessage) {
 	}
 }
 
-func compactID(raw json.RawMessage) string {
+// CompactID is a JSON-RPC id as compact JSON, the key a request is held
+// under in its session, so 7 and "7" are distinct and spacing is not.
+func CompactID(raw json.RawMessage) string {
 	var b bytes.Buffer
 	if json.Compact(&b, raw) != nil {
 		return string(raw)
@@ -364,7 +367,7 @@ func (ss *session) dispatch() {
 		if r == nil {
 			return
 		}
-		out, initialized := ss.answer(ctx, r.env)
+		out, initialized := ss.s.answer(ctx, ss.proto, r.env)
 		ss.mu.Lock()
 		ss.running = nil
 		dropped := r.cancelled
@@ -374,7 +377,7 @@ func (ss *session) dispatch() {
 			ss.sendAnswer(r.env, out)
 		}
 		if initialized {
-			ss.initialized.Store(true)
+			ss.proto.initialized.Store(true)
 		}
 	}
 }
@@ -431,19 +434,19 @@ func (ss *session) next() (*request, context.Context) {
 
 // answer handles one request and returns its response, and whether it
 // completed initialize.
-func (ss *session) answer(ctx context.Context, env *envelope) (*outgoing, bool) {
+func (s *Server) answer(ctx context.Context, ps *Session, env *envelope) (*outgoing, bool) {
 	// Unknown methods (server/discover included) answer method-not-found even
 	// before initialize so clients can fall back to the initialize handshake.
-	if env.Method != "initialize" && env.Method != "ping" && !ss.initialized.Load() && knownMethods[env.Method] {
+	if env.Method != "initialize" && env.Method != "ping" && !ps.Initialized() && knownMethods[env.Method] {
 		return errorResponse(env.ID, codeInvalidRequest, "send initialize first"), false
 	}
-	result, rerr := ss.s.handle(ctx, env.Method, env.Params)
+	result, rerr := s.handle(ctx, ps, env.Method, env.Params)
 	if rerr != nil {
 		return errorResponse(env.ID, rerr.Code, rerr.Message), false
 	}
 	raw, err := marshal(result)
 	if err != nil {
-		ss.s.warn("marshal result", "", slog.LevelError, "method", env.Method, "err", err)
+		s.warn("marshal result", "", slog.LevelError, "method", env.Method, "err", err)
 		return errorResponse(env.ID, codeInternalError, "internal error"), false
 	}
 	return &outgoing{JSONRPC: "2.0", ID: env.ID, Result: raw}, env.Method == "initialize"
@@ -496,8 +499,12 @@ func Progress(ctx context.Context, progress, total float64, message string) bool
 
 // Received is when the request ctx belongs to was read from the client,
 // before it waited in the queue; ok is false for a context of no queued
-// request (a Control call runs as it is read).
+// request (a Control call runs as it is read). A time set with
+// WithReceived takes precedence over the request's own.
 func Received(ctx context.Context) (at time.Time, ok bool) {
+	if t, ok := ctx.Value(receivedKey{}).(time.Time); ok {
+		return t, true
+	}
 	r, ok := ctx.Value(requestKey{}).(*request)
 	if !ok {
 		return time.Time{}, false

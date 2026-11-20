@@ -49,7 +49,8 @@ type listArgs struct {
 
 // listJob is a job of this server as capture_list shows it: its state,
 // with its number in the series (id) and its capture id (capture,
-// series/NNN), as the history's rows name them.
+// series/NNN), as the history's rows name them, and by, the label of the
+// session that started it ("" for none).
 type listJob struct {
 	Job     string `json:"job"`
 	ID      string `json:"id,omitzero"`
@@ -61,6 +62,7 @@ type listJob struct {
 	Derived string `json:"derived,omitzero"`
 	Series  string `json:"series"`
 	Label   string `json:"label"`
+	By      string `json:"by,omitzero"`
 }
 
 // seriesRow is a series of the capture directory: its captures (marker-
@@ -154,22 +156,22 @@ const (
 // pool, waiting at most listWait for it.
 func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.Result, error) {
 	if s.captureDisabled != "" {
-		return toolError(s.disabledError(), nil), nil
+		return s.toolError(s.disabledError(), nil), nil
 	}
 	var a listArgs
 	if err := decodeArgs("capture_list", raw, &a); err != nil {
-		return toolError(invalidArgument(argsNext, "%s", err.Error()), nil), nil
+		return s.toolError(invalidArgument(argsNext, "%s", err.Error()), nil), nil
 	}
 	series := ""
 	if a.Series != nil {
 		if !validSeries(*a.Series) {
-			return toolError(invalidArgument("pass a series as capture_list without series shows them", "series %q is not a series name", echo(*a.Series)), nil), nil
+			return s.toolError(invalidArgument("pass a series as capture_list without series shows them", "series %q is not a series name", echo(*a.Series)), nil), nil
 		}
 		series = *a.Series
 	}
 	limit, err := s.pageLimit(a.Limit)
 	if err != nil {
-		return toolError(invalidArgument(fmt.Sprintf("pass limit from 1 to %d, or leave it out", s.lim.MaxRows), "%s", err.Error()), nil), nil
+		return s.toolError(invalidArgument(fmt.Sprintf("pass limit from 1 to %d, or leave it out", s.lim.MaxRows), "%s", err.Error()), nil), nil
 	}
 
 	var out listAnswer
@@ -184,7 +186,7 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 				v := j.view()
 				_, num, _ := strings.Cut(v.ID, "/")
 				out.Jobs = append(out.Jobs, listJob{Job: v.Job, ID: num, Capture: v.ID, Status: v.Status, Phase: v.Phase,
-					Elapsed: v.Elapsed, ETA: v.ETA, Derived: v.Derived, Series: js, Label: label})
+					Elapsed: v.Elapsed, ETA: v.ETA, Derived: v.Derived, Series: js, Label: label, By: j.by})
 			}
 		}
 	}
@@ -216,7 +218,7 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 		out.Captures = s.withHandles(out.Captures)
 	}
 	if err != nil {
-		return toolError(invalidArgument("call capture_list again without cursor for the first page, then pass the next_cursor it answers", "%s", err.Error()), nil), nil
+		return s.toolError(invalidArgument("call capture_list again without cursor for the first page, then pass the next_cursor it answers", "%s", err.Error()), nil), nil
 	}
 	out.TotalRows, out.Skipped, out.OmittedCount = number(info.TotalRows), number(info.Skipped), number(info.OmittedCount)
 	out.NextCursor = info.NextCursor
@@ -225,7 +227,7 @@ func (s *Server) handleList(ctx context.Context, raw json.RawMessage) (mcpstdio.
 		return mcpstdio.Result{}, err
 	}
 	if len(b) > s.lim.MaxResponseBytes {
-		return toolError(invalidArgument(shrinkWithLimit, "the capture_list answer is %d bytes, over MaxResponseBytes=%d", len(b), s.lim.MaxResponseBytes), nil), nil
+		return s.toolError(invalidArgument(shrinkWithLimit, "the capture_list answer is %d bytes, over MaxResponseBytes=%d", len(b), s.lim.MaxResponseBytes), nil), nil
 	}
 	return mcpstdio.Result{Text: string(b)}, nil
 }

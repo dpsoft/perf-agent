@@ -46,7 +46,7 @@ func ResolveCommand(name, pathEnv string, allow []string) (string, *Error) {
 		}
 	}
 	if len(allow) > 0 && !slices.Contains(allow, resolved) {
-		return "", Errorf(CodeInvalidArgument, "use one of the programs perf-agent-mcp was started with --capture-command",
+		return "", Errorf(CodeInvalidArgument, "use one of the programs "+CommandMark+" was started with --capture-command",
 			"%s is not one of the --capture-command programs", echo(resolved))
 	}
 	return resolved, nil

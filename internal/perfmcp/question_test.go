@@ -101,6 +101,9 @@ func TestQuestionIsNormalisedOrRefused(t *testing.T) {
 		{"\u0645\u0631\u062d\u0628\u0627\u200f \u200eok\u061c?", "\u0645\u0631\u062d\u0628\u0627 ok?"},
 		{"\u200f why? \u200e", "why?"},
 		{"\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645", "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645"},
+		{"🏳\ufe0f\u200d🌈 flag", "🏳\ufe0f\u200d🌈 flag"},
+		{"why\u00a0is\u2003this\u3000hot?\u202f\u205f really", "why is this hot? really"},
+		{"a  \t\r\n  b\u2009\u200a", "a b"},
 	} {
 		got, err := normalizeQuestion(tc.in)
 		if err != nil || got != tc.want {
@@ -131,6 +134,22 @@ func TestQuestionIsNormalisedOrRefused(t *testing.T) {
 		{"a selector with no base", "\ufe0fSECRET", "invisible"},
 		{"a supplementary selector", "SECRETx\U000e0100", "invisible"},
 		{"a plain selector", "SECRETx\ufe00", "invisible"},
+		{"80 alternating joiners", "SECRET Why?" + strings.Repeat("\u200c\u200d", 40), "invisible"},
+		{"joiners between letters, two in a row", "SECRET a\u200d\u200cb", "invisible"},
+		{"a leading joiner", "\u200dSECRET", "invisible"},
+		{"a trailing joiner", "SECRET\u200c", "invisible"},
+		{"a joiner before a selector", "SECRET a\u200d\ufe0f", "invisible"},
+		{"a joiner after a filler", "SECRET a\u3164\u200db", "invisible"},
+		{"a combining grapheme joiner", "SECRET a\u034fb", "invisible"},
+		{"a Hangul choseong filler", "SECRET \u115f", "invisible"},
+		{"a Hangul jungseong filler", "SECRET \u1160", "invisible"},
+		{"a Khmer inherent vowel", "SECRET \u17b4\u17b5", "invisible"},
+		{"a Mongolian selector", "SECRET \u180bx", "invisible"},
+		{"a Mongolian selector four", "SECRET x\u180f", "invisible"},
+		{"a Hangul filler", "SECRET \u3164", "invisible"},
+		{"a halfwidth Hangul filler", "SECRET \uffa0", "invisible"},
+		{"an unassigned ignorable", "SECRET x\U000e0fff", "invisible"},
+		{"an ignorable past the selectors", "SECRET x\U000e0200", "invisible"},
 	} {
 		got, err := normalizeQuestion(tc.in)
 		if err == nil || !strings.Contains(err.Error(), tc.reason) {

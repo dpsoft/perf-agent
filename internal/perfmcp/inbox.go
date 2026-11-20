@@ -142,12 +142,12 @@ func resolveReport(snap *liveSnapshot, r PageReport) (reported, error) {
 }
 
 // normalizeQuestion is q as the inbox keeps it: only text the person can
-// see. Its line breaks and tabs are folded to spaces, its directional marks
-// stripped and the space around it trimmed; "" is no question. It refuses q
-// when it is not UTF-8, holds any other control character (C0, DEL or C1),
-// a bidirectional embedding, override or isolate, an invisible character
-// (see invisibleIn), or is left with more than 280 characters. The reason
-// never repeats q.
+// see. Its line breaks, tabs and spaces of every width are folded to one
+// space, its directional marks stripped and the space around it trimmed;
+// "" is no question. It refuses q when it is not UTF-8, holds any other
+// control character (C0, DEL or C1), a bidirectional embedding, override
+// or isolate, an invisible character (see invisibleIn), or is left with
+// more than 280 characters. The reason never repeats q.
 func normalizeQuestion(q string) (string, error) {
 	if !utf8.ValidString(q) {
 		return "", errors.New("the question is not valid UTF-8")
@@ -159,10 +159,17 @@ func normalizeQuestion(q string) (string, error) {
 	if strings.ContainsFunc(q, isBidiControl) {
 		return "", errors.New("the question holds a bidirectional formatting character; send it as plain text")
 	}
+	// Every Zs space becomes U+0020, and Fields then collapses each run
+	// of spaces to one and trims the ends.
+	q = strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		if unicode.Is(unicode.Zs, r) {
+			return ' '
+		}
+		return r
+	}, q)), " ")
 	if invisibleIn(q) {
 		return "", errors.New("the question holds an invisible formatting character; send it as plain text")
 	}
-	q = strings.TrimSpace(q)
 	if utf8.RuneCountInString(q) > maxQuestionRunes {
 		return "", fmt.Errorf("the question is over %d characters", maxQuestionRunes)
 	}
@@ -175,35 +182,56 @@ func isBidiControl(r rune) bool {
 	return r >= '\u202a' && r <= '\u202e' || r >= '\u2066' && r <= '\u2069'
 }
 
-// isVariationSelector reports whether r selects a variant of the
-// character before it.
-func isVariationSelector(r rune) bool {
-	return r >= '\ufe00' && r <= '\ufe0f' || r >= '\U000e0100' && r <= '\U000e01ef'
+// isIgnorable reports whether r is a default-ignorable character that is
+// not a format character: the combining grapheme joiner, the Hangul
+// fillers, the Khmer inherent vowels, the Mongolian free variation
+// selectors, the variation selectors, and the whole U+E0000 to U+E0FFF
+// block, assigned or not.
+func isIgnorable(r rune) bool {
+	switch {
+	case r == '\u034f', r == '\u115f', r == '\u1160', r == '\u17b4', r == '\u17b5', r == '\u3164', r == '\uffa0':
+		return true
+	case r >= '\u180b' && r <= '\u180f', r >= '\ufe00' && r <= '\ufe0f', r >= '\U000e0000' && r <= '\U000e0fff':
+		return true
+	}
+	return false
 }
+
+// isJoiner reports whether r is the zero-width non-joiner or joiner.
+func isJoiner(r rune) bool { return r == '\u200c' || r == '\u200d' }
+
+// isVisible reports whether r is drawn on its own: neither a format
+// character nor default-ignorable.
+func isVisible(r rune) bool { return !unicode.Is(unicode.Cf, r) && !isIgnorable(r) }
 
 // invisibleIn reports whether q holds a character that is not drawn but
 // that an agent reading q would still read: any format character (Cf: the
 // tag characters, which can spell a whole hidden sentence, zero-width
-// spaces and joiners, the BOM, the soft hyphen, the interlinear
-// annotations) other than the zero-width non-joiner and joiner, which
-// scripts and emoji need; every tag character, assigned or not; and any
-// variation selector but one text or emoji presentation selector (U+FE0E,
-// U+FE0F) right after a character that is not itself a selector.
+// spaces, the BOM, the soft hyphen, the interlinear annotations) or other
+// default-ignorable character, with two exceptions that scripts and emoji
+// need. One text or emoji presentation selector (U+FE0E, U+FE0F) may follow
+// a visible character. A zero-width non-joiner or joiner may stand between
+// two visible characters, never beside another joiner, so it carries no
+// hidden run of bits; the character before a joiner may also be an emoji
+// presentation selector that follows a visible one, as in an emoji ZWJ
+// sequence such as the rainbow flag.
 func invisibleIn(q string) bool {
-	prev := rune(-1)
-	for _, r := range q {
+	rs := []rune(q)
+	visibleAt := func(i int) bool { return i >= 0 && i < len(rs) && isVisible(rs[i]) }
+	for i, r := range rs {
 		switch {
-		case r == '\u200c', r == '\u200d':
-		case r >= '\U000e0000' && r <= '\U000e007f':
-			return true
-		case r == '\ufe0e', r == '\ufe0f':
-			if prev < 0 || isVariationSelector(prev) {
+		case isJoiner(r):
+			before := visibleAt(i-1) || i >= 1 && rs[i-1] == '\ufe0f' && visibleAt(i-2)
+			if !before || !visibleAt(i+1) {
 				return true
 			}
-		case isVariationSelector(r), unicode.Is(unicode.Cf, r):
+		case r == '\ufe0e', r == '\ufe0f':
+			if !visibleAt(i - 1) {
+				return true
+			}
+		case !isVisible(r):
 			return true
 		}
-		prev = r
 	}
 	return false
 }

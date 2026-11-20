@@ -28,7 +28,7 @@ var skillArgs = []string{
 	"comparability", "status", "done", "interrupted", "derived", "capture_id",
 	"sample_rate", "start_time", "perf_agent_exit",
 	// page_state's answer.
-	"asks", "user",
+	"asks", "user", "question", "question_source",
 }
 
 // captureCodes are the capture failure codes, which the skill may cite.

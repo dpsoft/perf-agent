@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -54,7 +55,8 @@ func TestLiveShellHasNoInlineScriptOrStyle(t *testing.T) {
 	}
 
 	for _, id := range []string{"chart", "sel-ref", "sel-name", "sel-id", "facts", "exp", "noexp", "path", "chips", "copybox", "toast",
-		"pubs", "banner", "rejected", "pills", "notes", "quality", "rows", "legend", "axis", "export", "focus-btn", "whole-btn", "inbox", "by", "sw-warn"} {
+		"pubs", "banner", "rejected", "pills", "notes", "quality", "rows", "legend", "axis", "export", "focus-btn", "whole-btn", "inbox", "by", "sw-warn",
+		"ask-q", "ask-send", "ask-last"} {
 		assert.Equal(t, 1, strings.Count(shell, ` id="`+id+`"`), "region %s", id)
 	}
 	assert.Contains(t, shell, `<link rel="stylesheet" href="assets/live.css">`)
@@ -67,6 +69,13 @@ func TestLiveShellHasNoInlineScriptOrStyle(t *testing.T) {
 	assert.Less(t, strings.Index(shell, `id="inbox"`), strings.Index(shell, `id="pills"`), "the count sits before the pills")
 	assert.Regexp(t, `<span [^>]*id="by"[^>]*\bhidden\b`, shell, "no label before the first state")
 	assert.Regexp(t, `<div [^>]*id="sw-warn"[^>]*\bhidden\b`, shell)
+	// The question field is the side panel's, single-line, bounded and
+	// off until a frame is selected.
+	assert.Regexp(t, `<input [^>]*type="text"[^>]*id="ask-q"[^>]*maxlength="560"[^>]*placeholder="Ask about this frame…"[^>]*\bdisabled\b`, shell)
+	assert.Regexp(t, `<button [^>]*id="ask-send"[^>]*\bdisabled\b[^>]*>Ask</button>`, shell)
+	assert.Regexp(t, `<p [^>]*id="ask-last"[^>]*\bhidden\b`, shell)
+	_, side, _ := strings.Cut(shell, `<aside class="side"`)
+	assert.Contains(t, side, `id="ask-q"`, "the field is in the side panel")
 }
 
 // fetchArgs are the argument lists of every fetch and EventSource call.
@@ -372,6 +381,10 @@ type liveDOM struct {
 	AskOff     bool     `json:"ask_disabled"`
 	AskText    string   `json:"ask_text"`
 	Seq        string   `json:"seq"`
+	AskQ       string   `json:"ask_q"`
+	AskQOff    bool     `json:"ask_q_disabled"`
+	AskSendOff bool     `json:"ask_send_disabled"`
+	AskLast    string   `json:"ask_last"`
 }
 
 const domProbe = `(() => {
@@ -416,6 +429,10 @@ const domProbe = `(() => {
     ask_disabled: !$('ask-btn') || $('ask-btn').disabled,
     ask_text: $('ask-btn') ? $('ask-btn').textContent : '',
     seq: document.body.dataset.seq || '',
+    ask_q: $('ask-q') ? $('ask-q').value : '',
+    ask_q_disabled: !$('ask-q') || $('ask-q').disabled,
+    ask_send_disabled: !$('ask-send') || $('ask-send').disabled,
+    ask_last: $('ask-last') && !$('ask-last').hidden ? $('ask-last').textContent : '',
   });
 })()`
 
@@ -498,6 +515,7 @@ type liveServer struct {
 	reports    []map[string]string // the inbox's reports, in order
 	answer     map[string]int      // node -> the inbox's status for a report about it; 204 otherwise
 	answerOnce map[string][]int    // node -> statuses for its next reports, first first, before answer
+	refusal    string              // the reason a 422 gives; the frame's absence when empty
 	guard      http.Handler        // the real inbox guard in front of inbox
 	guarded    []int               // the status of every POST inbox, the guard's refusals included
 	tok        livehttp.Token
@@ -699,8 +717,13 @@ func (s *liveServer) inbox(w http.ResponseWriter, r *http.Request) {
 	if code == http.StatusTooManyRequests {
 		w.Header().Set("Retry-After", "1")
 	}
+	refusal := cmp.Or(s.refusal, "the frame is not in the publication; the page will refresh")
 	s.mu.Unlock()
 	s.wait(r, "inbox")
+	if code == http.StatusUnprocessableEntity {
+		http.Error(w, "invalid page report: "+refusal, code)
+		return
+	}
 	w.WriteHeader(code)
 }
 
@@ -2059,4 +2082,201 @@ func countOf(list []string, s string) int {
 		}
 	}
 	return n
+}
+
+// liveQuestion is an ask as the page sends it with a typed question.
+func liveQuestion(pub string, node, focus profilemodel.NodeID, question string) map[string]string {
+	r := liveReport("ask", pub, node, focus)
+	r["question"] = question
+	return r
+}
+
+// typeQuestion types q into the question field, as a paste would, and
+// presses Enter in it.
+func typeQuestion(tab *liveTab, q string) {
+	js, err := json.Marshal(q)
+	if err != nil {
+		panic(err)
+	}
+	tab.eval(`(() => {
+  const e = document.getElementById('ask-q');
+  e.focus();
+  e.value = ` + string(js) + `;
+  e.dispatchEvent(new Event('input', {bubbles: true}));
+  e.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true, cancelable: true}));
+  return '';
+})()`)
+}
+
+// liveInboxAsked is the inbox part of an envelope whose newest ask has a
+// question.
+func liveInboxAsked(rev, asks, unread, readBy, question string) string {
+	out, err := json.Marshal(map[string]string{"rev": rev, "asks": asks, "unread": unread, "read_by": readBy, "question": question})
+	if err != nil {
+		panic(err)
+	}
+	return string(out)
+}
+
+// The side panel's question field: off with no frame selected; Enter or
+// Ask sends the selected frame's ask with the question at once, past the
+// queue selections wait in, and clears the field once the hub took it. A
+// refusal says why without the question, and keeps it to edit. The newest
+// ask's question, from the envelope, is shown as text, however hostile.
+func TestLivePageQuestionInChrome(t *testing.T) {
+	c := startChrome(t)
+	f := newLiveFixture(t)
+
+	t.Run("the field waits for a selection", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("0", "", "", ""), nil)
+		tab.waitFor("the waiting text", func(d liveDOM) bool { return d.Waiting })
+		time.Sleep(200 * time.Millisecond)
+		d := tab.dom()
+		assert.True(t, d.AskQOff, "no selection, no field")
+		assert.True(t, d.AskSendOff)
+		assert.Equal(t, "Ask about this frame…", tab.eval(`document.getElementById('ask-q').placeholder`))
+		assert.Equal(t, "560", tab.eval(`String(document.getElementById('ask-q').maxLength)`), "room for 280 characters of two UTF-16 units")
+		// A question typed with nothing selected is not sent.
+		typeQuestion(tab, "anything?")
+		s.push(liveState("1", "p1", "", "", "p1"))
+		tab.waitFor("seq 1", func(d liveDOM) bool { return len(d.Frames) > 0 && d.Seq == "1" })
+		clickFrame(tab, "a")
+		d = tab.waitFor("a selected", func(d liveDOM) bool { return d.SelName == "a" && !d.AskQOff && !d.AskSendOff })
+		waitReports(t, s, 1)
+		assert.Equal(t, "anything?", d.AskQ, "the unsent question is still there")
+		// An empty field sends nothing.
+		typeQuestion(tab, "   ")
+		time.Sleep(400 * time.Millisecond)
+		assert.Equal(t, []map[string]string{liveReport("select", "p1", f.a, "")}, s.reportsSeen())
+		assert.Empty(t, tab.dom().Toast)
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("Enter sends the question and clears the field", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), nil)
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.AskQOff })
+		typeQuestion(tab, "  why is b hot?  ")
+		d := tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast != "" })
+		assert.Equal(t, liveAskSent, d.Toast)
+		assert.Equal(t, []map[string]string{liveQuestion("p1", f.b, "", "why is b hot?")}, s.reportsSeen())
+		d = tab.waitFor("the field cleared", func(d liveDOM) bool { return d.AskQ == "" })
+		assert.Equal(t, "b", d.SelName, "a question moves nothing on the page")
+		assert.Equal(t, "1", d.Seq)
+		assert.Equal(t, "0", d.Rev, "only an envelope moves the inbox")
+		// The Ask button sends too.
+		tab.eval(`document.getElementById('toast').textContent = '', ''`)
+		tab.eval(`(() => { const e = document.getElementById('ask-q'); e.value = 'and its callers?'; e.dispatchEvent(new Event('input')); document.getElementById('ask-send').click(); return ''; })()`)
+		tab.waitFor("the second toast", func(d liveDOM) bool { return d.Toast == liveAskSent && d.AskQ == "" })
+		assert.Equal(t, liveQuestion("p1", f.b, "", "and its callers?"), waitReports(t, s, 2)[1])
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a question does not wait behind a selection", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), func(s *liveServer) {
+			s.setDelay("inbox", 2*time.Second)
+		})
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.AskQOff })
+		clickFrame(tab, "a")
+		tab.waitFor("a selected", func(d liveDOM) bool { return d.SelName == "a" })
+		// The select is in flight, its answer held 2 s; the question is
+		// posted beside it rather than after it.
+		waitReports(t, s, 1)
+		start := time.Now()
+		typeQuestion(tab, "what calls a?")
+		reps := waitReports(t, s, 2)
+		assert.Less(t, time.Since(start), 1500*time.Millisecond, "the ask was not queued behind the select")
+		assert.Equal(t, []map[string]string{liveReport("select", "p1", f.a, ""), liveQuestion("p1", f.a, "", "what calls a?")}, reps)
+		tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast == liveAskSent })
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a 422 says why, without the question", func(t *testing.T) {
+		const secret = "SECRET question text"
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), func(s *liveServer) {
+			s.answer[string(f.b)] = http.StatusUnprocessableEntity
+			s.refusal = "the question is over 280 characters"
+		})
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.AskQOff })
+		typeQuestion(tab, secret)
+		d := tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast != "" })
+		assert.Equal(t, "Your question could not be sent: the question is over 280 characters", d.Toast)
+		assert.NotContains(t, d.Toast, "SECRET")
+		assert.Equal(t, secret, d.AskQ, "a refused question stays in the field to edit")
+		assert.Len(t, s.reportsSeen(), 1)
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("280 emoji can be typed and sent; 281 characters are refused here", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), nil)
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.AskQOff })
+		emoji := strings.Repeat("😀", 280)
+		// Typed as the user types, so the field's maxlength applies; one
+		// more emoji does not fit.
+		tab.eval(`(() => { const e = document.getElementById('ask-q'); e.focus(); document.execCommand('insertText', false, '` + emoji + `😀'); return ''; })()`)
+		assert.Equal(t, "280", tab.eval(`String([...document.getElementById('ask-q').value].length)`))
+		tab.eval(`document.getElementById('ask-q').dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true, cancelable: true})), ''`)
+		d := tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast != "" })
+		assert.Equal(t, liveAskSent, d.Toast)
+		assert.Equal(t, []map[string]string{liveQuestion("p1", f.b, "", emoji)}, s.reportsSeen())
+		// 281 characters fit the field's 560 units, but the page refuses
+		// them as the hub would, and sends nothing.
+		tab.eval(`document.getElementById('toast').textContent = '', ''`)
+		long := "SECRET" + strings.Repeat("x", 275)
+		typeQuestion(tab, long)
+		d = tab.waitFor("the refusal", func(d liveDOM) bool { return d.Toast != "" })
+		assert.Equal(t, "Your question could not be sent: the question is over 280 characters", d.Toast)
+		assert.Equal(t, long, d.AskQ)
+		time.Sleep(200 * time.Millisecond)
+		assert.Len(t, s.reportsSeen(), 1, "the page sent nothing")
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("a 429 is tried again once", func(t *testing.T) {
+		s, tab := newLivePage(t, c, f, liveState("1", "p1", f.b, "", "p1"), func(s *liveServer) {
+			s.answerOnce[string(f.b)] = []int{http.StatusTooManyRequests}
+		})
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" && !d.AskQOff })
+		start := time.Now()
+		typeQuestion(tab, "why?")
+		d := tab.waitFor("the toast", func(d liveDOM) bool { return d.Toast != "" })
+		assert.Equal(t, liveAskSent, d.Toast)
+		assert.GreaterOrEqual(t, time.Since(start), 900*time.Millisecond, "after Retry-After")
+		assert.Equal(t, []map[string]string{liveQuestion("p1", f.b, "", "why?"), liveQuestion("p1", f.b, "", "why?")}, s.reportsSeen())
+		assert.Equal(t, "", d.AskQ)
+		assert.Empty(t, tab.errors())
+	})
+
+	t.Run("hostile questions are shown as text", func(t *testing.T) {
+		seq1 := engineState("1", "p1", f.b, "", "p1")
+		s, tab := newLivePage(t, c, f, envelope(seq1, noAsks), nil)
+		tab.waitFor("seq 1", func(d liveDOM) bool { return d.SelName == "b" })
+		assert.Empty(t, tab.dom().AskLast, "no ask, no question shown")
+		for i, q := range []string{
+			`</script><script>window.pwned=1</script>`,
+			`<img src=x onerror="window.pwned=1">`,
+			"\u202egnp.exe why?",
+			"👨\u200d👩\u200d👧 zero\u200bwidth",
+			strings.Repeat("😀", 280),
+		} {
+			rev := strconv.Itoa(i + 1)
+			s.push(envelope(seq1, liveInboxAsked(rev, rev, "1", "", q)))
+			d := tab.waitFor("question "+rev, func(d liveDOM) bool { return d.Rev == rev })
+			assert.Equal(t, "Latest question: "+q+" · not read yet", d.AskLast)
+			assert.Equal(t, 0, d.Images)
+			assert.Equal(t, 0, d.Violations)
+			assert.Equal(t, "undefined", tab.eval(`String(window.pwned)`))
+			assert.Equal(t, "1", tab.eval(`String(document.querySelectorAll('#ask-last bdi').length)`), "the question is one isolated run of text")
+		}
+		// The read_by line names the reader beside the question.
+		s.push(envelope(seq1, liveInboxAsked("9", "5", "0", `<b>codex</b>`, "is it the allocator?")))
+		d := tab.waitFor("read", func(d liveDOM) bool { return d.Rev == "9" })
+		assert.Equal(t, "Latest question: is it the allocator? · read by <b>codex</b>", d.AskLast)
+		assert.Equal(t, "5 asks · 0 unread · read by <b>codex</b>", d.Inbox)
+		assert.Equal(t, "0", tab.eval(`String(document.querySelectorAll('#ask-last b, #inbox b').length)`))
+		// A newest ask without a question hides the line.
+		s.push(envelope(seq1, liveInbox("10", "6", "1", "")))
+		d = tab.waitFor("a plain ask", func(d liveDOM) bool { return d.Rev == "10" })
+		assert.Empty(t, d.AskLast)
+		assert.Empty(t, tab.errors())
+	})
 }

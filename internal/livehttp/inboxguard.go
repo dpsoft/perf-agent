@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	// maxInboxBody bounds one page report.
-	maxInboxBody = 1024
+	// maxInboxBody bounds one page report: room for an ask's
+	// 280-character question in any script.
+	maxInboxBody = 2048
 	// inboxBodyTimeout bounds the wait for a report's body.
 	inboxBodyTimeout = 2 * time.Second
 )
@@ -34,7 +35,7 @@ type Rate struct{ PerSecond, Burst int }
 //     succeeds here;
 //   - X-Perf-Agent-Page must be 1, else 403;
 //   - the body needs a Content-Length, else 411 (chunked included), of at
-//     most 1024 bytes, else 413;
+//     most 2048 bytes, else 413;
 //   - the bucket, one per guard, must hold a token, else 429 with
 //     Retry-After: 1. Refused requests take none.
 //

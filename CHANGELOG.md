@@ -53,8 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`page_open`, `page_explain`, `page_diff`, `page_show`) and `page_state`:
   "Ask my agent about this" on the page records the frame the user points
   at, and the agent reads those asks and the user's last selection without
-  waiting for another agent's call. Committed captures are published on the
-  page, and the hub captures into `<profiles>/captures-hub`. Its transport
+  waiting for another agent's call. The user can also type a question of at
+  most 280 characters about the selected frame; `page_state` returns it with
+  the ask, labelled as typed on the page, for the agent to answer there.
+  Committed captures are published on the page, and the hub captures into `<profiles>/captures-hub`. Its transport
   is bounded by the new `--limit Hub.*` limits, and a call's wait for
   another agent's by `MaxEngineWait`. See [docs/mcp.md](docs/mcp.md).
 - The stdio `perf-agent-mcp` links no networking package; it has no page

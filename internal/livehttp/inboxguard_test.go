@@ -117,9 +117,9 @@ func TestInboxGuardCSRFMatrix(t *testing.T) {
 			r.ContentLength = -1
 			r.TransferEncoding = []string{"chunked"}
 		}, http.StatusLengthRequired},
-		{"1025 bytes", func(r *http.Request) {
-			r.ContentLength = 1025
-			r.Header.Set("Content-Length", "1025")
+		{"2049 bytes", func(r *http.Request) {
+			r.ContentLength = 2049
+			r.Header.Set("Content-Length", "2049")
 		}, http.StatusRequestEntityTooLarge},
 	}
 	for _, tc := range cases {
@@ -147,9 +147,9 @@ func TestInboxGuardCSRFMatrix(t *testing.T) {
 		t.Errorf("after 20 refused requests: status %d, want 200", w.Code)
 	}
 
-	// 1024 bytes is the limit, not over it.
-	if w := answer(newInboxRig().guard, report(1024)); w.Code != http.StatusOK {
-		t.Errorf("1024 bytes: status %d, want 200", w.Code)
+	// 2048 bytes is the limit, not over it.
+	if w := answer(newInboxRig().guard, report(2048)); w.Code != http.StatusOK {
+		t.Errorf("2048 bytes: status %d, want 200", w.Code)
 	}
 
 	// The bucket holds five; the sixth within the same second is refused.
@@ -198,25 +198,47 @@ func TestInboxGuardWithAnEmptyTokenAdmitsNothing(t *testing.T) {
 
 func TestInboxGuardReadsTheBodyUnderADeadline(t *testing.T) {
 	h := startHubRig(t, nil)
-	conn := h.dial(t)
-	start := time.Now()
-	// Ten bytes announced, three sent.
-	if _, err := io.WriteString(conn, rawRequest("POST", h.inboxPath(), h.inboxHeaders(10))+"{\"k"); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	resp, err := readAnswer(t, conn, 5*time.Second)
-	if resp == nil {
-		t.Fatalf("no answer to a stalled body: %v", err)
-	}
-	d := time.Since(start)
-	if resp.StatusCode != http.StatusRequestTimeout || !resp.Close {
-		t.Errorf("stalled body: status %d close %v, want 408 and close", resp.StatusCode, resp.Close)
-	}
-	if d < 1500*time.Millisecond || d > 4*time.Second {
-		t.Errorf("stalled body answered after %v, want about 2 s", d)
+	// Ten bytes announced and three sent; then the largest body announced
+	// and all but one byte sent: the 2 s deadline holds for both.
+	for _, tc := range []struct{ announced, sent int }{{10, 3}, {2048, 2047}} {
+		conn := h.dial(t)
+		start := time.Now()
+		if _, err := io.WriteString(conn, rawRequest("POST", h.inboxPath(), h.inboxHeaders(tc.announced))+strings.Repeat(" ", tc.sent)); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		resp, err := readAnswer(t, conn, 5*time.Second)
+		if resp == nil {
+			t.Fatalf("no answer to a stalled body of %d bytes: %v", tc.announced, err)
+		}
+		d := time.Since(start)
+		if resp.StatusCode != http.StatusRequestTimeout || !resp.Close {
+			t.Errorf("stalled body of %d bytes: status %d close %v, want 408 and close", tc.announced, resp.StatusCode, resp.Close)
+		}
+		if d < 1500*time.Millisecond || d > 4*time.Second {
+			t.Errorf("stalled body of %d bytes answered after %v, want about 2 s", tc.announced, d)
+		}
 	}
 	if n := h.inbox.calls.Load(); n != 0 {
 		t.Errorf("next called %d times for a body that never arrived", n)
+	}
+}
+
+// A report's body is at most 2048 bytes, room for a 280-character
+// question in any script: 2048 are read whole and handed on, 2049 are
+// refused from the headers and spend no rate.
+func TestTheInboxBodyCapIs2048(t *testing.T) {
+	rig := newInboxRig()
+	var got int
+	rig.guard = newInboxGuard(testPage, Rate{PerSecond: 5, Burst: 1}, rig.clock.now, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got = len(b)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	if w := answer(rig.guard, report(2049)); w.Code != http.StatusRequestEntityTooLarge || got != 0 {
+		t.Errorf("2049 bytes: status %d, next read %d bytes; want 413 and nothing", w.Code, got)
+	}
+	if w := answer(rig.guard, report(2048)); w.Code != http.StatusNoContent || got != 2048 {
+		t.Errorf("2048 bytes: status %d, next read %d bytes; want 204 and 2048", w.Code, got)
 	}
 }
 

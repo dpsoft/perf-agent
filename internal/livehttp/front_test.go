@@ -465,7 +465,7 @@ func TestEveryRefusalIsAnsweredBeforeTheBody(t *testing.T) {
 		{"inbox: text/plain", "POST", h.inboxPath(), with(inbox, "Content-Type", "text/plain"), http.StatusBadRequest},
 		{"inbox: no X-Perf-Agent-Page", "POST", h.inboxPath(), without(inbox, "X-Perf-Agent-Page"), http.StatusForbidden},
 		{"inbox: chunked", "POST", h.inboxPath(), chunked(inbox), http.StatusLengthRequired},
-		{"inbox: 1025 bytes", "POST", h.inboxPath(), with(inbox, "Content-Length", "1025"), http.StatusRequestEntityTooLarge},
+		{"inbox: 2049 bytes", "POST", h.inboxPath(), with(inbox, "Content-Length", "2049"), http.StatusRequestEntityTooLarge},
 	}
 	for _, tc := range cases {
 		conn := h.dial(t)

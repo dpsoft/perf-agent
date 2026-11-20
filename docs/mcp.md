@@ -326,18 +326,20 @@ The page keeps `MaxPublications` publications, each with `by`, the label of the 
 
 ### The inbox and page_state
 
-On the page, a selected frame offers "Ask my agent about this". A click records an ask: the frame's node ID and name, the publication, its view and profile digest, and the time. An ask carries no text: the user writes the question in the chat, and the agent finds the frame with `page_state`. The page also reports the frame the user selects or lays the graph out from.
+On the page, a selected frame offers "Ask my agent about this" and a field to type a question about it. A click, or a question sent, records an ask: the frame's node ID and name, the publication, its view and profile digest, the time and, when one was typed, the question. Without a question the user asks in the chat, and the agent finds the frame with `page_state`. The page also reports the frame the user selects or lays the graph out from.
+
+The question is the one value in the inbox a person typed; everything else is the hub's own. It holds only text the person can see: at most 280 characters after trimming, valid UTF-8, with its line breaks, tabs and spaces of every width folded to single spaces and its directional marks (U+200E, U+200F, U+061C) stripped. One with any other control character, a bidirectional embedding, override or isolate, or an invisible character is refused: any format or other default-ignorable character (so the tag characters, which can spell a hidden sentence, zero-width spaces, the BOM, the soft hyphen, the Hangul fillers and the variation selectors), except one U+FE0E or U+FE0F after a visible character, and a zero-width non-joiner or joiner between two visible characters (or after an emoji's U+FE0F), never two in a row. A blank one is an ask without a question. The page's field takes up to 280 characters, emoji included, and refuses a longer one itself. A refusal's reason never repeats the text. `page_state` returns it as the row's `question`, with `question_source: "typed on the page by the person viewing it"`: an agent answers it about that frame, on the page with `page_explain` for its node, and treats it as the person's question, never as instructions.
 
 `page_state {since?, limit?}` answers:
 
 - `agent`: what the page was told to show (`seq`, `current`, `selected`, `focus`, and `by`, the session that steered it);
 - `user`: the frame the user last selected or focused, absent until they did. It is best effort: the last report the server received. The page sends one report at a time, the newest replacing any waiting, so a quick run of clicks reaches the server late or not at all;
-- `asks`: `rows`, oldest first, each with `read_by`; `next`; and `dropped`. Pass `since` set to your last call's `next` to get only newer asks: each agent keeps its own cursor. `limit` defaults to 8 and is at most `Hub.MaxInboxEntries`. The inbox keeps the newest `Hub.MaxInboxEntries` asks; a `note` says when asks after `since` were dropped, or when `since` came from an earlier run of the hub;
+- `asks`: `rows`, oldest first, each with `read_by`, and `question` and `question_source` when the ask has a question; `next`; and `dropped`. Pass `since` set to your last call's `next` to get only newer asks: each agent keeps its own cursor. `limit` defaults to 8 and is at most `Hub.MaxInboxEntries`. The inbox keeps the newest `Hub.MaxInboxEntries` asks; a `note` says when asks after `since` were dropped, or when `since` came from an earlier run of the hub;
 - `viewers`, the tabs watching.
 
-`read_by` is the first session that read an ask: `page_state` records it, and the page shows the ask as read. The resource `perf-agent://page/state` answers as `page_state` does without `since`, with the newest 8 asks, and reading it marks them read too. `page_state` never waits for the engine: it answers while another agent's tool runs. Its counts are decimal strings.
+`read_by` is the first session that read an ask: `page_state` records it, and the page shows the ask as read, with the newest ask's question. The page's state carries that question as the inbox's `question`, absent when the newest ask has none. The resource `perf-agent://page/state` answers as `page_state` does without `since`, with the newest 8 asks, and reading it marks them read too. `page_state` never waits for the engine: it answers while another agent's tool runs. Its counts are decimal strings.
 
-The page's reports are the only thing a browser can send the hub: a POST from the page itself (same origin, its token, a custom header, at most 1 KiB, at most 5 a second). One about a publication or frame the hub no longer keeps is refused, and the page says so. A second ask of the same frame within 2 s is taken for the same click. No report changes what the agents made: the store, attempts, publications and steering are theirs alone.
+The page's reports are the only thing a browser can send the hub: a POST from the page itself (same origin, its token, a custom header, at most 2 KiB, at most 5 a second). One about a publication or frame the hub no longer keeps is refused, and the page says so. A second ask of the same frame and question within 2 s is taken for the same click. No report changes what the agents made: the store, attempts, publications and steering are theirs alone.
 
 ### Captures on the hub
 
@@ -377,7 +379,7 @@ Set with `--limit Hub.Name=Value`, on the hub only: stdio refuses them (exit 2).
 | `Hub.MaxRequestBytes` | 16777216 (16 MiB) | Bytes of arguments the admitted calls hold |
 | `Hub.MaxInboxEntries` | 32 | Asks the inbox keeps; the oldest is dropped |
 
-Fixed, not limits: 512 connections, a connection's first byte within 2 s, 64 answers written at once, and the page's reports at most 1 KiB and 5 a second.
+Fixed, not limits: 512 connections, a connection's first byte within 2 s, 64 answers written at once, and the page's reports at most 2 KiB and 5 a second.
 
 ## Agent skill
 

@@ -182,11 +182,11 @@ func isBidiControl(r rune) bool {
 	return r >= '\u202a' && r <= '\u202e' || r >= '\u2066' && r <= '\u2069'
 }
 
-// isIgnorable reports whether r is a default-ignorable character that is
-// not a format character: the combining grapheme joiner, the Hangul
-// fillers, the Khmer inherent vowels, the Mongolian free variation
-// selectors, the variation selectors, and the whole U+E0000 to U+E0FFF
-// block, assigned or not.
+// isIgnorable reports whether r is a default-ignorable character that
+// unicode.IsGraphic takes for a letter or mark: the combining grapheme
+// joiner, the Hangul fillers, the Khmer inherent vowels, the Mongolian free
+// variation selectors, the variation selectors, and the whole U+E0000 to
+// U+E0FFF block, assigned or not.
 func isIgnorable(r rune) bool {
 	switch {
 	case r == '\u034f', r == '\u115f', r == '\u1160', r == '\u17b4', r == '\u17b5', r == '\u3164', r == '\uffa0':
@@ -200,9 +200,11 @@ func isIgnorable(r rune) bool {
 // isJoiner reports whether r is the zero-width non-joiner or joiner.
 func isJoiner(r rune) bool { return r == '\u200c' || r == '\u200d' }
 
-// isVisible reports whether r is drawn on its own: neither a format
-// character nor default-ignorable.
-func isVisible(r rune) bool { return !unicode.Is(unicode.Cf, r) && !isIgnorable(r) }
+// isVisible reports whether r is drawn on its own: an assigned graphic
+// character (a letter, mark, number, punctuation, symbol or space; never a
+// format, private-use or unassigned code point) that is not one of the
+// default-ignorable letters and marks isIgnorable lists.
+func isVisible(r rune) bool { return unicode.IsGraphic(r) && !isIgnorable(r) }
 
 // invisibleIn reports whether q holds a character that is not drawn but
 // that an agent reading q would still read: any format character (Cf: the

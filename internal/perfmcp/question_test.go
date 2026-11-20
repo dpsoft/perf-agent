@@ -150,6 +150,10 @@ func TestQuestionIsNormalisedOrRefused(t *testing.T) {
 		{"a halfwidth Hangul filler", "SECRET \uffa0", "invisible"},
 		{"an unassigned ignorable", "SECRET x\U000e0fff", "invisible"},
 		{"an ignorable past the selectors", "SECRET x\U000e0200", "invisible"},
+		{"an unassigned format slot", "SECRET x\u2065y", "invisible"},
+		{"an unassigned specials slot", "SECRET x\ufff0", "invisible"},
+		{"a private-use character", "SECRET x\ue000", "invisible"},
+		{"an unassigned plane-3 noncharacter", "SECRET x\U0003ffff", "invisible"},
 	} {
 		got, err := normalizeQuestion(tc.in)
 		if err == nil || !strings.Contains(err.Error(), tc.reason) {

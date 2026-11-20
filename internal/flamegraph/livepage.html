@@ -39,6 +39,10 @@
 </div>
 <aside class="side" aria-label="Selected frame">
 <div class="hd"><div class="lbl">Frame details · <span class="ref" id="sel-ref"></span></div><div class="nm" id="sel-name"></div><div class="nid" id="sel-id"></div></div>
+<section class="sec" id="ask-sec" aria-label="Ask your agent"><h5>Ask your agent about this frame</h5>
+<div class="askq"><input type="text" id="ask-q" maxlength="280" placeholder="Ask about this frame…" aria-label="Your question about the selected frame" autocomplete="off" disabled><button type="button" class="chip" id="ask-send" disabled>Ask</button></div>
+<p class="muted" id="ask-last" hidden></p>
+</section>
 <section class="sec"><h5>Profile facts — computed by perf-agent</h5>
 <div class="facts" id="facts"></div>
 </section>

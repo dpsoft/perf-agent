@@ -2,12 +2,12 @@
 // state when the stream is down): the state the agent drives, and the
 // count of the user's asks, each at its own revision. It fetches the shown
 // publication's model and rejected history, and draws them with the
-// shared panel. It reports the user's own selections, focus and asks to
-// the inbox. Every request is relative, and every one but the inbox's
-// POST is a GET. The only received strings that become part of a request
-// path are publication and node IDs, and only when they have their fixed
-// shapes. Every figure comes from the server: this script formats no
-// number.
+// shared panel. It reports the user's own selections, focus and asks, with
+// any question the user typed, to the inbox. Every request is relative,
+// and every one but the inbox's POST is a GET. The only received strings
+// that become part of a request path are publication and node IDs, and
+// only when they have their fixed shapes. Every figure comes from the
+// server: this script formats no number.
 (() => {
   'use strict';
   const $ = (id) => document.getElementById(id);
@@ -22,10 +22,12 @@
       if (!r.ok) throw new Error('request refused: ' + path);
       return r.json();
     },
-    // post sends body as JSON and resolves to the answer's status.
+    // post sends body as JSON and resolves to the answer's status and,
+    // for a 422, the reason the server gave, which never repeats the body.
     post: async (path, body) => {
       const r = await fetch(path, {method: 'POST', headers: postHeaders, body: JSON.stringify(body)});
-      return r.status;
+      const reason = r.status === 422 ? await r.text().catch(() => '') : '';
+      return {status: r.status, reason};
     },
     // subscribe opens the event stream. onState gets each envelope; onTrouble
     // gets true when the browser gave the stream up for good (a refusal,
@@ -359,6 +361,8 @@
     $('focus-btn').disabled = !view || !view.selected || view.focus === view.selected;
     $('whole-btn').disabled = !view || !view.focus;
     $('ask-btn').disabled = !view || !view.selected;
+    $('ask-q').disabled = !view || !view.selected;
+    $('ask-send').disabled = !view || !view.selected;
   };
 
   // drawModel draws m, the publication's whole model or a focus of it:
@@ -608,12 +612,12 @@
   const REPORT_QUIET_MS = 150;
 
   const later = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  // post sends body to the inbox and resolves to the answer's status, or
-  // 0 when none came.
-  const post = (body) => transport.post('inbox', body).catch(() => 0);
+  // post sends body to the inbox and resolves to the answer: its status,
+  // 0 when none came, and a refusal's reason.
+  const post = (body) => transport.post('inbox', body).catch(() => ({status: 0, reason: ''}));
   const postOrRetry = async (body) => {
-    const status = await post(body);
-    if (status !== 429) return status;
+    const res = await post(body);
+    if (res.status !== 429) return res;
     await later(RETRY_AFTER_MS);
     return post(body);
   };
@@ -648,11 +652,11 @@
     const n = navNext;
     navNext = null;
     navBusy = true;
-    let status = await post(n.body);
+    let status = (await post(n.body)).status;
     if (status === 429) {
       await later(RETRY_AFTER_MS);
       // A newer report stands for this one rather than follow it.
-      if (!navNext) status = await post(n.body);
+      if (!navNext) status = (await post(n.body)).status;
     }
     if (status !== 204) {
       if (navNext) navNext.body = navNext.whole;
@@ -677,7 +681,36 @@
   const askAgent = () => {
     if (!view || !view.selected || !isPub(view.pub)) return;
     const body = {kind: 'ask', publication: view.pub, node: view.selected, focus: view.focus};
-    postOrRetry(body).then((status) => toast(askReplies[status] || NOT_SENT, ASK_TOAST_MS));
+    postOrRetry(body).then((res) => toast(askReplies[res.status] || NOT_SENT, ASK_TOAST_MS));
+  };
+
+  // REFUSAL_PREFIX starts every reason the inbox gives; the page shows
+  // what follows it. MAX_REASON bounds what it shows.
+  const REFUSAL_PREFIX = 'invalid page report: ';
+  const MAX_REASON = 300;
+
+  // askQuestion is askAgent with the question typed in the side panel. It
+  // goes at once, never through the queue selections wait in, and is tried
+  // once more after a 429. The field is cleared once the inbox took the
+  // question, unless the user has changed it since; a refused question
+  // stays in it to edit, and the toast gives the server's reason, which
+  // never repeats the question.
+  const askQuestion = () => {
+    const field = $('ask-q');
+    const typed = field.value;
+    const question = typed.trim();
+    if (!question || !view || !view.selected || !isPub(view.pub)) return;
+    const body = {kind: 'ask', publication: view.pub, node: view.selected, focus: view.focus, question};
+    postOrRetry(body).then((res) => {
+      if (res.status === 204 && field.value === typed) field.value = '';
+      if (res.status !== 422) {
+        toast(askReplies[res.status] || NOT_SENT, ASK_TOAST_MS);
+        return;
+      }
+      let reason = res.reason.trim();
+      if (reason.startsWith(REFUSAL_PREFIX)) reason = reason.slice(REFUSAL_PREFIX.length);
+      toast('Your question could not be sent: ' + (reason.slice(0, MAX_REASON) || 'perf-agent refused it.'), ASK_TOAST_MS);
+    });
   };
 
   // --- The user's own navigation: local until the next agent state ---
@@ -891,6 +924,20 @@
     e.hidden = !asks || asks === '0';
     e.textContent = asks + (asks === '1' ? ' ask' : ' asks') + ' · ' + strOf(ib.unread) + ' unread' +
       (strOf(ib.read_by) ? ' · read by ' + ib.read_by : '');
+    showQuestion(strOf(ib.question), strOf(ib.read_by));
+  };
+
+  // showQuestion shows the newest ask's question, which a person typed,
+  // with who read it. It is text in an isolated run: no markup, and no
+  // direction control in it reorders what is around it.
+  const showQuestion = (question, readBy) => {
+    const e = $('ask-last');
+    clear(e);
+    e.hidden = !question;
+    if (!question) return;
+    e.appendChild(document.createTextNode('Latest question: '));
+    e.appendChild(make('bdi', '', question));
+    e.appendChild(document.createTextNode(readBy ? ' · read by ' + readBy : ' · not read yet'));
   };
 
   // onState takes an envelope: the engine's state and the inbox's, each
@@ -1062,6 +1109,12 @@
   $('focus-btn').addEventListener('click', focusHere);
   $('whole-btn').addEventListener('click', wholeView);
   askBtn.addEventListener('click', askAgent);
+  $('ask-send').addEventListener('click', askQuestion);
+  $('ask-q').addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter' || ev.isComposing) return;
+    ev.preventDefault();
+    askQuestion();
+  });
   document.addEventListener('click', (ev) => {
     const chip = ev.target.closest('[data-prompt]');
     if (chip) {

@@ -12,6 +12,12 @@
 #pubs .vw,#pubs .by{color:var(--muted)}
 #views{margin:0 0 8px}
 #focus-btn:disabled,#whole-btn:disabled,#ask-btn:disabled{opacity:.5;cursor:default;border-color:var(--line);color:inherit}
+#ask-sec .askq{display:flex;gap:6px;align-items:center}
+#ask-q{flex:1;min-width:0;padding:3px 8px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:inherit;font:inherit;font-size:12.5px}
+#ask-q:focus-visible{outline:2px solid var(--ai);outline-offset:1px}
+#ask-q:disabled,#ask-send:disabled{opacity:.5;cursor:default}
+#ask-last{margin:6px 0 0;overflow-wrap:anywhere}
+#ask-last[hidden]{display:none}
 #export{color:inherit;text-decoration:none}
 #export[hidden]{display:none}
 #rows-sec[hidden],#quality-sec[hidden]{display:none}

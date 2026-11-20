@@ -312,6 +312,8 @@ type pageState struct {
 		Rows []struct {
 			ID, Publication, Node, Name, View string
 			ReadBy                             string `json:"read_by"`
+			Question                           string `json:"question"`
+			QuestionSource                     string `json:"question_source"`
 		} `json:"rows"`
 	} `json:"asks"`
 }
@@ -473,6 +475,124 @@ func TestAnAskReachesPageStateInChrome(t *testing.T) {
 	tab.waitFor("the new publication", framesProbe, func(s string) bool { return slices.Contains(strings.Split(s, ","), "d") })
 	if next == pub {
 		t.Errorf("the new publication is %s again", next)
+	}
+	if errs := c.errors(); len(errs) != 0 {
+		t.Errorf("the page reported errors: %v", errs)
+	}
+}
+
+// askProbe is the question field's value, whether it is off, and the
+// newest question the page shows.
+const askProbe = `(() => { const q = document.getElementById('ask-q'), l = document.getElementById('ask-last');
+  return JSON.stringify({value: q.value, off: q.disabled, last: l.hidden ? '' : l.textContent}); })()`
+
+// typeQuestion types q into the tab's question field and presses Enter.
+func (tab *chromeTab) typeQuestion(q string) {
+	tab.t.Helper()
+	js, err := json.Marshal(q)
+	if err != nil {
+		tab.t.Fatal(err)
+	}
+	tab.eval(`(() => { const e = document.getElementById('ask-q'); e.focus(); e.value = ` + string(js) +
+		`; e.dispatchEvent(new Event('input', {bubbles: true}));` +
+		` e.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true, cancelable: true})); return ''; })()`)
+}
+
+// End to end with the real hub: a question typed on the page about the
+// selected frame reaches page_state as live.js sends it, labelled as typed
+// by the person, and every tab shows it as text, with who read it. The
+// agent answers on the page with page_explain for that frame, and the
+// answer is in the panel. A question the hub refuses says why, without the
+// text, and stays in the field; a hostile one is kept and shown as text.
+func TestATypedQuestionReachesPageStateInChrome(t *testing.T) {
+	c := startChrome(t)
+	p := startHub(t, hubOptions{profiles: profilesDir(t)})
+	agent := p.client("claude")
+	o := agent.open("cpu.pb.gz")
+	pub := agent.publish(o)
+	nodeB := agent.nodeID(o, "b")
+	pageURL := p.pageURL()
+	tab := c.open(t, pageURL)
+	other := c.open(t, pageURL)
+	for _, tb := range []*chromeTab{tab, other} {
+		tb.waitFor("the frames", framesProbe, func(s string) bool { return slices.Contains(strings.Split(s, ","), "b") })
+	}
+	type askView struct {
+		Value, Last string
+		Off         bool
+	}
+	read := func(tb *chromeTab) askView {
+		var v askView
+		if err := json.Unmarshal([]byte(tb.eval(askProbe)), &v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	tab.clickFrame("b")
+	tab.waitFor("b selected", selProbe, func(s string) bool { return s == "b askable" })
+
+	// An input drops line breaks itself; the hub trims the space around.
+	tab.typeQuestion("  Why is b so hot? Is it the allocator?  ")
+	if got := tab.waitFor("the question's toast", toastProbe, func(s string) bool { return s != "" }); got != askSent {
+		t.Errorf("toast %q, want %q", got, askSent)
+	}
+	if v := read(tab); v.Value != "" {
+		t.Errorf("the field kept %q after the hub took it", v.Value)
+	}
+	const kept = "Why is b so hot? Is it the allocator?"
+	other.waitFor("the question in the other tab", askProbe, func(s string) bool { return strings.Contains(s, "Latest question: "+kept+" · not read yet") })
+	s := agent.pageState()
+	if len(s.Asks.Rows) != 1 {
+		t.Fatalf("page_state asks = %+v, want one", s.Asks.Rows)
+	}
+	if a := s.Asks.Rows[0]; a.Node != nodeB || a.Name != "b" || a.Publication != pub || a.Question != kept ||
+		a.QuestionSource != "typed on the page by the person viewing it" {
+		t.Errorf("the ask = %+v", a)
+	}
+	other.waitFor("the question read", askProbe, func(s string) bool { return strings.Contains(s, "Latest question: "+kept+" · read by claude") })
+
+	// The agent answers on the page, for that frame.
+	exps := []any{map[string]any{
+		"node":   nodeB,
+		"claims": []any{map[string]any{"id": "c1", "metric": "share_of_total", "denominator": "view_total", "unit": "ratio", "value": json.RawMessage("0.411")}},
+		"prose":  "{n:" + nodeB + "} holds {c1} of the view: the allocator is not on its path.",
+	}}
+	agent.call("page_explain", map[string]any{"handle": o.handle, "view": o.view, "explanations": exps})
+	const answerProbe = `[...document.querySelectorAll('#exp, #rows')].map((e) => e.textContent).join(' ')`
+	tab.waitFor("the answer in the panel", answerProbe, func(s string) bool { return strings.Contains(s, "the allocator is not on its path") })
+
+	// A question over 280 characters, set past the field's maxlength, is
+	// refused with the hub's reason, which does not repeat it.
+	tab.eval(`document.getElementById('toast').textContent = '', ''`)
+	tab.waitFor("b selected again", selProbe, func(s string) bool { return strings.HasSuffix(s, "askable") })
+	long := "SECRET" + strings.Repeat("x", 280)
+	tab.typeQuestion(long)
+	got := tab.waitFor("the refusal", toastProbe, func(s string) bool { return s != "" })
+	if got != "Your question could not be sent: the question is over 280 characters" || strings.Contains(got, "SECRET") {
+		t.Errorf("the refusal's toast %q", got)
+	}
+	if v := read(tab); v.Value != long {
+		t.Errorf("the refused question left the field: %q", v.Value)
+	}
+
+	// A hostile question is a question: kept as typed, shown as text.
+	const hostile = `</script><img src=x onerror="window.pwned=1"> why?`
+	tab.eval(`document.getElementById('toast').textContent = '', ''`)
+	tab.typeQuestion(hostile)
+	if got := tab.waitFor("the hostile question's toast", toastProbe, func(s string) bool { return s != "" }); got != askSent {
+		t.Errorf("toast %q, want %q", got, askSent)
+	}
+	other.waitFor("the hostile question", askProbe, func(s string) bool {
+		var v askView
+		return json.Unmarshal([]byte(s), &v) == nil && v.Last == "Latest question: "+hostile+" · not read yet"
+	})
+	for _, tb := range []*chromeTab{tab, other} {
+		if n := tb.eval(`String(document.querySelectorAll('img').length) + ' ' + String(window.pwned)`); n != "0 undefined" {
+			t.Errorf("the hostile question made markup or ran: %s", n)
+		}
+	}
+	if rows := agent.pageState().Asks.Rows; len(rows) != 2 || rows[1].Question != hostile {
+		t.Errorf("page_state rows %+v", rows)
 	}
 	if errs := c.errors(); len(errs) != 0 {
 		t.Errorf("the page reported errors: %v", errs)

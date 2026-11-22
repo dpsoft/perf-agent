@@ -43,6 +43,10 @@ const sourceDescription = "The source lines a node's samples point at, from insi
 // shrinkSource is the advice for a source response over MaxResponseBytes.
 const shrinkSource = "call again with a smaller limit or context"
 
+// noSourceRefs is the note of a node none of whose frames the profile gave
+// a file and line.
+const noSourceRefs = "no frame of this node has a file and line in the profile, so there is no source to show. Interpreted frames, such as Python's, may name their file and line only in the function name, as in \"preprocess (train.py:35)\"; that text is the profiler's, not a resolved location."
+
 // noSourceRoots is the reason of every row when no --source was given.
 func (s *Server) noSourceRoots() string { return "no source roots: " + s.startAdvice("--source DIR") }
 
@@ -162,6 +166,12 @@ func (s *Server) handleSource(_ context.Context, raw json.RawMessage) (mcpstdio.
 	notes, err := viewNotes(v)
 	if err != nil {
 		return mcpstdio.Result{}, err
+	}
+	if len(refs) == 0 {
+		// Without it an empty page reads as "no lines matter here", when
+		// the profile simply gave the frame no file: Python frames name
+		// theirs only in the function name.
+		notes = append(notes, noSourceRefs)
 	}
 	bind := binding("source", sourceQuery{Handle: a.Handle, View: a.View, Node: a.Node, Context: ctx})
 	pg, info, err := pageRows(refs, func(r profilemodel.SourceRef) int64 { return r.Value }, "value", bind, a.Cursor, limit)

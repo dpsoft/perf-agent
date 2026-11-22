@@ -404,6 +404,8 @@ mkdir -p ~/.agents/skills && ln -s "$PWD/skills/perf-agent-mcp" ~/.agents/skills
 | `ambiguous` | Several candidate files (at most 16 are listed). |
 | `unresolved` | No file was found, or the file could not be read. |
 
+A node none of whose frames has a file and line in the profile has no rows, and `source` says so in `notes`. Python frames are the usual case: perf-agent names their file and line only in the function name, as in `preprocess (train.py:35)`, which `source` does not read as a location.
+
 ## Limits
 
 Defaults; override with `--limit Name=Value`. Sizes are bytes. Every limit must be positive (`Source.MaxContext` and `Capture.TTL` may be 0); a zero, negative or unparsable value, or one out of its type's range, exits 2 and names the limit. A value over its ceiling (`MaxEngineWait` over 55s) or that does not fit another limit (`MaxRetainedBytes` under `MaxPageBytes` on the hub) is refused at start-up with exit 1, naming both. The capture limits are in their own table below.

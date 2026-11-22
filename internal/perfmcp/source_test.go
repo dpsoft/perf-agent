@@ -314,3 +314,30 @@ func TestSourceGitSelectsTheTrackedFileAndReadsHeadOncePerCall(t *testing.T) {
 		t.Errorf("HEAD read %d times for one call, want 1", n)
 	}
 }
+
+// A Python frame from perf-agent carries its file and line only in its
+// name, "preprocess (train.py:35)", with no file in the profile: source has
+// no row to give and must say why instead of an unexplained empty page.
+func TestSourceSaysWhyAFrameWithoutAFileHasNoRows(t *testing.T) {
+	raw := pmfixture.Build("cpu", "nanoseconds", nil, pmfixture.Sample{
+		Frames: []pmfixture.Frame{pmfixture.Fn("train (train.py:60)"), pmfixture.Fn("preprocess (train.py:35)")},
+		Value:  10,
+	})
+	o := openFixture(t, "py.pb.gz", raw, nil)
+	var out sourceOut
+	o.c.callOK("source", o.args(map[string]any{"node": o.nodeID(t, "preprocess (train.py:35)")}), &out)
+	if len(out.Rows) != 0 {
+		t.Fatalf("rows = %+v", out.Rows)
+	}
+	if !slices.Contains(out.Notes, noSourceRefs) {
+		t.Errorf("notes = %q", out.Notes)
+	}
+
+	// A frame with a file gets no such note.
+	o = openFixture(t, "cpu.pb.gz", pmfixture.CPUBasic(), nil)
+	out = sourceOut{}
+	o.c.callOK("source", o.args(map[string]any{"node": o.nodeID(t, "b")}), &out)
+	if slices.Contains(out.Notes, noSourceRefs) {
+		t.Errorf("a node with source rows carries %q", noSourceRefs)
+	}
+}

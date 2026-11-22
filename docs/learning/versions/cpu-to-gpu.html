@@ -1,0 +1,273 @@
+<div id="pa-gpu-lesson-one">
+  <style>
+    #pa-gpu-lesson-one { color:var(--foreground); display:grid; gap:calc(var(--font-size-base) * 1); }
+    #pa-gpu-lesson-one .lesson-heading { padding-right:90px; }
+    #pa-gpu-lesson-one .lesson-heading h2 { margin-top:calc(var(--font-size-base) * .25); }
+    #pa-gpu-lesson-one .lesson-controls { display:flex; flex-wrap:wrap; align-items:center; gap:calc(var(--font-size-base) * .5); }
+    #pa-gpu-lesson-one .lesson-step { display:grid; gap:calc(var(--font-size-base) * .25); }
+    #pa-gpu-lesson-one .lesson-diagram { width:100%; display:block; overflow:visible; }
+    #pa-gpu-lesson-one .lesson-diagram text { fill:var(--foreground); font-family:inherit; }
+    #pa-gpu-lesson-one .lesson-diagram .secondary { fill:var(--muted-foreground); }
+    #pa-gpu-lesson-one .cpu-fill { fill:var(--viz-series-1); }
+    #pa-gpu-lesson-one .gpu-fill { fill:var(--viz-series-2); }
+    #pa-gpu-lesson-one .future-fill { fill:var(--muted); }
+    #pa-gpu-lesson-one .wait-fill { fill:var(--viz-series-3); }
+    #pa-gpu-lesson-one .structure { stroke:var(--border); stroke-width:1; fill:none; }
+    #pa-gpu-lesson-one .cursor-line { stroke:var(--foreground); stroke-width:1.5; fill:none; }
+    #pa-gpu-lesson-one .observation { stroke:var(--muted-foreground); stroke-width:1.5; fill:none; }
+    #pa-gpu-lesson-one .lane-key { display:flex; flex-wrap:wrap; align-items:center; gap:calc(var(--font-size-base) * .75); }
+    #pa-gpu-lesson-one .lane-key span { display:inline-flex; align-items:center; gap:calc(var(--font-size-base) * .35); }
+    #pa-gpu-lesson-one .swatch { display:inline-block; width:12px; height:12px; background:var(--viz-series-1); }
+    #pa-gpu-lesson-one .swatch.gpu { background:var(--viz-series-2); }
+    #pa-gpu-lesson-one .swatch.wait { background:var(--viz-series-3); }
+    #pa-gpu-lesson-one .attribution { display:grid; gap:calc(var(--font-size-base) * .5); }
+    #pa-gpu-lesson-one .stack-chain { display:flex; align-items:center; flex-wrap:wrap; gap:calc(var(--font-size-base) * .4); }
+    #pa-gpu-lesson-one .stack-chain code { overflow-wrap:anywhere; }
+    #pa-gpu-lesson-one .sample-options { margin-top:calc(var(--font-size-base) * .25); }
+    #pa-gpu-lesson-one .knowledge-check { display:grid; gap:calc(var(--font-size-base) * .5); }
+    #pa-gpu-lesson-one .quiz-result:empty { display:none; }
+    #pa-gpu-lesson-one [hidden] { display:none !important; }
+    @media (pointer:coarse) { #pa-gpu-lesson-one .lesson-controls { gap:calc(var(--font-size-base) * .75); } }
+  </style>
+
+  <div class="lesson-heading">
+    <span class="text-small text-muted">GPU concepts · Lesson 1</span>
+    <h2>From Python to GPU</h2>
+  </div>
+  <div class="lesson-controls" aria-label="Playback controls">
+    <button type="button" class="btn btn-primary" data-action="play">Play</button>
+    <button type="button" class="btn" data-action="back" disabled>Back</button>
+    <button type="button" class="btn" data-action="next">Next step</button>
+    <label class="form-check form-switch">
+      <input class="form-check-input" type="checkbox" data-option="profiler">
+      <span class="form-check-label">Show profiler</span>
+    </label>
+  </div>
+  <div class="lesson-step" aria-live="polite" aria-atomic="true">
+    <h3 data-slot="step-title">1 / 6 · Prepare on the CPU</h3>
+    <div data-slot="step-detail">Python prepares inputs; the GPU has no work yet.</div>
+  </div>
+
+  <div class="lane-key text-small" aria-label="Timeline legend">
+    <span><i class="swatch" aria-hidden="true"></i>CPU execution</span>
+    <span><i class="swatch gpu" aria-hidden="true"></i>GPU execution</span>
+    <span><i class="swatch wait" aria-hidden="true"></i>Sleeping CPU wait</span>
+    <span class="text-muted">Muted = upcoming</span>
+  </div>
+  <div data-slot="diagram-host">
+    <svg class="lesson-diagram" role="img" aria-label="Illustrative CPU and GPU execution timeline"></svg>
+  </div>
+
+  <div class="attribution" data-slot="profiler-evidence" hidden>
+    <h3>GPU profile: who launched this kernel?</h3>
+    <div class="stack-chain" data-slot="stack-chain" aria-live="polite"></div>
+    <div class="text-small" data-slot="caller-status"></div>
+    <label class="form-check form-switch sample-options">
+      <input class="form-check-input" type="checkbox" data-option="caller" checked>
+      <span class="form-check-label">Launch stack was captured</span>
+    </label>
+  </div>
+
+  <div class="viz-row text-small text-muted">
+    <span>Illustrative model · one CPU thread · one GPU stream</span>
+    <span>Timings and sample dots are not captured data.</span>
+  </div>
+  <hr>
+  <div class="knowledge-check">
+    <h3>Does a returned launch prove the kernel has finished?</h3>
+    <div class="lesson-controls" role="group" aria-label="Knowledge check">
+      <button type="button" class="btn" data-answer="yes" aria-pressed="false">Yes</button>
+      <button type="button" class="btn" data-answer="no" aria-pressed="false">No</button>
+    </div>
+    <div class="quiz-result" data-slot="quiz-result" aria-live="polite"></div>
+  </div>
+
+  <script>
+    (() => {
+      const root = document.getElementById('pa-gpu-lesson-one');
+      const find = s => root.querySelector(s);
+      const svg = find('svg');
+      const host = find('[data-slot="diagram-host"]');
+      const play = find('[data-action="play"]');
+      const back = find('[data-action="back"]');
+      const next = find('[data-action="next"]');
+      const profiler = find('[data-option="profiler"]');
+      const caller = find('[data-option="caller"]');
+      const steps = [
+        { t:1, from:0, title:'Prepare on the CPU', detail:'Python prepares inputs; the GPU has no work yet.' },
+        { t:2.6, from:2, title:'Submit GPU work', detail:'A CUDA launch submits a kernel; its CPU call is not the kernel execution.' },
+        { t:4.5, from:3, title:'CPU and GPU overlap', detail:'The launch returned. The CPU does other work while the GPU runs.' },
+        { t:7.5, from:6, title:'Wait for the result', detail:'Here the CPU thread sleeps; the GPU continues running the kernel.' },
+        { t:10.6, from:10, title:'Use the result', detail:'The kernel finished. The CPU thread resumes with its result.' },
+        { t:12, from:11.5, title:'Connect the evidence', detail:'GPU duration is device execution time. CPU frames identify a captured launch path.' }
+      ];
+      const state = { time:1, overlay:false, sampled:true, answer:null };
+      const instanceKey = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+      let running = false, raf = null, lastStamp = null, lastStep = -1;
+      let lastReducedStep = 0;
+      const reduced = window.matchMedia('(prefers-reduced-motion: reduce)');
+      const stepAt = time => steps.reduce((index, item, i) => time >= item.from ? i : index, 0);
+      const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+      function applySaved(snapshot) {
+        const saved = snapshot?.modelContent;
+        if (!saved || saved.lesson !== 'cpu-to-gpu-v1') return;
+        if (Number.isInteger(saved.step) && saved.step >= 0 && saved.step < steps.length) state.time = steps[saved.step].t;
+        if (typeof saved.profiler === 'boolean') state.overlay = saved.profiler;
+        if (typeof saved.launchStack === 'boolean') state.sampled = saved.launchStack;
+        if (saved.answer === 'yes' || saved.answer === 'no') state.answer = saved.answer;
+      }
+      function save() {
+        if (typeof window.openai?.setWidgetState !== 'function') return;
+        window.openai.setWidgetState({
+          modelContent:{ lesson:'cpu-to-gpu-v1', step:stepAt(state.time), profiler:state.overlay, launchStack:state.sampled, answer:state.answer },
+          privateContent:{ instanceKey }
+        }).catch(() => {});
+      }
+      const el = (name, attrs = {}, text) => {
+        const node = document.createElementNS('http://www.w3.org/2000/svg', name);
+        for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+        if (text !== undefined) node.textContent = text;
+        svg.appendChild(node);
+        return node;
+      };
+      const text = (x, y, value, attrs = {}) => el('text', { x, y, ...attrs }, value);
+
+      function draw() {
+        const width = Math.max(220, host.getBoundingClientRect().width);
+        const x0 = 54, plot = Math.max(160, width - x0 - 8), x = t => x0 + plot * t / 12;
+        const mobile = plot < 430;
+        const time = state.time;
+        svg.setAttribute('viewBox', `0 0 ${width} ${state.overlay ? 290 : 264}`);
+        svg.style.height = `${state.overlay ? 290 : 264}px`;
+        svg.replaceChildren();
+        el('title', {}, 'One CPU thread submits a kernel, works concurrently, sleeps waiting for the GPU, then resumes.');
+        el('desc', {}, 'Illustrative execution, not a recorded trace. A vertical marker tracks progress. When profiler is shown, dots mark illustrative on-CPU samples, CUPTI supplies GPU duration, and a sampled launch stack can identify the caller.');
+        text(x0, 15, 'Earlier', { class:'secondary text-small' });
+        text(x(12), 15, 'Later →', { class:'secondary text-small', 'text-anchor':'end' });
+        text(0, 94, 'CPU');
+        text(0, 219, 'GPU');
+        text(0, 237, 'stream 0', { class:'secondary text-small' });
+        el('line', { x1:x0, y1:113, x2:x(12), y2:113, class:'structure' });
+        el('line', { x1:x0, y1:242, x2:x(12), y2:242, class:'structure' });
+        const segment = (start, end, y, label, color) => {
+          const left = x(start), total = x(end) - left - 2;
+          el('rect', { x:left, y, width:total, height:38, rx:3, class:'future-fill' });
+          const filled = clamp((time - start) / (end - start), 0, 1) * total;
+          if (filled > 0) el('rect', { x:left, y, width:filled, height:38, rx:3, class:color, opacity:.34 });
+          if (total > label.length * 7.5 + 5) text(left + total/2, y + 24, label, { 'text-anchor':'middle' });
+        };
+        segment(0,2,74,'Prep','cpu-fill');
+        segment(2,3,74,mobile ? '' : 'Launch','cpu-fill');
+        segment(3,6,74,mobile ? 'Work' : 'Other work','cpu-fill');
+        segment(6,10,74,'Wait','wait-fill');
+        segment(10,12,74,'Use','cpu-fill');
+        segment(3,10,202,mobile ? 'Kernel' : 'Kernel execution','gpu-fill');
+        if (time >= 2) {
+          const source = x(2.5), dest = x(3) + 6;
+          el('path', { d:`M ${source} 114 V 151 H ${dest} V 198`, class:'observation' });
+          el('polyline', { points:`${dest-4},192 ${dest},198 ${dest+4},192`, class:'observation' });
+          text(x0 + plot/2, 176, state.overlay ? 'CUPTI correlation ID' : 'Submit kernel to stream', { 'text-anchor':'middle', class:'secondary' });
+        }
+        if (state.overlay) {
+          const samples = [.4,.9,1.4,1.8,2.5,3.4,4.1,4.9,5.6,10.4,11.1,11.7];
+          for (const t of samples.filter(t => t <= time)) el('circle', { cx:x(t), cy:55, r:3, class:'cpu-fill' });
+          text(x0, 39, 'eBPF: on-CPU samples', { class:'secondary text-small' });
+          if (time >= 2.5 && state.sampled) {
+            el('circle', { cx:x(2.5), cy:55, r:6, class:'observation' });
+          }
+          if (time >= 6) {
+            el('line', { x1:x(6), y1:124, x2:x(Math.min(time,10)), y2:124, class:'observation' });
+            text(x(12), 146, mobile ? 'Optional off-CPU wait' : 'Sleeping wait: optional --offcpu', { 'text-anchor':'end', class:'secondary text-small' });
+          }
+          if (time >= 3) {
+            const end = x(Math.min(time,10));
+            el('path', { d:`M ${x(3)} 250 v 7 H ${end} v -7`, class:'observation' });
+            text(x0 + plot/2, 280, time < 10 ? 'CUPTI: kernel in progress' : 'CUPTI: measured kernel duration', { 'text-anchor':'middle', class:'secondary text-small' });
+          }
+        }
+        el('line', { x1:x(time), y1:62, x2:x(time), y2:114, class:'cursor-line' });
+        el('line', { x1:x(time), y1:194, x2:x(time), y2:245, class:'cursor-line' });
+        el('circle', { cx:x(time), cy:62, r:3, fill:'currentColor' });
+      }
+
+      function render() {
+        const i = stepAt(state.time);
+        profiler.checked = state.overlay;
+        caller.checked = state.sampled;
+        play.textContent = running ? 'Pause' : state.time >= 12 ? 'Replay' : 'Play';
+        back.disabled = i === 0;
+        next.disabled = i === steps.length - 1;
+        find('[data-slot="profiler-evidence"]').hidden = !state.overlay;
+        if (lastStep !== i) {
+          find('[data-slot="step-title"]').textContent = `${i+1} / 6 · ${steps[i].title}`;
+          find('[data-slot="step-detail"]').textContent = steps[i].detail;
+          lastStep = i;
+        }
+        const chain = find('[data-slot="stack-chain"]');
+        find('[data-slot="caller-status"]').textContent = state.time < 3 ? 'No GPU execution yet.' : state.time < 10
+          ? 'Kernel in progress; its duration is not complete yet.' : state.sampled
+          ? 'Measured GPU duration, linked to a sampled caller.' : 'Measured GPU duration; caller unknown.';
+        const names = state.time < 2.5 ? ['Launch has not been observed yet'] : state.time < 3 ? ['Launch submitted; GPU execution not observed yet'] : state.sampled
+          ? ['train_step()', 'torch operation', '[gpu:launch]', 'example_kernel']
+          : ['[gpu:launch unsampled]', 'example_kernel'];
+        const key = names.join('|');
+        if (chain.dataset.key !== key) {
+          chain.replaceChildren();
+          names.forEach((name,index) => {
+            if (index) { const arrow = document.createElement('span'); arrow.textContent = '→'; arrow.setAttribute('aria-hidden','true'); chain.appendChild(arrow); }
+            const part = document.createElement(names.length > 1 ? 'code' : 'span'); part.textContent = name; chain.appendChild(part);
+          });
+          chain.dataset.key = key;
+        }
+        root.querySelectorAll('[data-answer]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.answer === state.answer)));
+        find('[data-slot="quiz-result"]').textContent = state.answer === 'no'
+          ? 'Correct. The launch can return before the kernel finishes—or even starts.'
+          : state.answer === 'yes' ? 'Not necessarily. A returned launch does not prove completion; synchronization can establish it.' : '';
+        draw();
+      }
+
+      function stop() {
+        running = false;
+        if (raf !== null) cancelAnimationFrame(raf);
+        raf = null; lastStamp = null; lastReducedStep = 0;
+      }
+      function tick(stamp) {
+        if (!running || !root.isConnected) { stop(); return; }
+        if (lastStamp === null) lastStamp = stamp;
+        const dt = Math.min((stamp - lastStamp) / 1000, .1);
+        lastStamp = stamp;
+        if (reduced.matches) {
+          lastReducedStep += dt;
+          if (lastReducedStep >= 3) {
+            state.time = steps[Math.min(stepAt(state.time)+1,5)].t;
+            lastReducedStep = 0;
+          }
+        } else state.time = Math.min(12, state.time + dt*.38);
+        if (state.time >= 12) { stop(); save(); }
+        render();
+        if (running) raf = requestAnimationFrame(tick);
+      }
+
+      play.addEventListener('click', () => {
+        if (running) stop();
+        else { if (state.time >= 12) state.time = steps[0].t; running = true; lastStamp = null; raf = requestAnimationFrame(tick); }
+        render(); save();
+      });
+      back.addEventListener('click', () => { stop(); state.time = steps[Math.max(0,stepAt(state.time)-1)].t; render(); save(); });
+      next.addEventListener('click', () => { stop(); state.time = steps[Math.min(5,stepAt(state.time)+1)].t; render(); save(); });
+      profiler.addEventListener('change', () => { state.overlay = profiler.checked; render(); save(); });
+      caller.addEventListener('change', () => { state.sampled = caller.checked; render(); save(); });
+      root.querySelectorAll('[data-answer]').forEach(button => button.addEventListener('click', () => { state.answer = button.dataset.answer; render(); save(); }));
+      window.addEventListener('openai:set_globals', event => {
+        const snapshot = event.detail?.globals?.widgetState;
+        if (!snapshot || snapshot.privateContent?.instanceKey === instanceKey) return;
+        stop(); applySaved(snapshot); render();
+      });
+      document.addEventListener('visibilitychange', () => { if (document.hidden && running) { stop(); render(); save(); } });
+      new ResizeObserver(draw).observe(host);
+      applySaved(window.openai?.widgetState);
+      render();
+    })();
+  </script>
+</div>

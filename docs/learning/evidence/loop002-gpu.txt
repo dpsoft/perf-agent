@@ -1,0 +1,128 @@
+perf-agent.capture_id=BMOEAJVVM4UTNVCN5ATYCMCL2G
+Type: gpu
+Time: 2026-11-20 00:51:58 -03
+Duration: 20.37s, Total samples = 6.23s (30.61%)
+Showing nodes accounting for 6.18s, 99.21% of 6.23s total
+Dropped 128 nodes (cum <= 0.03s)
+      flat  flat%   sum%        cum   cum%
+         0     0%     0%      5.48s 87.90%  [gpu:launch unsampled]
+     1.66s 26.68% 26.68%      1.66s 26.68%  [gpu:kernel:ampere_sgemm_128x64_tn]
+     1.33s 21.32% 48.00%      1.33s 21.32%  [gpu:kernel:_ZN7cutlass7Kernel2I43cutlass_80_simt_sgemm_128x256_8x4_nt_align1EEvNT_6ParamsE]
+     1.31s 20.96% 68.97%      1.31s 20.96%  [gpu:kernel:_ZN7cutlass7Kernel2I43cutlass_80_simt_sgemm_256x128_8x4_nn_align1EEvNT_6ParamsE]
+         0     0% 68.97%      0.75s 12.10%  (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+         0     0% 68.97%      0.75s 12.10%  [gpu:instrumentation]
+         0     0% 68.97%      0.75s 12.10%  [gpu:launch]
+         0     0% 68.97%      0.52s  8.34%  at::native::(anonymous namespace)::addmm_out_cuda_impl(at::Tensor&, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&, at::native::(anonymous namespace)::Activation, bool) [clone .isra.0]
+         0     0% 68.97%      0.52s  8.34%  libcublasLt.so.13+0xe2b573
+         0     0% 68.97%      0.52s  8.34%  libcublasLt.so.13+0xf8e200
+         0     0% 68.97%      0.41s  6.51%  <module> (train.py:1)
+         0     0% 68.97%      0.41s  6.51%  PyEval_EvalCode
+         0     0% 68.97%      0.41s  6.51%  Py_RunMain.warm
+         0     0% 68.97%      0.41s  6.51%  _PyEval_EvalFrameDefault
+         0     0% 68.97%      0.41s  6.51%  _PyRun_AnyFileObject
+         0     0% 68.97%      0.41s  6.51%  _PyRun_SimpleFileObject
+         0     0% 68.97%      0.41s  6.51%  __libc_start_call_main
+         0     0% 68.97%      0.41s  6.51%  __libc_start_main_alias_1
+         0     0% 68.97%      0.41s  6.51%  _start
+         0     0% 68.97%      0.41s  6.51%  cfunction_call
+         0     0% 68.97%      0.41s  6.51%  main
+         0     0% 68.97%      0.41s  6.51%  main (train.py:99)
+         0     0% 68.97%      0.41s  6.51%  pymain_main.llvm.3121965821471187960
+         0     0% 68.97%      0.41s  6.51%  pymain_run_file
+         0     0% 68.97%      0.41s  6.51%  pymain_run_file_obj
+         0     0% 68.97%      0.41s  6.51%  pyrun_file
+         0     0% 68.97%      0.41s  6.51%  run_mod.llvm.10142647837896989511
+         0     0% 68.97%      0.41s  6.51%  train (train.py:53)
+         0     0% 68.97%      0.35s  5.59%  __clone3
+         0     0% 68.97%      0.35s  5.59%  execute_native_thread_routine
+         0     0% 68.97%      0.35s  5.59%  start_thread
+         0     0% 68.97%      0.35s  5.59%  torch::autograd::Engine::evaluate_function(std::shared_ptr<torch::autograd::GraphTask>&, torch::autograd::Node*, torch::autograd::InputBuffer&, std::shared_ptr<torch::autograd::ReadyQueue> const&)
+         0     0% 68.97%      0.35s  5.59%  torch::autograd::Engine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+         0     0% 68.97%      0.35s  5.59%  torch::autograd::Engine::thread_main(std::shared_ptr<torch::autograd::GraphTask> const&)
+         0     0% 68.97%      0.35s  5.59%  torch::autograd::python::PythonEngine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+         0     0% 68.97%      0.34s  5.50%  torch::autograd::Node::operator()(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+     0.34s  5.38% 74.34%      0.34s  5.38%  [gpu:kernel:_ZN2at6native57_GLOBAL__N__7e105b8f_24_ForeachBinaryOpScalar_cu_86b9896c25multi_tensor_apply_kernelINS1_18TensorListMetadataILi1EEENS1_21BinaryOpScalarFunctorIfLi1ELi1ELi0EEEJSt10multipliesIfEfEEEvT_T0_DpT1_]
+         0     0% 74.34%      0.33s  5.32%  at::_ops::mm::call(at::Tensor const&, at::Tensor const&)
+         0     0% 74.34%      0.33s  5.32%  at::_ops::mm::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+         0     0% 74.34%      0.33s  5.32%  at::native::structured_mm_out_cuda::impl(at::Tensor const&, at::Tensor const&, at::Tensor const&)
+         0     0% 74.34%      0.33s  5.32%  c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&), &at::(anonymous namespace)::wrapper_CUDA_mm(at::Tensor const&, at::Tensor const&)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&> >, at::Tensor(at::Tensor const&, at::Tensor const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+         0     0% 74.34%      0.33s  5.32%  c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&), &torch::autograd::VariableType::(anonymous namespace)::mm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&> >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+         0     0% 74.34%      0.33s  5.32%  cublasLtSSSMatmul
+         0     0% 74.34%      0.33s  5.32%  cublasSgemm_v2
+         0     0% 74.34%      0.33s  5.32%  libcublas.so.13+0x1c4b74
+         0     0% 74.34%      0.33s  5.32%  libcublas.so.13+0x1c6b85
+         0     0% 74.34%      0.33s  5.32%  libcublas.so.13+0x2cc690
+         0     0% 74.34%      0.33s  5.32%  torch::autograd::VariableType::(anonymous namespace)::mm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+         0     0% 74.34%      0.33s  5.32%  torch::autograd::generated::AddmmBackward0::apply(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+         0     0% 74.34%      0.33s  5.32%  torch::autograd::generated::AddmmBackward0_apply_functional(std::vector<at::Tensor, std::allocator<at::Tensor> >&&, std::array<bool, (unsigned long)3>, c10::Scalar&, c10::Scalar&, at::Tensor&, c10::Layout&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, at::Tensor&, c10::Layout&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&)
+         0     0% 74.34%      0.33s  5.32%  void at::cuda::blas::gemm_internal_cublas<float, float>(char, char, long, long, long, at::OpMathType<float>::type, float const*, long, float const*, long, at::OpMathType<float>::type, float*, long)
+         0     0% 74.34%      0.33s  5.21%  cuLaunchKernel
+         0     0% 74.34%      0.33s  5.21%  libcublasLt.so.13+0x1df0eb0
+     0.32s  5.09% 79.43%      0.32s  5.09%  [gpu:kernel:_ZN2at6native54_GLOBAL__N__ae7e1889_21_ForeachPointwiseOp_cu_ef478fac25multi_tensor_apply_kernelINS1_28TensorListScalarListMetadataIfLi3EEENS1_28PointwiseOpScalarListFunctorIfLi3ELi3ELi0EEEJSt7dividesIfEEEEvT_T0_DpT1_]
+     0.25s  3.94% 83.38%      0.25s  3.94%  [gpu:kernel:_ZN2at6native52_GLOBAL__N__913c22e1_19_ForeachTernaryOp_cu_5285c63625multi_tensor_apply_kernelINS1_18TensorListMetadataILi2EEENS1_22TernaryOpScalarFunctorIfLi2ELi2ELi0EEEJNS0_11LerpFunctorIfEEfEEEvT_T0_DpT1_]
+     0.25s  3.94% 87.31%      0.25s  3.94%  [gpu:kernel:_ZN2at6native54_GLOBAL__N__ae7e1889_21_ForeachPointwiseOp_cu_ef478fac25multi_tensor_apply_kernelINS1_18TensorListMetadataILi3EEENS1_24PointwiseOpScalarFunctorIfLi3ELi3ELi0EEEJSt10multipliesIfEfEEEvT_T0_DpT1_]
+         0     0% 87.31%      0.23s  3.76%  cudaLaunchKernel
+         0     0% 87.31%      0.21s  3.37%  Adam.step (adam.py:214)
+         0     0% 87.31%      0.21s  3.37%  Optimizer.profile_hook_step.<locals>.wrapper (optimizer.py:528)
+         0     0% 87.31%      0.21s  3.37%  _disable_dynamo_if_unsupported.<locals>.wrapper.<locals>.maybe_fallback (optimizer.py:140)
+         0     0% 87.31%      0.21s  3.37%  _multi_tensor_adam (adam.py:553)
+         0     0% 87.31%      0.21s  3.37%  _use_grad_for_differentiable.<locals>._use_grad (optimizer.py:59)
+         0     0% 87.31%      0.21s  3.37%  adam (adam.py:902)
+         0     0% 87.31%      0.20s  3.14%  Module._call_impl (module.py:1787)
+         0     0% 87.31%      0.20s  3.14%  Module._wrapped_call_impl (module.py:1779)
+         0     0% 87.31%      0.20s  3.14%  _PyObject_Call_Prepend
+         0     0% 87.31%      0.20s  3.14%  method_vectorcall.llvm.12408582019548959275
+         0     0% 87.31%      0.20s  3.14%  slot_tp_call
+         0     0% 87.31%      0.20s  3.14%  Sequential.forward (container.py:254)
+         0     0% 87.31%      0.19s  3.12%  libcublasLt.so.13+0x19426a6
+         0     0% 87.31%      0.19s  3.12%  libcublasLt.so.13+0x71bd1ed
+         0     0% 87.31%      0.19s  3.09%  libcublasLt.so.13+0x1943221
+         0     0% 87.31%      0.19s  3.03%  Linear.forward (linear.py:130)
+         0     0% 87.31%      0.19s  3.03%  at::_ops::addmm::call(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+         0     0% 87.31%      0.19s  3.03%  at::_ops::addmm::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+         0     0% 87.31%      0.19s  3.03%  at::_ops::linear::call(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)
+         0     0% 87.31%      0.19s  3.03%  at::native::linear(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)
+         0     0% 87.31%      0.19s  3.03%  at::native::structured_addmm_out_cuda::impl(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&, at::Tensor const&)
+         0     0% 87.31%      0.19s  3.03%  bool at::cuda::blas::gemm_and_bias<float, float>(bool, bool, long, long, long, at::OpMathType<float>::type, float const*, long, float const*, long, float const*, float*, long, at::cuda::blas::GEMMAndBiasActivationEpilogue, float const*, long, at::OpMathType<float>::type)
+         0     0% 87.31%      0.19s  3.03%  bool at::native::(anonymous namespace)::launchGemmAndBiasCublasLt<float, float>(at::native::cublasCommonArgs&, std::optional<at::Tensor> const&, c10::Scalar const&, at::native::(anonymous namespace)::Activation)
+         0     0% 87.31%      0.19s  3.03%  c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&), &at::(anonymous namespace)::wrapper_CUDA_addmm(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&> >, at::Tensor(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+         0     0% 87.31%      0.19s  3.03%  c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CompositeImplicitAutograd__linear(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&> >, at::Tensor(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)
+         0     0% 87.31%      0.19s  3.03%  c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&), &torch::autograd::VariableType::(anonymous namespace)::addmm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&> >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+         0     0% 87.31%      0.19s  3.03%  cublasLtMatmul
+         0     0% 87.31%      0.19s  3.03%  torch::autograd::THPVariable_linear(_object*, _object*, _object*)
+         0     0% 87.31%      0.19s  3.03%  torch::autograd::VariableType::(anonymous namespace)::addmm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+         0     0% 87.31%      0.19s  2.99%  libcublasLt.so.13+0x712d695
+         0     0% 87.31%      0.18s  2.89%  torch::autograd::generated::details::mm_mat1_backward(at::Tensor const&, at::Tensor const&, c10::ArrayRef<c10::SymInt>, c10::ArrayRef<c10::SymInt>, c10::Layout, c10::Scalar const&)
+         0     0% 87.31%      0.18s  2.87%  libcublasLt.so.13+0x3279bb4
+     0.17s  2.70% 90.01%      0.17s  2.70%  [gpu:kernel:_ZN2at6native61_GLOBAL__N__832b9cb6_28_ForeachBinaryOpScalarList_cu_dda10a6925multi_tensor_apply_kernelINS1_28TensorListScalarListMetadataIfLi1EEENS1_25BinaryOpScalarListFunctorIfLi1ELi1ELi0EEEJSt7dividesIfEEEEvT_T0_DpT1_]
+     0.17s  2.70% 92.71%      0.17s  2.70%  [gpu:kernel:_ZN2at6native57_GLOBAL__N__7e105b8f_24_ForeachBinaryOpScalar_cu_86b9896c25multi_tensor_apply_kernelINS1_18TensorListMetadataILi1EEENS1_21BinaryOpScalarFunctorIfLi1ELi1ELi0EEEJSt4plusIfEfEEEvT_T0_DpT1_]
+     0.17s  2.67% 95.38%      0.17s  2.67%  [gpu:kernel:_ZN2at6native50_GLOBAL__N__637ba612_17_ForeachUnaryOp_cu_77fe623d25multi_tensor_apply_kernelINS1_18TensorListMetadataILi2EEENS1_14UnaryOpFunctorIfLi2ELi1ELi1EEEJNS0_4SqrtIfEEEEEvT_T0_DpT1_]
+         0     0% 95.38%      0.15s  2.42%  torch::autograd::generated::details::mm_mat2_backward(at::Tensor const&, at::Tensor const&, c10::ArrayRef<c10::SymInt>, c10::ArrayRef<c10::SymInt>, c10::Layout, c10::Scalar const&)
+         0     0% 95.38%      0.14s  2.31%  libcublasLt.so.13+0x3274094
+     0.09s  1.37% 96.75%      0.09s  1.37%  [gpu:kernel:_ZN2at6native29vectorized_elementwise_kernelILi4EZZZNS0_26GeluBackwardCUDAKernelImplERNS_18TensorIteratorBaseENS0_8GeluTypeEENKUlvE0_clEvENKUlvE0_clEvEUlffE_St5arrayIPcLm3EELb0EEEviT0_T1_]
+     0.06s  0.96% 97.71%      0.06s  0.96%  [gpu:kernel:_ZN2at6native29vectorized_elementwise_kernelILi4EZZZNS0_18GeluCUDAKernelImplERNS_18TensorIteratorBaseENS0_8GeluTypeEENKUlvE0_clEvENKUlvE0_clEvEUlfE_St5arrayIPcLm2EELb0EEEviT0_T1_]
+     0.05s  0.77% 98.48%      0.05s  0.77%  [gpu:kernel:ampere_sgemm_64x64_nt]
+         0     0% 98.48%      0.05s  0.75%  __device_stub__ZN2at6native54_GLOBAL__N__ae7e1889_21_ForeachPointwiseOp_cu_ef478fac25multi_tensor_apply_kernelINS1_28TensorListScalarListMetadataIfLi3EEENS1_28PointwiseOpScalarListFunctorIfLi3ELi3ELi0EEEJSt7dividesIfEEEEvT_T0_DpT1_(at::native::(anonymous namespace)::TensorListScalarListMetadata<float, 3>&, at::native::(anonymous namespace)::PointwiseOpScalarListFunctor<float, 3, 3, 0>&, std::divides<float>&)
+         0     0% 98.48%      0.05s  0.75%  at::_ops::_foreach_addcdiv__ScalarList::call(c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)
+         0     0% 98.48%      0.05s  0.75%  c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<void (c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA_ScalarList__foreach_addcdiv_(c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)>, void, c10::guts::typelist::typelist<c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar> > >, void (c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)>::call(c10::OperatorKernel*, c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)
+         0     0% 98.48%      0.05s  0.75%  torch::autograd::THPVariable__foreach_addcdiv_(_object*, _object*, _object*)
+         0     0% 98.48%      0.05s  0.75%  torch::autograd::VariableType::(anonymous namespace)::_foreach_addcdiv__ScalarList(c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)
+         0     0% 98.48%      0.05s  0.75%  void at::native::foreach_pointwise_op_<std::divides>(c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)
+         0     0% 98.48%      0.05s  0.75%  void at::native::multi_tensor_apply<3, float, at::native::(anonymous namespace)::PointwiseOpScalarListFunctor<float, 3, 3, 0>, std::divides<float> >(std::vector<std::vector<at::Tensor, std::allocator<at::Tensor> >, std::allocator<std::vector<at::Tensor, std::allocator<at::Tensor> > > >&, c10::ArrayRef<c10::Scalar>, at::native::(anonymous namespace)::PointwiseOpScalarListFunctor<float, 3, 3, 0>, std::divides<float>) [clone .isra.0]
+     0.05s  0.73% 99.21%      0.05s  0.73%  [gpu:kernel:_ZN2at6native13reduce_kernelILi128ELi4ENS0_8ReduceOpIfNS0_14func_wrapper_tIfZNS0_11sum_functorIfffEclERNS_14TensorIteratorEEUlffE_EEjfLi4ELi4EEEEEvT1_]
+         0     0% 99.21%      0.04s  0.62%  __device_stub__ZN2at6native57_GLOBAL__N__7e105b8f_24_ForeachBinaryOpScalar_cu_86b9896c25multi_tensor_apply_kernelINS1_18TensorListMetadataILi1EEENS1_21BinaryOpScalarFunctorIfLi1ELi1ELi0EEEJSt10multipliesIfEfEEEvT_T0_DpT1_(at::native::(anonymous namespace)::TensorListMetadata<1>&, at::native::(anonymous namespace)::BinaryOpScalarFunctor<float, 1, 1, 0>&, std::multiplies<float>&, float)
+         0     0% 99.21%      0.04s  0.62%  at::_ops::_foreach_mul__Scalar::call(c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+         0     0% 99.21%      0.04s  0.62%  at::native::foreach_tensor_mul_scalar_kernel_cuda_(c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+         0     0% 99.21%      0.04s  0.62%  c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<void (c10::ArrayRef<at::Tensor>, c10::Scalar const&), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA_Scalar__foreach_mul_(c10::ArrayRef<at::Tensor>, c10::Scalar const&)>, void, c10::guts::typelist::typelist<c10::ArrayRef<at::Tensor>, c10::Scalar const&> >, void (c10::ArrayRef<at::Tensor>, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+         0     0% 99.21%      0.04s  0.62%  torch::autograd::THPVariable__foreach_mul_(_object*, _object*, _object*)
+         0     0% 99.21%      0.04s  0.62%  torch::autograd::VariableType::(anonymous namespace)::_foreach_mul__Scalar(c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+         0     0% 99.21%      0.04s  0.62%  void at::native::foreach_binary_op_<float, std::multiplies>(c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+         0     0% 99.21%      0.04s  0.62%  void at::native::multi_tensor_apply<1, at::native::(anonymous namespace)::BinaryOpScalarFunctor<float, 1, 1, 0>, std::multiplies<float>, float>(std::vector<std::vector<at::Tensor, std::allocator<at::Tensor> >, std::allocator<std::vector<at::Tensor, std::allocator<at::Tensor> > > >&, at::native::(anonymous namespace)::BinaryOpScalarFunctor<float, 1, 1, 0>, std::multiplies<float>, float) [clone .isra.0]
+         0     0% 99.21%      0.04s  0.59%  __device_stub__ZN2at6native54_GLOBAL__N__ae7e1889_21_ForeachPointwiseOp_cu_ef478fac25multi_tensor_apply_kernelINS1_18TensorListMetadataILi3EEENS1_24PointwiseOpScalarFunctorIfLi3ELi3ELi0EEEJSt10multipliesIfEfEEEvT_T0_DpT1_(at::native::(anonymous namespace)::TensorListMetadata<3>&, at::native::(anonymous namespace)::PointwiseOpScalarFunctor<float, 3, 3, 0>&, std::multiplies<float>&, float)
+         0     0% 99.21%      0.04s  0.59%  at::_ops::_foreach_addcmul__Scalar::call(c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+         0     0% 99.21%      0.04s  0.59%  at::_ops::_foreach_addcmul__Scalar::redispatch(c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+         0     0% 99.21%      0.04s  0.59%  c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<void (c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA_Scalar__foreach_addcmul_(c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)>, void, c10::guts::typelist::typelist<c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&> >, void (c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+         0     0% 99.21%      0.04s  0.59%  torch::autograd::THPVariable__foreach_addcmul_(_object*, _object*, _object*)
+         0     0% 99.21%      0.04s  0.59%  torch::autograd::VariableType::(anonymous namespace)::_foreach_addcmul__Scalar(c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+         0     0% 99.21%      0.04s  0.59%  void at::native::foreach_pointwise_op_<std::multiplies>(c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+         0     0% 99.21%      0.04s  0.59%  void at::native::multi_tensor_apply<3, at::native::(anonymous namespace)::PointwiseOpScalarFunctor<float, 3, 3, 0>, std::multiplies<float>, float>(std::vector<std::vector<at::Tensor, std::allocator<at::Tensor> >, std::allocator<std::vector<at::Tensor, std::allocator<at::Tensor> > > >&, at::native::(anonymous namespace)::PointwiseOpScalarFunctor<float, 3, 3, 0>, std::multiplies<float>, float) [clone .isra.0]

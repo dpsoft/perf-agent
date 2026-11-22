@@ -1,0 +1,1049 @@
+perf-agent.capture_id=BMOEAJVVM4UTNVCN5ATYCMCL2G
+Type: gpu
+Time: 2026-11-20 00:51:58 -03
+Duration: 20.37s, Total samples = 6233.36ms (30.61%)
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+    1.93ms   [gpu:kernel:_ZN7cutlass7Kernel2I42cutlass_80_simt_sgemm_128x32_8x5_nt_align1EEvNT_6ParamsE]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cuLaunchKernel
+             libcublasLt.so.13+0x326e53b
+             libcublasLt.so.13+0x1df0eb0
+             libcublasLt.so.13+0xe2b573
+             libcublasLt.so.13+0xf8e200
+             cublasLtSSSMatmul
+             libcublas.so.13+0x1c4b74
+             libcublas.so.13+0x1c6b85
+             libcublas.so.13+0x2cc690
+             cublasSgemm_v2
+             void at::cuda::blas::gemm_internal_cublas<float, float>(char, char, long, long, long, at::OpMathType<float>::type, float const*, long, float const*, long, at::OpMathType<float>::type, float*, long)
+             at::native::(anonymous namespace)::addmm_out_cuda_impl(at::Tensor&, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&, at::native::(anonymous namespace)::Activation, bool) [clone .isra.0]
+             at::native::structured_mm_out_cuda::impl(at::Tensor const&, at::Tensor const&, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&), &at::(anonymous namespace)::wrapper_CUDA_mm(at::Tensor const&, at::Tensor const&)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&> >, at::Tensor(at::Tensor const&, at::Tensor const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             at::_ops::mm::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             torch::autograd::VariableType::(anonymous namespace)::mm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&), &torch::autograd::VariableType::(anonymous namespace)::mm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&> >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             at::_ops::mm::call(at::Tensor const&, at::Tensor const&)
+             torch::autograd::generated::details::mm_mat2_backward(at::Tensor const&, at::Tensor const&, c10::ArrayRef<c10::SymInt>, c10::ArrayRef<c10::SymInt>, c10::Layout, c10::Scalar const&)
+             torch::autograd::generated::AddmmBackward0_apply_functional(std::vector<at::Tensor, std::allocator<at::Tensor> >&&, std::array<bool, (unsigned long)3>, c10::Scalar&, c10::Scalar&, at::Tensor&, c10::Layout&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, at::Tensor&, c10::Layout&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&)
+             torch::autograd::generated::AddmmBackward0::apply(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Node::operator()(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Engine::evaluate_function(std::shared_ptr<torch::autograd::GraphTask>&, torch::autograd::Node*, torch::autograd::InputBuffer&, std::shared_ptr<torch::autograd::ReadyQueue> const&)
+             torch::autograd::Engine::thread_main(std::shared_ptr<torch::autograd::GraphTask> const&)
+             torch::autograd::Engine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             torch::autograd::python::PythonEngine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             execute_native_thread_routine
+             start_thread
+             __clone3
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+   11.38ms   [gpu:kernel:_ZN2at6native29vectorized_elementwise_kernelILi4EZZZNS0_26GeluBackwardCUDAKernelImplERNS_18TensorIteratorBaseENS0_8GeluTypeEENKUlvE0_clEvENKUlvE0_clEvEUlffE_St5arrayIPcLm3EELb0EEEviT0_T1_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cudaLaunchKernel
+             void at::native::gpu_kernel_impl<__nv_hdl_wrapper_t<false, true, false, __nv_dl_tag<void (*)(at::TensorIteratorBase&, at::native::GeluType), &at::native::GeluBackwardCUDAKernelImpl(at::TensorIteratorBase&, at::native::GeluType), (unsigned int)6>, float (float, float), > >(at::TensorIteratorBase&, __nv_hdl_wrapper_t<false, true, false, __nv_dl_tag<void (*)(at::TensorIteratorBase&, at::native::GeluType), &at::native::GeluBackwardCUDAKernelImpl(at::TensorIteratorBase&, at::native::GeluType), (unsigned int)6>, float (float, float), > const&) [clone .isra.0]
+             at::(anonymous namespace)::wrapper_CUDA_gelu_backward(at::Tensor const&, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >), &at::(anonymous namespace)::wrapper_CUDA_gelu_backward(at::Tensor const&, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> > > >, at::Tensor(at::Tensor const&, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)
+             at::_ops::gelu_backward::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)
+             torch::autograd::VariableType::(anonymous namespace)::gelu_backward(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >), &torch::autograd::VariableType::(anonymous namespace)::gelu_backward(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> > > >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)
+             at::_ops::gelu_backward::call(at::Tensor const&, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)
+             torch::autograd::generated::GeluBackward0_apply_functional(std::vector<at::Tensor, std::allocator<at::Tensor> >&&, std::array<bool, (unsigned long)1>, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >&, at::Tensor&)
+             torch::autograd::generated::GeluBackward0::apply(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Node::operator()(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Engine::evaluate_function(std::shared_ptr<torch::autograd::GraphTask>&, torch::autograd::Node*, torch::autograd::InputBuffer&, std::shared_ptr<torch::autograd::ReadyQueue> const&)
+             torch::autograd::Engine::thread_main(std::shared_ptr<torch::autograd::GraphTask> const&)
+             torch::autograd::Engine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             torch::autograd::python::PythonEngine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             execute_native_thread_routine
+             start_thread
+             __clone3
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+    5.34ms   [gpu:kernel:_ZN2at6native13reduce_kernelILi128ELi4ENS0_8ReduceOpIfNS0_14func_wrapper_tIfZNS0_11sum_functorIfffEclERNS_14TensorIteratorEEUlffE_EEjfLi4ELi4EEEEEvT1_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cudaLaunchKernel
+             void at::native::gpu_reduce_kernel<float, float, 4, 4, at::native::func_wrapper_t<float, __nv_hdl_wrapper_t<false, true, false, __nv_dl_tag<void (at::native::sum_functor<float, float, float>::*)(at::TensorIterator&), &at::native::sum_functor<float, float, float>(at::TensorIterator&)::operator(), (unsigned int)1>, float (float, float), > >, double>(at::TensorIterator&, at::native::func_wrapper_t<float, __nv_hdl_wrapper_t<false, true, false, __nv_dl_tag<void (at::native::sum_functor<float, float, float>::*)(at::TensorIterator&), &at::native::sum_functor<float, float, float>(at::TensorIterator&)::operator(), (unsigned int)1>, float (float, float), > > const&, double, at::native::AccumulationBuffer*, long) [clone .isra.0]
+             at::native::structured_sum_out::impl(at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>), &at::(anonymous namespace)::wrapper_CUDA_sum_dim_IntList(at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType> > >, at::Tensor(at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>)
+             at::_ops::sum_dim_IntList::redispatch(c10::DispatchKeySet, at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>)
+             torch::autograd::VariableType::(anonymous namespace)::sum_dim_IntList(c10::DispatchKeySet, at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>), &torch::autograd::VariableType::(anonymous namespace)::sum_dim_IntList(c10::DispatchKeySet, at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType> > >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>)
+             at::_ops::sum_dim_IntList::call(at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>)
+             at::Tensor at::_sum_to<c10::SymInt>(at::Tensor, c10::ArrayRef<c10::SymInt>, bool)
+             torch::autograd::InputMetadata::reduce_grad(at::Tensor&) const
+             torch::autograd::InputMetadata::maybe_reduce(unsigned long, at::Tensor, std::function<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)> const&) const
+             void torch::autograd::validate_outputs_impl<torch::autograd::Edge>(std::vector<torch::autograd::Edge, std::allocator<torch::autograd::Edge> > const&, std::vector<at::Tensor, std::allocator<at::Tensor> >&, std::function<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)> const&)
+             torch::autograd::Engine::evaluate_function(std::shared_ptr<torch::autograd::GraphTask>&, torch::autograd::Node*, torch::autograd::InputBuffer&, std::shared_ptr<torch::autograd::ReadyQueue> const&)
+             torch::autograd::Engine::thread_main(std::shared_ptr<torch::autograd::GraphTask> const&)
+             torch::autograd::Engine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             torch::autograd::python::PythonEngine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             execute_native_thread_routine
+             start_thread
+             __clone3
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+    0.08ms   [gpu:kernel:_ZN2at6native29vectorized_elementwise_kernelILi4ENS0_11FillFunctorIfEESt5arrayIPcLm1EELb0EEEviT0_T1_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cudaLaunchKernel
+             void at::native::gpu_kernel_impl_nocast<at::native::FillFunctor<float> >(at::TensorIteratorBase&, at::native::FillFunctor<float> const&)
+             at::native::fill_kernel_cuda(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const [clone .isra.0]
+             at::native::fill_kernel_cuda(at::TensorIterator&, c10::Scalar const&)
+             at::native::fill_out(at::Tensor&, c10::Scalar const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor& (at::Tensor&, c10::Scalar const&), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA_Scalar_fill_(at::Tensor&, c10::Scalar const&)>, at::Tensor&, c10::guts::typelist::typelist<at::Tensor&, c10::Scalar const&> >, at::Tensor& (at::Tensor&, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor&, c10::Scalar const&)
+             at::_ops::fill__Scalar::call(at::Tensor&, c10::Scalar const&)
+             at::native::zero_(at::Tensor&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor& (at::Tensor&), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA__zero_(at::Tensor&)>, at::Tensor&, c10::guts::typelist::typelist<at::Tensor&> >, at::Tensor& (at::Tensor&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor&)
+             at::_ops::zero_::call(at::Tensor&)
+             at::native::zeros_like(at::Tensor const&, std::optional<c10::ScalarType>, std::optional<c10::Layout>, std::optional<c10::Device>, std::optional<bool>, std::optional<c10::MemoryFormat>)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, std::optional<c10::ScalarType>, std::optional<c10::Layout>, std::optional<c10::Device>, std::optional<bool>, std::optional<c10::MemoryFormat>), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CompositeExplicitAutograd__zeros_like(at::Tensor const&, std::optional<c10::ScalarType>, std::optional<c10::Layout>, std::optional<c10::Device>, std::optional<bool>, std::optional<c10::MemoryFormat>)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, std::optional<c10::ScalarType>, std::optional<c10::Layout>, std::optional<c10::Device>, std::optional<bool>, std::optional<c10::MemoryFormat> > >, at::Tensor(at::Tensor const&, std::optional<c10::ScalarType>, std::optional<c10::Layout>, std::optional<c10::Device>, std::optional<bool>, std::optional<c10::MemoryFormat>)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, std::optional<c10::ScalarType>, std::optional<c10::Layout>, std::optional<c10::Device>, std::optional<bool>, std::optional<c10::MemoryFormat>)
+             at::_ops::zeros_like::call(at::Tensor const&, std::optional<c10::ScalarType>, std::optional<c10::Layout>, std::optional<c10::Device>, std::optional<bool>, std::optional<c10::MemoryFormat>)
+             at::native::mse_loss_backward(at::Tensor const&, at::Tensor const&, at::Tensor const&, long)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&, at::Tensor const&, long), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA__mse_loss_backward(at::Tensor const&, at::Tensor const&, at::Tensor const&, long)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&, at::Tensor const&, long> >, at::Tensor(at::Tensor const&, at::Tensor const&, at::Tensor const&, long)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long)
+             at::_ops::mse_loss_backward::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long)
+             torch::autograd::VariableType::(anonymous namespace)::mse_loss_backward(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long), &torch::autograd::VariableType::(anonymous namespace)::mse_loss_backward(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long> >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long)
+             at::_ops::mse_loss_backward::call(at::Tensor const&, at::Tensor const&, at::Tensor const&, long)
+             torch::autograd::generated::MseLossBackward0_apply_functional(std::vector<at::Tensor, std::allocator<at::Tensor> >&&, std::array<bool, (unsigned long)2>, long&, at::Tensor&, at::Tensor&)
+             torch::autograd::generated::MseLossBackward0::apply(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Node::operator()(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Engine::evaluate_function(std::shared_ptr<torch::autograd::GraphTask>&, torch::autograd::Node*, torch::autograd::InputBuffer&, std::shared_ptr<torch::autograd::ReadyQueue> const&)
+             torch::autograd::Engine::thread_main(std::shared_ptr<torch::autograd::GraphTask> const&)
+             torch::autograd::Engine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             torch::autograd::python::PythonEngine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             execute_native_thread_routine
+             start_thread
+             __clone3
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+    0.13ms   [gpu:kernel:_ZN2at6native18elementwise_kernelILi128ELi2EZNS0_22gpu_kernel_impl_nocastIZZZNS0_24mse_backward_cuda_kernelERNS_14TensorIteratorERKN3c106ScalarEENKUlvE_clEvENKUlvE0_clEvEUlfffE_EEvRNS_18TensorIteratorBaseERKT_EUliE_EEviT1_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cudaLaunchKernel
+             void at::native::gpu_kernel_impl_nocast<__nv_hdl_wrapper_t<false, false, false, __nv_dl_tag<void (*)(at::TensorIterator&, c10::Scalar const&), &at::native::mse_backward_cuda_kernel(at::TensorIterator&, c10::Scalar const&), (unsigned int)2>, float (float, float, float), float> >(at::TensorIteratorBase&, __nv_hdl_wrapper_t<false, false, false, __nv_dl_tag<void (*)(at::TensorIterator&, c10::Scalar const&), &at::native::mse_backward_cuda_kernel(at::TensorIterator&, c10::Scalar const&), (unsigned int)2>, float (float, float, float), float> const&)
+             at::native::mse_backward_cuda_kernel(at::TensorIterator&, c10::Scalar const&)
+             at::native::mse_loss_backward_out(at::Tensor const&, at::Tensor const&, at::Tensor const&, long, at::Tensor&)
+             at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA_grad_input_mse_loss_backward_out(at::Tensor const&, at::Tensor const&, at::Tensor const&, long, at::Tensor&)
+             at::_ops::mse_loss_backward_grad_input::call(at::Tensor const&, at::Tensor const&, at::Tensor const&, long, at::Tensor&)
+             at::native::mse_loss_backward(at::Tensor const&, at::Tensor const&, at::Tensor const&, long)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&, at::Tensor const&, long), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA__mse_loss_backward(at::Tensor const&, at::Tensor const&, at::Tensor const&, long)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&, at::Tensor const&, long> >, at::Tensor(at::Tensor const&, at::Tensor const&, at::Tensor const&, long)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long)
+             at::_ops::mse_loss_backward::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long)
+             torch::autograd::VariableType::(anonymous namespace)::mse_loss_backward(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long), &torch::autograd::VariableType::(anonymous namespace)::mse_loss_backward(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long> >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, long)
+             at::_ops::mse_loss_backward::call(at::Tensor const&, at::Tensor const&, at::Tensor const&, long)
+             torch::autograd::generated::MseLossBackward0_apply_functional(std::vector<at::Tensor, std::allocator<at::Tensor> >&&, std::array<bool, (unsigned long)2>, long&, at::Tensor&, at::Tensor&)
+             torch::autograd::generated::MseLossBackward0::apply(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Node::operator()(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Engine::evaluate_function(std::shared_ptr<torch::autograd::GraphTask>&, torch::autograd::Node*, torch::autograd::InputBuffer&, std::shared_ptr<torch::autograd::ReadyQueue> const&)
+             torch::autograd::Engine::thread_main(std::shared_ptr<torch::autograd::GraphTask> const&)
+             torch::autograd::Engine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             torch::autograd::python::PythonEngine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             execute_native_thread_routine
+             start_thread
+             __clone3
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+  144.22ms   [gpu:kernel:_ZN7cutlass7Kernel2I43cutlass_80_simt_sgemm_128x256_8x4_nt_align1EEvNT_6ParamsE]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cuLaunchKernel
+             libcublasLt.so.13+0x3274094
+             libcublasLt.so.13+0x1df0eb0
+             libcublasLt.so.13+0xe2b573
+             libcublasLt.so.13+0xf8e200
+             cublasLtSSSMatmul
+             libcublas.so.13+0x1c4b74
+             libcublas.so.13+0x1c6b85
+             libcublas.so.13+0x2cc690
+             cublasSgemm_v2
+             void at::cuda::blas::gemm_internal_cublas<float, float>(char, char, long, long, long, at::OpMathType<float>::type, float const*, long, float const*, long, at::OpMathType<float>::type, float*, long)
+             at::native::(anonymous namespace)::addmm_out_cuda_impl(at::Tensor&, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&, at::native::(anonymous namespace)::Activation, bool) [clone .isra.0]
+             at::native::structured_mm_out_cuda::impl(at::Tensor const&, at::Tensor const&, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&), &at::(anonymous namespace)::wrapper_CUDA_mm(at::Tensor const&, at::Tensor const&)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&> >, at::Tensor(at::Tensor const&, at::Tensor const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             at::_ops::mm::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             torch::autograd::VariableType::(anonymous namespace)::mm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&), &torch::autograd::VariableType::(anonymous namespace)::mm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&> >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             at::_ops::mm::call(at::Tensor const&, at::Tensor const&)
+             torch::autograd::generated::details::mm_mat2_backward(at::Tensor const&, at::Tensor const&, c10::ArrayRef<c10::SymInt>, c10::ArrayRef<c10::SymInt>, c10::Layout, c10::Scalar const&)
+             torch::autograd::generated::AddmmBackward0_apply_functional(std::vector<at::Tensor, std::allocator<at::Tensor> >&&, std::array<bool, (unsigned long)3>, c10::Scalar&, c10::Scalar&, at::Tensor&, c10::Layout&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, at::Tensor&, c10::Layout&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&)
+             torch::autograd::generated::AddmmBackward0::apply(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Node::operator()(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Engine::evaluate_function(std::shared_ptr<torch::autograd::GraphTask>&, torch::autograd::Node*, torch::autograd::InputBuffer&, std::shared_ptr<torch::autograd::ReadyQueue> const&)
+             torch::autograd::Engine::thread_main(std::shared_ptr<torch::autograd::GraphTask> const&)
+             torch::autograd::Engine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             torch::autograd::python::PythonEngine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             execute_native_thread_routine
+             start_thread
+             __clone3
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+    0.16ms   [gpu:kernel:_ZN8cublasLt19splitKreduce_kernelILi32ELi16EiffffLb0EfffLb1ELb0ELb0ELb0EEEvNS_18cublasSplitKParamsIT4_EEPKT2_PKT8_PT7_PT3_PKS2_SF_PKT9_S6_PSG_PvlPS2_PiSL_SL_SF_SF_SF_SF_SF_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             libcublasLt.so.13+0x71bd48d
+             libcublasLt.so.13+0x1a884ac
+             libcublasLt.so.13+0x1df0f87
+             libcublasLt.so.13+0xe2b573
+             libcublasLt.so.13+0xf8e200
+             cublasLtSSSMatmul
+             libcublas.so.13+0x1c4b74
+             libcublas.so.13+0x1c6b85
+             libcublas.so.13+0x2cc690
+             cublasSgemm_v2
+             void at::cuda::blas::gemm_internal_cublas<float, float>(char, char, long, long, long, at::OpMathType<float>::type, float const*, long, float const*, long, at::OpMathType<float>::type, float*, long)
+             at::native::(anonymous namespace)::addmm_out_cuda_impl(at::Tensor&, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&, at::native::(anonymous namespace)::Activation, bool) [clone .isra.0]
+             at::native::structured_mm_out_cuda::impl(at::Tensor const&, at::Tensor const&, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&), &at::(anonymous namespace)::wrapper_CUDA_mm(at::Tensor const&, at::Tensor const&)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&> >, at::Tensor(at::Tensor const&, at::Tensor const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             at::_ops::mm::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             torch::autograd::VariableType::(anonymous namespace)::mm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&), &torch::autograd::VariableType::(anonymous namespace)::mm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&> >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             at::_ops::mm::call(at::Tensor const&, at::Tensor const&)
+             torch::autograd::generated::details::mm_mat2_backward(at::Tensor const&, at::Tensor const&, c10::ArrayRef<c10::SymInt>, c10::ArrayRef<c10::SymInt>, c10::Layout, c10::Scalar const&)
+             torch::autograd::generated::AddmmBackward0_apply_functional(std::vector<at::Tensor, std::allocator<at::Tensor> >&&, std::array<bool, (unsigned long)3>, c10::Scalar&, c10::Scalar&, at::Tensor&, c10::Layout&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, at::Tensor&, c10::Layout&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&)
+             torch::autograd::generated::AddmmBackward0::apply(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Node::operator()(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Engine::evaluate_function(std::shared_ptr<torch::autograd::GraphTask>&, torch::autograd::Node*, torch::autograd::InputBuffer&, std::shared_ptr<torch::autograd::ReadyQueue> const&)
+             torch::autograd::Engine::thread_main(std::shared_ptr<torch::autograd::GraphTask> const&)
+             torch::autograd::Engine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             torch::autograd::python::PythonEngine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             execute_native_thread_routine
+             start_thread
+             __clone3
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+  178.90ms   [gpu:kernel:_ZN7cutlass7Kernel2I43cutlass_80_simt_sgemm_256x128_8x4_nn_align1EEvNT_6ParamsE]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cuLaunchKernel
+             libcublasLt.so.13+0x3279bb4
+             libcublasLt.so.13+0x1df0eb0
+             libcublasLt.so.13+0xe2b573
+             libcublasLt.so.13+0xf8e200
+             cublasLtSSSMatmul
+             libcublas.so.13+0x1c4b74
+             libcublas.so.13+0x1c6b85
+             libcublas.so.13+0x2cc690
+             cublasSgemm_v2
+             void at::cuda::blas::gemm_internal_cublas<float, float>(char, char, long, long, long, at::OpMathType<float>::type, float const*, long, float const*, long, at::OpMathType<float>::type, float*, long)
+             at::native::(anonymous namespace)::addmm_out_cuda_impl(at::Tensor&, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&, at::native::(anonymous namespace)::Activation, bool) [clone .isra.0]
+             at::native::structured_mm_out_cuda::impl(at::Tensor const&, at::Tensor const&, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&), &at::(anonymous namespace)::wrapper_CUDA_mm(at::Tensor const&, at::Tensor const&)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&> >, at::Tensor(at::Tensor const&, at::Tensor const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             at::_ops::mm::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             torch::autograd::VariableType::(anonymous namespace)::mm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&), &torch::autograd::VariableType::(anonymous namespace)::mm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&> >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             at::_ops::mm::call(at::Tensor const&, at::Tensor const&)
+             torch::autograd::generated::details::mm_mat1_backward(at::Tensor const&, at::Tensor const&, c10::ArrayRef<c10::SymInt>, c10::ArrayRef<c10::SymInt>, c10::Layout, c10::Scalar const&)
+             torch::autograd::generated::AddmmBackward0_apply_functional(std::vector<at::Tensor, std::allocator<at::Tensor> >&&, std::array<bool, (unsigned long)3>, c10::Scalar&, c10::Scalar&, at::Tensor&, c10::Layout&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, at::Tensor&, c10::Layout&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&)
+             torch::autograd::generated::AddmmBackward0::apply(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Node::operator()(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Engine::evaluate_function(std::shared_ptr<torch::autograd::GraphTask>&, torch::autograd::Node*, torch::autograd::InputBuffer&, std::shared_ptr<torch::autograd::ReadyQueue> const&)
+             torch::autograd::Engine::thread_main(std::shared_ptr<torch::autograd::GraphTask> const&)
+             torch::autograd::Engine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             torch::autograd::python::PythonEngine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             execute_native_thread_routine
+             start_thread
+             __clone3
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+  186.28ms   [gpu:kernel:ampere_sgemm_128x64_tn]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             libcublasLt.so.13+0x71bd1ed
+             libcublasLt.so.13+0x712d695
+             libcublasLt.so.13+0x19426a6
+             libcublasLt.so.13+0x1943221
+             libcublasLt.so.13+0xe2b573
+             libcublasLt.so.13+0xf8e200
+             cublasLtMatmul
+             bool at::cuda::blas::gemm_and_bias<float, float>(bool, bool, long, long, long, at::OpMathType<float>::type, float const*, long, float const*, long, float const*, float*, long, at::cuda::blas::GEMMAndBiasActivationEpilogue, float const*, long, at::OpMathType<float>::type)
+             bool at::native::(anonymous namespace)::launchGemmAndBiasCublasLt<float, float>(at::native::cublasCommonArgs&, std::optional<at::Tensor> const&, c10::Scalar const&, at::native::(anonymous namespace)::Activation)
+             at::native::(anonymous namespace)::addmm_out_cuda_impl(at::Tensor&, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&, at::native::(anonymous namespace)::Activation, bool) [clone .isra.0]
+             at::native::structured_addmm_out_cuda::impl(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&), &at::(anonymous namespace)::wrapper_CUDA_addmm(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&> >, at::Tensor(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+             at::_ops::addmm::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+             torch::autograd::VariableType::(anonymous namespace)::addmm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&), &torch::autograd::VariableType::(anonymous namespace)::addmm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&> >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+             at::_ops::addmm::call(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+             at::native::linear(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CompositeImplicitAutograd__linear(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&> >, at::Tensor(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)
+             at::_ops::linear::call(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)
+             torch::autograd::THPVariable_linear(_object*, _object*, _object*)
+             cfunction_call
+             _PyEval_EvalFrameDefault
+             Linear.forward (linear.py:130)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._call_impl (module.py:1787)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._wrapped_call_impl (module.py:1779)
+             _PyObject_Call_Prepend
+             slot_tp_call
+             _PyEval_EvalFrameDefault
+             Sequential.forward (container.py:254)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._call_impl (module.py:1787)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._wrapped_call_impl (module.py:1779)
+             _PyObject_Call_Prepend
+             slot_tp_call
+             _PyEval_EvalFrameDefault
+             train (train.py:53)
+             main (train.py:99)
+             <module> (train.py:1)
+             PyEval_EvalCode
+             run_mod.llvm.10142647837896989511
+             pyrun_file
+             _PyRun_SimpleFileObject
+             _PyRun_AnyFileObject
+             pymain_run_file_obj
+             pymain_run_file
+             Py_RunMain.warm
+             pymain_main.llvm.3121965821471187960
+             main
+             __libc_start_call_main
+             __libc_start_main_alias_1
+             _start
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+   16.71ms   [gpu:kernel:_ZN2at6native57_GLOBAL__N__7e105b8f_24_ForeachBinaryOpScalar_cu_86b9896c25multi_tensor_apply_kernelINS1_18TensorListMetadataILi1EEENS1_21BinaryOpScalarFunctorIfLi1ELi1ELi0EEEJSt4plusIfEfEEEvT_T0_DpT1_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cudaLaunchKernel
+             __device_stub__ZN2at6native57_GLOBAL__N__7e105b8f_24_ForeachBinaryOpScalar_cu_86b9896c25multi_tensor_apply_kernelINS1_18TensorListMetadataILi1EEENS1_21BinaryOpScalarFunctorIfLi1ELi1ELi0EEEJSt4plusIfEfEEEvT_T0_DpT1_(at::native::(anonymous namespace)::TensorListMetadata<1>&, at::native::(anonymous namespace)::BinaryOpScalarFunctor<float, 1, 1, 0>&, std::plus<float>&, float)
+             void at::native::multi_tensor_apply<1, at::native::(anonymous namespace)::BinaryOpScalarFunctor<float, 1, 1, 0>, std::plus<float>, float>(std::vector<std::vector<at::Tensor, std::allocator<at::Tensor> >, std::allocator<std::vector<at::Tensor, std::allocator<at::Tensor> > > >&, at::native::(anonymous namespace)::BinaryOpScalarFunctor<float, 1, 1, 0>, std::plus<float>, float) [clone .isra.0]
+             at::native::foreach_tensor_add_scalar_kernel_cuda_(c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<void (c10::ArrayRef<at::Tensor>, c10::Scalar const&), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA_Scalar__foreach_add_(c10::ArrayRef<at::Tensor>, c10::Scalar const&)>, void, c10::guts::typelist::typelist<c10::ArrayRef<at::Tensor>, c10::Scalar const&> >, void (c10::ArrayRef<at::Tensor>, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             torch::autograd::VariableType::(anonymous namespace)::_foreach_add__Scalar(c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             at::_ops::_foreach_add__Scalar::call(c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             torch::autograd::THPVariable__foreach_add_(_object*, _object*, _object*)
+             cfunction_call
+             _PyEval_EvalFrameDefault
+             _multi_tensor_adam (adam.py:553)
+             adam (adam.py:902)
+             _disable_dynamo_if_unsupported.<locals>.wrapper.<locals>.maybe_fallback (optimizer.py:140)
+             Adam.step (adam.py:214)
+             _use_grad_for_differentiable.<locals>._use_grad (optimizer.py:59)
+             Optimizer.profile_hook_step.<locals>.wrapper (optimizer.py:528)
+             train (train.py:53)
+             main (train.py:99)
+             <module> (train.py:1)
+             PyEval_EvalCode
+             run_mod.llvm.10142647837896989511
+             pyrun_file
+             _PyRun_SimpleFileObject
+             _PyRun_AnyFileObject
+             pymain_run_file_obj
+             pymain_run_file
+             Py_RunMain.warm
+             pymain_main.llvm.3121965821471187960
+             main
+             __libc_start_call_main
+             __libc_start_main_alias_1
+             _start
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+    0.18ms   [gpu:kernel:_ZN8cublasLt19splitKreduce_kernelILi32ELi16EiffffLb0EfffLb1ELb1ELb0ELb0EEEvNS_18cublasSplitKParamsIT4_EEPKT2_PKT8_PT7_PT3_PKS2_SF_PKT9_S6_PSG_PvlPS2_PiSL_SL_SF_SF_SF_SF_SF_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             libcublasLt.so.13+0x71bd48d
+             libcublasLt.so.13+0x1a8903b
+             libcublasLt.so.13+0x19440ad
+             libcublasLt.so.13+0xe2b573
+             libcublasLt.so.13+0xf8e200
+             cublasLtMatmul
+             bool at::cuda::blas::gemm_and_bias<float, float>(bool, bool, long, long, long, at::OpMathType<float>::type, float const*, long, float const*, long, float const*, float*, long, at::cuda::blas::GEMMAndBiasActivationEpilogue, float const*, long, at::OpMathType<float>::type)
+             bool at::native::(anonymous namespace)::launchGemmAndBiasCublasLt<float, float>(at::native::cublasCommonArgs&, std::optional<at::Tensor> const&, c10::Scalar const&, at::native::(anonymous namespace)::Activation)
+             at::native::(anonymous namespace)::addmm_out_cuda_impl(at::Tensor&, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&, at::native::(anonymous namespace)::Activation, bool) [clone .isra.0]
+             at::native::structured_addmm_out_cuda::impl(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&), &at::(anonymous namespace)::wrapper_CUDA_addmm(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&> >, at::Tensor(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+             at::_ops::addmm::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+             torch::autograd::VariableType::(anonymous namespace)::addmm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&), &torch::autograd::VariableType::(anonymous namespace)::addmm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&> >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+             at::_ops::addmm::call(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+             at::native::linear(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CompositeImplicitAutograd__linear(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&> >, at::Tensor(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)
+             at::_ops::linear::call(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)
+             torch::autograd::THPVariable_linear(_object*, _object*, _object*)
+             cfunction_call
+             _PyEval_EvalFrameDefault
+             Linear.forward (linear.py:130)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._call_impl (module.py:1787)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._wrapped_call_impl (module.py:1779)
+             _PyObject_Call_Prepend
+             slot_tp_call
+             _PyEval_EvalFrameDefault
+             Sequential.forward (container.py:254)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._call_impl (module.py:1787)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._wrapped_call_impl (module.py:1779)
+             _PyObject_Call_Prepend
+             slot_tp_call
+             _PyEval_EvalFrameDefault
+             train (train.py:53)
+             main (train.py:99)
+             <module> (train.py:1)
+             PyEval_EvalCode
+             run_mod.llvm.10142647837896989511
+             pyrun_file
+             _PyRun_SimpleFileObject
+             _PyRun_AnyFileObject
+             pymain_run_file_obj
+             pymain_run_file
+             Py_RunMain.warm
+             pymain_main.llvm.3121965821471187960
+             main
+             __libc_start_call_main
+             __libc_start_main_alias_1
+             _start
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+   38.43ms   [gpu:kernel:_ZN2at6native57_GLOBAL__N__7e105b8f_24_ForeachBinaryOpScalar_cu_86b9896c25multi_tensor_apply_kernelINS1_18TensorListMetadataILi1EEENS1_21BinaryOpScalarFunctorIfLi1ELi1ELi0EEEJSt10multipliesIfEfEEEvT_T0_DpT1_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cudaLaunchKernel
+             __device_stub__ZN2at6native57_GLOBAL__N__7e105b8f_24_ForeachBinaryOpScalar_cu_86b9896c25multi_tensor_apply_kernelINS1_18TensorListMetadataILi1EEENS1_21BinaryOpScalarFunctorIfLi1ELi1ELi0EEEJSt10multipliesIfEfEEEvT_T0_DpT1_(at::native::(anonymous namespace)::TensorListMetadata<1>&, at::native::(anonymous namespace)::BinaryOpScalarFunctor<float, 1, 1, 0>&, std::multiplies<float>&, float)
+             void at::native::multi_tensor_apply<1, at::native::(anonymous namespace)::BinaryOpScalarFunctor<float, 1, 1, 0>, std::multiplies<float>, float>(std::vector<std::vector<at::Tensor, std::allocator<at::Tensor> >, std::allocator<std::vector<at::Tensor, std::allocator<at::Tensor> > > >&, at::native::(anonymous namespace)::BinaryOpScalarFunctor<float, 1, 1, 0>, std::multiplies<float>, float) [clone .isra.0]
+             void at::native::foreach_binary_op_<float, std::multiplies>(c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             at::native::foreach_tensor_mul_scalar_kernel_cuda_(c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<void (c10::ArrayRef<at::Tensor>, c10::Scalar const&), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA_Scalar__foreach_mul_(c10::ArrayRef<at::Tensor>, c10::Scalar const&)>, void, c10::guts::typelist::typelist<c10::ArrayRef<at::Tensor>, c10::Scalar const&> >, void (c10::ArrayRef<at::Tensor>, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             torch::autograd::VariableType::(anonymous namespace)::_foreach_mul__Scalar(c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             at::_ops::_foreach_mul__Scalar::call(c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             torch::autograd::THPVariable__foreach_mul_(_object*, _object*, _object*)
+             cfunction_call
+             _PyEval_EvalFrameDefault
+             _multi_tensor_adam (adam.py:553)
+             adam (adam.py:902)
+             _disable_dynamo_if_unsupported.<locals>.wrapper.<locals>.maybe_fallback (optimizer.py:140)
+             Adam.step (adam.py:214)
+             _use_grad_for_differentiable.<locals>._use_grad (optimizer.py:59)
+             Optimizer.profile_hook_step.<locals>.wrapper (optimizer.py:528)
+             train (train.py:53)
+             main (train.py:99)
+             <module> (train.py:1)
+             PyEval_EvalCode
+             run_mod.llvm.10142647837896989511
+             pyrun_file
+             _PyRun_SimpleFileObject
+             _PyRun_AnyFileObject
+             pymain_run_file_obj
+             pymain_run_file
+             Py_RunMain.warm
+             pymain_main.llvm.3121965821471187960
+             main
+             __libc_start_call_main
+             __libc_start_main_alias_1
+             _start
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+   19.14ms   [gpu:kernel:_ZN2at6native61_GLOBAL__N__832b9cb6_28_ForeachBinaryOpScalarList_cu_dda10a6925multi_tensor_apply_kernelINS1_28TensorListScalarListMetadataIfLi1EEENS1_25BinaryOpScalarListFunctorIfLi1ELi1ELi0EEEJSt7dividesIfEEEEvT_T0_DpT1_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cudaLaunchKernel
+             __device_stub__ZN2at6native61_GLOBAL__N__832b9cb6_28_ForeachBinaryOpScalarList_cu_dda10a6925multi_tensor_apply_kernelINS1_28TensorListScalarListMetadataIfLi1EEENS1_25BinaryOpScalarListFunctorIfLi1ELi1ELi0EEEJSt7dividesIfEEEEvT_T0_DpT1_(at::native::(anonymous namespace)::TensorListScalarListMetadata<float, 1>&, at::native::(anonymous namespace)::BinaryOpScalarListFunctor<float, 1, 1, 0>&, std::divides<float>&)
+             void at::native::multi_tensor_apply<1, float, at::native::(anonymous namespace)::BinaryOpScalarListFunctor<float, 1, 1, 0>, std::divides<float> >(std::vector<std::vector<at::Tensor, std::allocator<at::Tensor> >, std::allocator<std::vector<at::Tensor, std::allocator<at::Tensor> > > >&, c10::ArrayRef<c10::Scalar>, at::native::(anonymous namespace)::BinaryOpScalarListFunctor<float, 1, 1, 0>, std::divides<float>) [clone .isra.0]
+             at::native::foreach_tensor_div_scalarlist_kernel_cuda_(c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<void (c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA_ScalarList__foreach_div_(c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)>, void, c10::guts::typelist::typelist<c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar> > >, void (c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)>::call(c10::OperatorKernel*, c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)
+             torch::autograd::VariableType::(anonymous namespace)::_foreach_div__ScalarList(c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)
+             at::_ops::_foreach_div__ScalarList::call(c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)
+             torch::autograd::THPVariable__foreach_div_(_object*, _object*, _object*)
+             cfunction_call
+             _PyEval_EvalFrameDefault
+             _multi_tensor_adam (adam.py:553)
+             adam (adam.py:902)
+             _disable_dynamo_if_unsupported.<locals>.wrapper.<locals>.maybe_fallback (optimizer.py:140)
+             Adam.step (adam.py:214)
+             _use_grad_for_differentiable.<locals>._use_grad (optimizer.py:59)
+             Optimizer.profile_hook_step.<locals>.wrapper (optimizer.py:528)
+             train (train.py:53)
+             main (train.py:99)
+             <module> (train.py:1)
+             PyEval_EvalCode
+             run_mod.llvm.10142647837896989511
+             pyrun_file
+             _PyRun_SimpleFileObject
+             _PyRun_AnyFileObject
+             pymain_run_file_obj
+             pymain_run_file
+             Py_RunMain.warm
+             pymain_main.llvm.3121965821471187960
+             main
+             __libc_start_call_main
+             __libc_start_main_alias_1
+             _start
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+   36.83ms   [gpu:kernel:_ZN2at6native54_GLOBAL__N__ae7e1889_21_ForeachPointwiseOp_cu_ef478fac25multi_tensor_apply_kernelINS1_18TensorListMetadataILi3EEENS1_24PointwiseOpScalarFunctorIfLi3ELi3ELi0EEEJSt10multipliesIfEfEEEvT_T0_DpT1_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cudaLaunchKernel
+             __device_stub__ZN2at6native54_GLOBAL__N__ae7e1889_21_ForeachPointwiseOp_cu_ef478fac25multi_tensor_apply_kernelINS1_18TensorListMetadataILi3EEENS1_24PointwiseOpScalarFunctorIfLi3ELi3ELi0EEEJSt10multipliesIfEfEEEvT_T0_DpT1_(at::native::(anonymous namespace)::TensorListMetadata<3>&, at::native::(anonymous namespace)::PointwiseOpScalarFunctor<float, 3, 3, 0>&, std::multiplies<float>&, float)
+             void at::native::multi_tensor_apply<3, at::native::(anonymous namespace)::PointwiseOpScalarFunctor<float, 3, 3, 0>, std::multiplies<float>, float>(std::vector<std::vector<at::Tensor, std::allocator<at::Tensor> >, std::allocator<std::vector<at::Tensor, std::allocator<at::Tensor> > > >&, at::native::(anonymous namespace)::PointwiseOpScalarFunctor<float, 3, 3, 0>, std::multiplies<float>, float) [clone .isra.0]
+             void at::native::foreach_pointwise_op_<std::multiplies>(c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<void (c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA_Scalar__foreach_addcmul_(c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)>, void, c10::guts::typelist::typelist<c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&> >, void (c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             at::_ops::_foreach_addcmul__Scalar::redispatch(c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             torch::autograd::VariableType::(anonymous namespace)::_foreach_addcmul__Scalar(c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             at::_ops::_foreach_addcmul__Scalar::call(c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             torch::autograd::THPVariable__foreach_addcmul_(_object*, _object*, _object*)
+             cfunction_call
+             _PyEval_EvalFrameDefault
+             _multi_tensor_adam (adam.py:553)
+             adam (adam.py:902)
+             _disable_dynamo_if_unsupported.<locals>.wrapper.<locals>.maybe_fallback (optimizer.py:140)
+             Adam.step (adam.py:214)
+             _use_grad_for_differentiable.<locals>._use_grad (optimizer.py:59)
+             Optimizer.profile_hook_step.<locals>.wrapper (optimizer.py:528)
+             train (train.py:53)
+             main (train.py:99)
+             <module> (train.py:1)
+             PyEval_EvalCode
+             run_mod.llvm.10142647837896989511
+             pyrun_file
+             _PyRun_SimpleFileObject
+             _PyRun_AnyFileObject
+             pymain_run_file_obj
+             pymain_run_file
+             Py_RunMain.warm
+             pymain_main.llvm.3121965821471187960
+             main
+             __libc_start_call_main
+             __libc_start_main_alias_1
+             _start
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+    7.02ms   [gpu:kernel:_ZN2at6native29vectorized_elementwise_kernelILi4EZZZNS0_18GeluCUDAKernelImplERNS_18TensorIteratorBaseENS0_8GeluTypeEENKUlvE0_clEvENKUlvE0_clEvEUlfE_St5arrayIPcLm2EELb0EEEviT0_T1_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cudaLaunchKernel
+             void at::native::gpu_kernel_impl<__nv_hdl_wrapper_t<false, true, false, __nv_dl_tag<void (*)(at::TensorIteratorBase&, at::native::GeluType), &at::native::GeluCUDAKernelImpl(at::TensorIteratorBase&, at::native::GeluType), (unsigned int)6>, float (float), > >(at::TensorIteratorBase&, __nv_hdl_wrapper_t<false, true, false, __nv_dl_tag<void (*)(at::TensorIteratorBase&, at::native::GeluType), &at::native::GeluCUDAKernelImpl(at::TensorIteratorBase&, at::native::GeluType), (unsigned int)6>, float (float), > const&) [clone .isra.0]
+             at::(anonymous namespace)::wrapper_CUDA_gelu(at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >), &at::(anonymous namespace)::wrapper_CUDA_gelu(at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, std::basic_string_view<char, std::char_traits<char> > > >, at::Tensor(at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)
+             at::_ops::gelu::redispatch(c10::DispatchKeySet, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)
+             torch::autograd::VariableType::(anonymous namespace)::gelu(c10::DispatchKeySet, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >), &torch::autograd::VariableType::(anonymous namespace)::gelu(c10::DispatchKeySet, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> > > >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)
+             at::_ops::gelu::call(at::Tensor const&, std::basic_string_view<char, std::char_traits<char> >)
+             torch::autograd::THPVariable_gelu(_object*, _object*, _object*)
+             cfunction_call
+             _PyEval_EvalFrameDefault
+             GELU.forward (activation.py:813)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._call_impl (module.py:1787)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._wrapped_call_impl (module.py:1779)
+             _PyObject_Call_Prepend
+             slot_tp_call
+             _PyEval_EvalFrameDefault
+             Sequential.forward (container.py:254)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._call_impl (module.py:1787)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._wrapped_call_impl (module.py:1779)
+             _PyObject_Call_Prepend
+             slot_tp_call
+             _PyEval_EvalFrameDefault
+             train (train.py:53)
+             main (train.py:99)
+             <module> (train.py:1)
+             PyEval_EvalCode
+             run_mod.llvm.10142647837896989511
+             pyrun_file
+             _PyRun_SimpleFileObject
+             _PyRun_AnyFileObject
+             pymain_run_file_obj
+             pymain_run_file
+             Py_RunMain.warm
+             pymain_main.llvm.3121965821471187960
+             main
+             __libc_start_call_main
+             __libc_start_main_alias_1
+             _start
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+    0.09ms   [gpu:kernel:_ZN2at6native29vectorized_elementwise_kernelILi4EZZZNS0_15mse_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE_clEvENKUlvE0_clEvEUlffE_St5arrayIPcLm3EELb0EEEviT0_T1_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cudaLaunchKernel
+             void at::native::gpu_kernel_impl<__nv_hdl_wrapper_t<false, true, false, __nv_dl_tag<void (*)(at::TensorIteratorBase&), &at::native::mse_kernel_cuda(at::TensorIteratorBase&), (unsigned int)2>, float (float, float), > >(at::TensorIteratorBase&, __nv_hdl_wrapper_t<false, true, false, __nv_dl_tag<void (*)(at::TensorIteratorBase&), &at::native::mse_kernel_cuda(at::TensorIteratorBase&), (unsigned int)2>, float (float, float), > const&) [clone .isra.0]
+             at::native::structured_mse_loss_out::impl(at::Tensor const&, at::Tensor const&, long, at::Tensor const&)
+             at::(anonymous namespace)::wrapper_CUDA_mse_loss(at::Tensor const&, at::Tensor const&, long)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&, long), &at::(anonymous namespace)::wrapper_CUDA_mse_loss(at::Tensor const&, at::Tensor const&, long)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&, long> >, at::Tensor(at::Tensor const&, at::Tensor const&, long)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long)
+             at::_ops::mse_loss::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long)
+             torch::autograd::VariableType::(anonymous namespace)::mse_loss(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long), &torch::autograd::VariableType::(anonymous namespace)::mse_loss(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long> >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long)
+             at::_ops::mse_loss::call(at::Tensor const&, at::Tensor const&, long)
+             torch::autograd::THPVariable_mse_loss(_object*, _object*, _object*)
+             cfunction_call
+             _PyEval_EvalFrameDefault
+             mse_loss (functional.py:4271)
+             MSELoss.forward (loss.py:626)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._call_impl (module.py:1787)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._wrapped_call_impl (module.py:1779)
+             _PyObject_Call_Prepend
+             slot_tp_call
+             _PyEval_EvalFrameDefault
+             train (train.py:53)
+             main (train.py:99)
+             <module> (train.py:1)
+             PyEval_EvalCode
+             run_mod.llvm.10142647837896989511
+             pyrun_file
+             _PyRun_SimpleFileObject
+             _PyRun_AnyFileObject
+             pymain_run_file_obj
+             pymain_run_file
+             Py_RunMain.warm
+             pymain_main.llvm.3121965821471187960
+             main
+             __libc_start_call_main
+             __libc_start_main_alias_1
+             _start
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+    2.14ms   [gpu:kernel:ampere_sgemm_32x32_sliced1x4_tn]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             libcublasLt.so.13+0x71bd1ed
+             libcublasLt.so.13+0x712e495
+             libcublasLt.so.13+0x19426a6
+             libcublasLt.so.13+0x1943e61
+             libcublasLt.so.13+0xe2b573
+             libcublasLt.so.13+0xf8e200
+             cublasLtMatmul
+             bool at::cuda::blas::gemm_and_bias<float, float>(bool, bool, long, long, long, at::OpMathType<float>::type, float const*, long, float const*, long, float const*, float*, long, at::cuda::blas::GEMMAndBiasActivationEpilogue, float const*, long, at::OpMathType<float>::type)
+             bool at::native::(anonymous namespace)::launchGemmAndBiasCublasLt<float, float>(at::native::cublasCommonArgs&, std::optional<at::Tensor> const&, c10::Scalar const&, at::native::(anonymous namespace)::Activation)
+             at::native::(anonymous namespace)::addmm_out_cuda_impl(at::Tensor&, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&, at::native::(anonymous namespace)::Activation, bool) [clone .isra.0]
+             at::native::structured_addmm_out_cuda::impl(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&), &at::(anonymous namespace)::wrapper_CUDA_addmm(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&> >, at::Tensor(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+             at::_ops::addmm::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+             torch::autograd::VariableType::(anonymous namespace)::addmm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&), &torch::autograd::VariableType::(anonymous namespace)::addmm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&> >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+             at::_ops::addmm::call(at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&)
+             at::native::linear(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CompositeImplicitAutograd__linear(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&> >, at::Tensor(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)
+             at::_ops::linear::call(at::Tensor const&, at::Tensor const&, std::optional<at::Tensor> const&)
+             torch::autograd::THPVariable_linear(_object*, _object*, _object*)
+             cfunction_call
+             _PyEval_EvalFrameDefault
+             Linear.forward (linear.py:130)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._call_impl (module.py:1787)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._wrapped_call_impl (module.py:1779)
+             _PyObject_Call_Prepend
+             slot_tp_call
+             _PyEval_EvalFrameDefault
+             Sequential.forward (container.py:254)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._call_impl (module.py:1787)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._wrapped_call_impl (module.py:1779)
+             _PyObject_Call_Prepend
+             slot_tp_call
+             _PyEval_EvalFrameDefault
+             train (train.py:53)
+             main (train.py:99)
+             <module> (train.py:1)
+             PyEval_EvalCode
+             run_mod.llvm.10142647837896989511
+             pyrun_file
+             _PyRun_SimpleFileObject
+             _PyRun_AnyFileObject
+             pymain_run_file_obj
+             pymain_run_file
+             Py_RunMain.warm
+             pymain_main.llvm.3121965821471187960
+             main
+             __libc_start_call_main
+             __libc_start_main_alias_1
+             _start
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+    0.06ms   [gpu:kernel:_ZN2at6native29vectorized_elementwise_kernelILi4ENS0_11FillFunctorIfEESt5arrayIPcLm1EELb0EEEviT0_T1_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cudaLaunchKernel
+             void at::native::gpu_kernel_impl_nocast<at::native::FillFunctor<float> >(at::TensorIteratorBase&, at::native::FillFunctor<float> const&)
+             at::native::fill_kernel_cuda(at::TensorIterator&, c10::Scalar const&)::{lambda()#1}::operator()() const [clone .isra.0]
+             at::native::fill_kernel_cuda(at::TensorIterator&, c10::Scalar const&)
+             at::native::fill_out(at::Tensor&, c10::Scalar const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor& (at::Tensor&, c10::Scalar const&), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA_Scalar_fill_(at::Tensor&, c10::Scalar const&)>, at::Tensor&, c10::guts::typelist::typelist<at::Tensor&, c10::Scalar const&> >, at::Tensor& (at::Tensor&, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor&, c10::Scalar const&)
+             at::_ops::fill__Scalar::call(at::Tensor&, c10::Scalar const&)
+             at::native::ones_like(at::Tensor const&, std::optional<c10::ScalarType>, std::optional<c10::Layout>, std::optional<c10::Device>, std::optional<bool>, std::optional<c10::MemoryFormat>)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, std::optional<c10::ScalarType>, std::optional<c10::Layout>, std::optional<c10::Device>, std::optional<bool>, std::optional<c10::MemoryFormat>), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CompositeExplicitAutograd__ones_like(at::Tensor const&, std::optional<c10::ScalarType>, std::optional<c10::Layout>, std::optional<c10::Device>, std::optional<bool>, std::optional<c10::MemoryFormat>)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, std::optional<c10::ScalarType>, std::optional<c10::Layout>, std::optional<c10::Device>, std::optional<bool>, std::optional<c10::MemoryFormat> > >, at::Tensor(at::Tensor const&, std::optional<c10::ScalarType>, std::optional<c10::Layout>, std::optional<c10::Device>, std::optional<bool>, std::optional<c10::MemoryFormat>)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, std::optional<c10::ScalarType>, std::optional<c10::Layout>, std::optional<c10::Device>, std::optional<bool>, std::optional<c10::MemoryFormat>)
+             at::_ops::ones_like::call(at::Tensor const&, std::optional<c10::ScalarType>, std::optional<c10::Layout>, std::optional<c10::Device>, std::optional<bool>, std::optional<c10::MemoryFormat>)
+             torch::autograd::THPVariable_ones_like(_object*, _object*, _object*)
+             cfunction_call
+             _PyEval_EvalFrameDefault
+             _make_grads (__init__.py:91)
+             backward (__init__.py:255)
+             Tensor.backward (_tensor.py:566)
+             train (train.py:53)
+             main (train.py:99)
+             <module> (train.py:1)
+             PyEval_EvalCode
+             run_mod.llvm.10142647837896989511
+             pyrun_file
+             _PyRun_SimpleFileObject
+             _PyRun_AnyFileObject
+             pymain_run_file_obj
+             pymain_run_file
+             Py_RunMain.warm
+             pymain_main.llvm.3121965821471187960
+             main
+             __libc_start_call_main
+             __libc_start_main_alias_1
+             _start
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+   30.39ms   [gpu:kernel:_ZN2at6native52_GLOBAL__N__913c22e1_19_ForeachTernaryOp_cu_5285c63625multi_tensor_apply_kernelINS1_18TensorListMetadataILi2EEENS1_22TernaryOpScalarFunctorIfLi2ELi2ELi0EEEJNS0_11LerpFunctorIfEEfEEEvT_T0_DpT1_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cudaLaunchKernel
+             __device_stub__ZN2at6native52_GLOBAL__N__913c22e1_19_ForeachTernaryOp_cu_5285c63625multi_tensor_apply_kernelINS1_18TensorListMetadataILi2EEENS1_22TernaryOpScalarFunctorIfLi2ELi2ELi0EEEJNS0_11LerpFunctorIfEEfEEEvT_T0_DpT1_(at::native::(anonymous namespace)::TensorListMetadata<2>&, at::native::(anonymous namespace)::TernaryOpScalarFunctor<float, 2, 2, 0>&, at::native::LerpFunctor<float>&, float)
+             void at::native::multi_tensor_apply<2, at::native::(anonymous namespace)::TernaryOpScalarFunctor<float, 2, 2, 0>, at::native::LerpFunctor<float>, float>(std::vector<std::vector<at::Tensor, std::allocator<at::Tensor> >, std::allocator<std::vector<at::Tensor, std::allocator<at::Tensor> > > >&, at::native::(anonymous namespace)::TernaryOpScalarFunctor<float, 2, 2, 0>, at::native::LerpFunctor<float>, float) [clone .isra.0]
+             at::native::foreach_tensor_lerp_list_cuda_(c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<void (c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA_Scalar__foreach_lerp_(c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)>, void, c10::guts::typelist::typelist<c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&> >, void (c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             at::_ops::_foreach_lerp__Scalar::redispatch(c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             torch::autograd::VariableType::(anonymous namespace)::_foreach_lerp__Scalar(c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             at::_ops::_foreach_lerp__Scalar::call(c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::Scalar const&)
+             torch::autograd::THPVariable__foreach_lerp_(_object*, _object*, _object*)
+             cfunction_call
+             _PyEval_EvalFrameDefault
+             _multi_tensor_adam (adam.py:553)
+             adam (adam.py:902)
+             _disable_dynamo_if_unsupported.<locals>.wrapper.<locals>.maybe_fallback (optimizer.py:140)
+             Adam.step (adam.py:214)
+             _use_grad_for_differentiable.<locals>._use_grad (optimizer.py:59)
+             Optimizer.profile_hook_step.<locals>.wrapper (optimizer.py:528)
+             train (train.py:53)
+             main (train.py:99)
+             <module> (train.py:1)
+             PyEval_EvalCode
+             run_mod.llvm.10142647837896989511
+             pyrun_file
+             _PyRun_SimpleFileObject
+             _PyRun_AnyFileObject
+             pymain_run_file_obj
+             pymain_run_file
+             Py_RunMain.warm
+             pymain_main.llvm.3121965821471187960
+             main
+             __libc_start_call_main
+             __libc_start_main_alias_1
+             _start
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+   46.97ms   [gpu:kernel:_ZN2at6native54_GLOBAL__N__ae7e1889_21_ForeachPointwiseOp_cu_ef478fac25multi_tensor_apply_kernelINS1_28TensorListScalarListMetadataIfLi3EEENS1_28PointwiseOpScalarListFunctorIfLi3ELi3ELi0EEEJSt7dividesIfEEEEvT_T0_DpT1_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cudaLaunchKernel
+             __device_stub__ZN2at6native54_GLOBAL__N__ae7e1889_21_ForeachPointwiseOp_cu_ef478fac25multi_tensor_apply_kernelINS1_28TensorListScalarListMetadataIfLi3EEENS1_28PointwiseOpScalarListFunctorIfLi3ELi3ELi0EEEJSt7dividesIfEEEEvT_T0_DpT1_(at::native::(anonymous namespace)::TensorListScalarListMetadata<float, 3>&, at::native::(anonymous namespace)::PointwiseOpScalarListFunctor<float, 3, 3, 0>&, std::divides<float>&)
+             void at::native::multi_tensor_apply<3, float, at::native::(anonymous namespace)::PointwiseOpScalarListFunctor<float, 3, 3, 0>, std::divides<float> >(std::vector<std::vector<at::Tensor, std::allocator<at::Tensor> >, std::allocator<std::vector<at::Tensor, std::allocator<at::Tensor> > > >&, c10::ArrayRef<c10::Scalar>, at::native::(anonymous namespace)::PointwiseOpScalarListFunctor<float, 3, 3, 0>, std::divides<float>) [clone .isra.0]
+             void at::native::foreach_pointwise_op_<std::divides>(c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<void (c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA_ScalarList__foreach_addcdiv_(c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)>, void, c10::guts::typelist::typelist<c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar> > >, void (c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)>::call(c10::OperatorKernel*, c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)
+             torch::autograd::VariableType::(anonymous namespace)::_foreach_addcdiv__ScalarList(c10::DispatchKeySet, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)
+             at::_ops::_foreach_addcdiv__ScalarList::call(c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<at::Tensor>, c10::ArrayRef<c10::Scalar>)
+             torch::autograd::THPVariable__foreach_addcdiv_(_object*, _object*, _object*)
+             cfunction_call
+             _PyEval_EvalFrameDefault
+             _multi_tensor_adam (adam.py:553)
+             adam (adam.py:902)
+             _disable_dynamo_if_unsupported.<locals>.wrapper.<locals>.maybe_fallback (optimizer.py:140)
+             Adam.step (adam.py:214)
+             _use_grad_for_differentiable.<locals>._use_grad (optimizer.py:59)
+             Optimizer.profile_hook_step.<locals>.wrapper (optimizer.py:528)
+             train (train.py:53)
+             main (train.py:99)
+             <module> (train.py:1)
+             PyEval_EvalCode
+             run_mod.llvm.10142647837896989511
+             pyrun_file
+             _PyRun_SimpleFileObject
+             _PyRun_AnyFileObject
+             pymain_run_file_obj
+             pymain_run_file
+             Py_RunMain.warm
+             pymain_main.llvm.3121965821471187960
+             main
+             __libc_start_call_main
+             __libc_start_main_alias_1
+             _start
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+    1.42ms   [gpu:kernel:ampere_sgemm_128x32_nn]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             libcublasLt.so.13+0x71bd1ed
+             libcublasLt.so.13+0x712c6d5
+             libcublasLt.so.13+0x19426a6
+             libcublasLt.so.13+0x1943221
+             libcublasLt.so.13+0xe2b573
+             libcublasLt.so.13+0xf8e200
+             cublasLtSSSMatmul
+             libcublas.so.13+0x1c4b74
+             libcublas.so.13+0x1c6b85
+             libcublas.so.13+0x2cc690
+             cublasSgemm_v2
+             void at::cuda::blas::gemm_internal_cublas<float, float>(char, char, long, long, long, at::OpMathType<float>::type, float const*, long, float const*, long, at::OpMathType<float>::type, float*, long)
+             at::native::(anonymous namespace)::addmm_out_cuda_impl(at::Tensor&, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&, at::native::(anonymous namespace)::Activation, bool) [clone .isra.0]
+             at::native::structured_mm_out_cuda::impl(at::Tensor const&, at::Tensor const&, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&), &at::(anonymous namespace)::wrapper_CUDA_mm(at::Tensor const&, at::Tensor const&)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&> >, at::Tensor(at::Tensor const&, at::Tensor const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             at::_ops::mm::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             torch::autograd::VariableType::(anonymous namespace)::mm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&), &torch::autograd::VariableType::(anonymous namespace)::mm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&> >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             at::_ops::mm::call(at::Tensor const&, at::Tensor const&)
+             torch::autograd::generated::details::mm_mat1_backward(at::Tensor const&, at::Tensor const&, c10::ArrayRef<c10::SymInt>, c10::ArrayRef<c10::SymInt>, c10::Layout, c10::Scalar const&)
+             torch::autograd::generated::AddmmBackward0_apply_functional(std::vector<at::Tensor, std::allocator<at::Tensor> >&&, std::array<bool, (unsigned long)3>, c10::Scalar&, c10::Scalar&, at::Tensor&, c10::Layout&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, at::Tensor&, c10::Layout&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&)
+             torch::autograd::generated::AddmmBackward0::apply(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Node::operator()(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Engine::evaluate_function(std::shared_ptr<torch::autograd::GraphTask>&, torch::autograd::Node*, torch::autograd::InputBuffer&, std::shared_ptr<torch::autograd::ReadyQueue> const&)
+             torch::autograd::Engine::thread_main(std::shared_ptr<torch::autograd::GraphTask> const&)
+             torch::autograd::Engine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             torch::autograd::python::PythonEngine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             execute_native_thread_routine
+             start_thread
+             __clone3
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+    0.26ms   [gpu:kernel:_ZN2at6native13reduce_kernelILi512ELi1ENS0_8ReduceOpIfNS0_7MeanOpsIffffEEjfLi4ELi4EEEEEvT1_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cudaLaunchKernel
+             void at::native::gpu_reduce_kernel<float, float, 4, 4, at::native::MeanOps<float, float, float, float>, double>(at::TensorIterator&, at::native::MeanOps<float, float, float, float> const&, double, at::native::AccumulationBuffer*, long)
+             at::native::mean_kernel_cuda(at::TensorIterator&)
+             at::native::structured_mean_out::impl(at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor& (at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>, at::Tensor&), &at::(anonymous namespace)::wrapper_CUDA_mean_out_out(at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>, at::Tensor&)>, at::Tensor&, c10::guts::typelist::typelist<at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>, at::Tensor&> >, at::Tensor& (at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>, at::Tensor&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>, at::Tensor&)
+             at::_ops::mean_out::call(at::Tensor const&, c10::OptionalArrayRef<long>, bool, std::optional<c10::ScalarType>, at::Tensor&)
+             at::native::structured_mse_loss_out::impl(at::Tensor const&, at::Tensor const&, long, at::Tensor const&)
+             at::(anonymous namespace)::wrapper_CUDA_mse_loss(at::Tensor const&, at::Tensor const&, long)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&, long), &at::(anonymous namespace)::wrapper_CUDA_mse_loss(at::Tensor const&, at::Tensor const&, long)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&, long> >, at::Tensor(at::Tensor const&, at::Tensor const&, long)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long)
+             at::_ops::mse_loss::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long)
+             torch::autograd::VariableType::(anonymous namespace)::mse_loss(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long), &torch::autograd::VariableType::(anonymous namespace)::mse_loss(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long> >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&, long)
+             at::_ops::mse_loss::call(at::Tensor const&, at::Tensor const&, long)
+             torch::autograd::THPVariable_mse_loss(_object*, _object*, _object*)
+             cfunction_call
+             _PyEval_EvalFrameDefault
+             mse_loss (functional.py:4271)
+             MSELoss.forward (loss.py:626)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._call_impl (module.py:1787)
+             method_vectorcall.llvm.12408582019548959275
+             _PyEval_EvalFrameDefault
+             Module._wrapped_call_impl (module.py:1779)
+             _PyObject_Call_Prepend
+             slot_tp_call
+             _PyEval_EvalFrameDefault
+             train (train.py:53)
+             main (train.py:99)
+             <module> (train.py:1)
+             PyEval_EvalCode
+             run_mod.llvm.10142647837896989511
+             pyrun_file
+             _PyRun_SimpleFileObject
+             _PyRun_AnyFileObject
+             pymain_run_file_obj
+             pymain_run_file
+             Py_RunMain.warm
+             pymain_main.llvm.3121965821471187960
+             main
+             __libc_start_call_main
+             __libc_start_main_alias_1
+             _start
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+   21.59ms   [gpu:kernel:_ZN2at6native50_GLOBAL__N__637ba612_17_ForeachUnaryOp_cu_77fe623d25multi_tensor_apply_kernelINS1_18TensorListMetadataILi2EEENS1_14UnaryOpFunctorIfLi2ELi1ELi1EEEJNS0_4SqrtIfEEEEEvT_T0_DpT1_]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             cudaLaunchKernel
+             __device_stub__ZN2at6native50_GLOBAL__N__637ba612_17_ForeachUnaryOp_cu_77fe623d25multi_tensor_apply_kernelINS1_18TensorListMetadataILi2EEENS1_14UnaryOpFunctorIfLi2ELi1ELi1EEEJNS0_4SqrtIfEEEEEvT_T0_DpT1_(at::native::(anonymous namespace)::TensorListMetadata<2>&, at::native::(anonymous namespace)::UnaryOpFunctor<float, 2, 1, 1>&, at::native::Sqrt<float>&)
+             void at::native::multi_tensor_apply<2, at::native::(anonymous namespace)::UnaryOpFunctor<float, 2, 1, 1>, at::native::Sqrt<float> >(std::vector<std::vector<at::Tensor, std::allocator<at::Tensor> >, std::allocator<std::vector<at::Tensor, std::allocator<at::Tensor> > > >&, at::native::(anonymous namespace)::UnaryOpFunctor<float, 2, 1, 1>, at::native::Sqrt<float>) [clone .isra.0]
+             std::vector<at::Tensor, std::allocator<at::Tensor> > at::native::foreach_unary_op<float, at::native::Sqrt>(c10::ArrayRef<at::Tensor>)
+             at::native::foreach_tensor_sqrt_cuda(c10::ArrayRef<at::Tensor>)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<std::vector<at::Tensor, std::allocator<at::Tensor> > (c10::ArrayRef<at::Tensor>), &at::(anonymous namespace)::(anonymous namespace)::wrapper_CUDA___foreach_sqrt(c10::ArrayRef<at::Tensor>)>, std::vector<at::Tensor, std::allocator<at::Tensor> >, c10::guts::typelist::typelist<c10::ArrayRef<at::Tensor> > >, std::vector<at::Tensor, std::allocator<at::Tensor> > (c10::ArrayRef<at::Tensor>)>::call(c10::OperatorKernel*, c10::DispatchKeySet, c10::ArrayRef<at::Tensor>)
+             at::_ops::_foreach_sqrt::redispatch(c10::DispatchKeySet, c10::ArrayRef<at::Tensor>)
+             torch::autograd::VariableType::(anonymous namespace)::_foreach_sqrt(c10::DispatchKeySet, c10::ArrayRef<at::Tensor>)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<std::vector<at::Tensor, std::allocator<at::Tensor> > (c10::DispatchKeySet, c10::ArrayRef<at::Tensor>), &torch::autograd::VariableType::(anonymous namespace)::_foreach_sqrt(c10::DispatchKeySet, c10::ArrayRef<at::Tensor>)>, std::vector<at::Tensor, std::allocator<at::Tensor> >, c10::guts::typelist::typelist<c10::DispatchKeySet, c10::ArrayRef<at::Tensor> > >, std::vector<at::Tensor, std::allocator<at::Tensor> > (c10::DispatchKeySet, c10::ArrayRef<at::Tensor>)>::call(c10::OperatorKernel*, c10::DispatchKeySet, c10::ArrayRef<at::Tensor>)
+             at::_ops::_foreach_sqrt::call(c10::ArrayRef<at::Tensor>)
+             torch::autograd::THPVariable__foreach_sqrt(_object*, _object*, _object*)
+             cfunction_call
+             _PyEval_EvalFrameDefault
+             _multi_tensor_adam (adam.py:553)
+             adam (adam.py:902)
+             _disable_dynamo_if_unsupported.<locals>.wrapper.<locals>.maybe_fallback (optimizer.py:140)
+             Adam.step (adam.py:214)
+             _use_grad_for_differentiable.<locals>._use_grad (optimizer.py:59)
+             Optimizer.profile_hook_step.<locals>.wrapper (optimizer.py:528)
+             train (train.py:53)
+             main (train.py:99)
+             <module> (train.py:1)
+             PyEval_EvalCode
+             run_mod.llvm.10142647837896989511
+             pyrun_file
+             _PyRun_SimpleFileObject
+             _PyRun_AnyFileObject
+             pymain_run_file_obj
+             pymain_run_file
+             Py_RunMain.warm
+             pymain_main.llvm.3121965821471187960
+             main
+             __libc_start_call_main
+             __libc_start_main_alias_1
+             _start
+-----------+-------------------------------------------------------
+   gpu_pid:  3439981
+  gpu_join:  exact
+gpu_sample_period:  8
+gpu_serialized:  false
+    4.80ms   [gpu:kernel:ampere_sgemm_64x64_nt]
+             [gpu:launch]
+             (anonymous namespace)::on_launch(CUpti_CallbackData const*)
+             [gpu:instrumentation]
+             libcublasLt.so.13+0x71bd1ed
+             libcublasLt.so.13+0x712f1b5
+             libcublasLt.so.13+0x19426a6
+             libcublasLt.so.13+0x1943221
+             libcublasLt.so.13+0xe2b573
+             libcublasLt.so.13+0xf8e200
+             cublasLtSSSMatmul
+             libcublas.so.13+0x1c4b74
+             libcublas.so.13+0x1c6b85
+             libcublas.so.13+0x2cc690
+             cublasSgemm_v2
+             void at::cuda::blas::gemm_internal_cublas<float, float>(char, char, long, long, long, at::OpMathType<float>::type, float const*, long, float const*, long, at::OpMathType<float>::type, float*, long)
+             at::native::(anonymous namespace)::addmm_out_cuda_impl(at::Tensor&, at::Tensor const&, at::Tensor const&, at::Tensor const&, c10::Scalar const&, c10::Scalar const&, at::native::(anonymous namespace)::Activation, bool) [clone .isra.0]
+             at::native::structured_mm_out_cuda::impl(at::Tensor const&, at::Tensor const&, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(at::Tensor const&, at::Tensor const&), &at::(anonymous namespace)::wrapper_CUDA_mm(at::Tensor const&, at::Tensor const&)>, at::Tensor, c10::guts::typelist::typelist<at::Tensor const&, at::Tensor const&> >, at::Tensor(at::Tensor const&, at::Tensor const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             at::_ops::mm::redispatch(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             torch::autograd::VariableType::(anonymous namespace)::mm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             c10::impl::wrap_kernel_functor_unboxed_<c10::impl::detail::WrapFunctionIntoFunctor_<c10::CompileTimeFunctionPointer<at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&), &torch::autograd::VariableType::(anonymous namespace)::mm(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)>, at::Tensor, c10::guts::typelist::typelist<c10::DispatchKeySet, at::Tensor const&, at::Tensor const&> >, at::Tensor(c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)>::call(c10::OperatorKernel*, c10::DispatchKeySet, at::Tensor const&, at::Tensor const&)
+             at::_ops::mm::call(at::Tensor const&, at::Tensor const&)
+             torch::autograd::generated::details::mm_mat2_backward(at::Tensor const&, at::Tensor const&, c10::ArrayRef<c10::SymInt>, c10::ArrayRef<c10::SymInt>, c10::Layout, c10::Scalar const&)
+             torch::autograd::generated::AddmmBackward0_apply_functional(std::vector<at::Tensor, std::allocator<at::Tensor> >&&, std::array<bool, (unsigned long)3>, c10::Scalar&, c10::Scalar&, at::Tensor&, c10::Layout&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, at::Tensor&, c10::Layout&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&, std::vector<c10::SymInt, std::allocator<c10::SymInt> >&)
+             torch::autograd::generated::AddmmBackward0::apply(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Node::operator()(std::vector<at::Tensor, std::allocator<at::Tensor> >&&)
+             torch::autograd::Engine::evaluate_function(std::shared_ptr<torch::autograd::GraphTask>&, torch::autograd::Node*, torch::autograd::InputBuffer&, std::shared_ptr<torch::autograd::ReadyQueue> const&)
+             torch::autograd::Engine::thread_main(std::shared_ptr<torch::autograd::GraphTask> const&)
+             torch::autograd::Engine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             torch::autograd::python::PythonEngine::thread_init(int, std::shared_ptr<torch::autograd::ReadyQueue> const&, bool)
+             execute_native_thread_routine
+             start_thread
+             __clone3
+-----------+-------------------------------------------------------

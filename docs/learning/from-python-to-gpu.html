@@ -1,0 +1,537 @@
+<div id="pa-gpu-course">
+  <style>
+    #pa-gpu-course { display:grid; gap:calc(var(--font-size-base) * 1); color:var(--foreground); }
+    #pa-gpu-course .course-heading { padding-right:90px; }
+    #pa-gpu-course .course-heading h2 { margin-top:calc(var(--font-size-base) * .25); }
+    #pa-gpu-course .course-nav, #pa-gpu-course .course-actions { display:flex; flex-wrap:wrap; align-items:center; gap:calc(var(--font-size-base) * .5); }
+    #pa-gpu-course .course-panel, #pa-gpu-course .inspection, #pa-gpu-course .question { display:grid; min-width:0; gap:calc(var(--font-size-base) * .75); }
+    #pa-gpu-course .question + .question { margin-top:calc(var(--font-size-base) * .75); }
+    #pa-gpu-course .answers { display:grid; gap:calc(var(--font-size-base) * .5); }
+    #pa-gpu-course .feedback:empty { display:none; }
+    #pa-gpu-course .path { display:grid; gap:calc(var(--font-size-base) * .5); list-style:none; margin:0; padding-left:calc(var(--font-size-base) * .75); border-left:1px solid var(--border); }
+    #pa-gpu-course .path code, #pa-gpu-course .recorded-symbol { overflow-wrap:anywhere; }
+    #pa-gpu-course .path li, #pa-gpu-course .inspection details { min-width:0; padding-right:calc(var(--font-size-base) * .75); }
+    #pa-gpu-course .profile-split { width:100%; display:block; }
+    #pa-gpu-course .profile-split text { fill:var(--foreground); font-family:inherit; }
+    #pa-gpu-course .profile-split .gpu-duration { fill:var(--viz-series-2); }
+    #pa-gpu-course .course-footer { display:flex; flex-wrap:wrap; gap:calc(var(--font-size-base) * .75); }
+    #pa-gpu-course #pa-gpu-lesson-one .lesson-heading,
+    #pa-gpu-course #pa-gpu-lesson-one .knowledge-check,
+    #pa-gpu-course #pa-gpu-lesson-one hr { display:none; }
+    #pa-gpu-course[data-part="understand"] #pa-gpu-lesson-one [data-slot="wait-control"] { display:none; }
+    #pa-gpu-course [hidden] { display:none !important; }
+  </style>
+  <div class="course-heading">
+    <span class="text-small text-muted">perf-agent learning · Lesson 1</span>
+    <h2>From Python to GPU</h2>
+  </div>
+  <div class="course-nav" role="group" aria-label="Lesson parts">
+    <button type="button" class="btn" data-part="understand" aria-pressed="true" aria-current="step">1 Understand</button>
+    <button type="button" class="btn" data-part="experiment" aria-pressed="false">2 Experiment</button>
+    <button type="button" class="btn" data-part="inspect" aria-pressed="false">3 Inspect</button>
+    <button type="button" class="btn" data-part="check" aria-pressed="false">4 Check</button>
+  </div>
+  <h3 data-course-slot="prompt">Where can CPU and GPU execution overlap?</h3>
+  <section class="course-panel" data-course-panel="model" aria-label="Execution model">
+    <div id="pa-gpu-lesson-one" data-course-embedded>
+  <style>
+    #pa-gpu-lesson-one { color:var(--foreground); display:grid; gap:calc(var(--font-size-base) * 1); }
+    #pa-gpu-lesson-one .lesson-heading { padding-right:90px; }
+    #pa-gpu-lesson-one .lesson-heading h2 { margin-top:calc(var(--font-size-base) * .25); }
+    #pa-gpu-lesson-one .lesson-controls { display:flex; flex-wrap:wrap; align-items:center; gap:calc(var(--font-size-base) * .5); }
+    #pa-gpu-lesson-one .lesson-step { display:grid; gap:calc(var(--font-size-base) * .25); }
+    #pa-gpu-lesson-one .lesson-diagram { width:100%; display:block; overflow:visible; }
+    #pa-gpu-lesson-one .lesson-diagram text { fill:var(--foreground); font-family:inherit; }
+    #pa-gpu-lesson-one .lesson-diagram .secondary { fill:var(--muted-foreground); }
+    #pa-gpu-lesson-one .cpu-fill { fill:var(--viz-series-1); }
+    #pa-gpu-lesson-one .gpu-fill { fill:var(--viz-series-2); }
+    #pa-gpu-lesson-one .future-fill { fill:var(--muted); }
+    #pa-gpu-lesson-one .wait-fill { fill:var(--viz-series-3); }
+    #pa-gpu-lesson-one .structure { stroke:var(--border); stroke-width:1; fill:none; }
+    #pa-gpu-lesson-one .cursor-line { stroke:var(--foreground); stroke-width:1.5; fill:none; }
+    #pa-gpu-lesson-one .observation { stroke:var(--muted-foreground); stroke-width:1.5; fill:none; }
+    #pa-gpu-lesson-one .lane-key { display:flex; flex-wrap:wrap; align-items:center; gap:calc(var(--font-size-base) * .75); }
+    #pa-gpu-lesson-one .lane-key span { display:inline-flex; align-items:center; gap:calc(var(--font-size-base) * .35); }
+    #pa-gpu-lesson-one .swatch { display:inline-block; width:12px; height:12px; background:var(--viz-series-1); }
+    #pa-gpu-lesson-one .swatch.gpu { background:var(--viz-series-2); }
+    #pa-gpu-lesson-one .swatch.wait { background:var(--viz-series-3); }
+    #pa-gpu-lesson-one .attribution { display:grid; gap:calc(var(--font-size-base) * .5); }
+    #pa-gpu-lesson-one .stack-chain { display:flex; align-items:center; flex-wrap:wrap; gap:calc(var(--font-size-base) * .4); }
+    #pa-gpu-lesson-one .stack-chain code { overflow-wrap:anywhere; }
+    #pa-gpu-lesson-one .sample-options { margin-top:calc(var(--font-size-base) * .25); }
+    #pa-gpu-lesson-one .knowledge-check { display:grid; gap:calc(var(--font-size-base) * .5); }
+    #pa-gpu-lesson-one .quiz-result:empty { display:none; }
+    #pa-gpu-lesson-one [hidden] { display:none !important; }
+    @media (pointer:coarse) { #pa-gpu-lesson-one .lesson-controls { gap:calc(var(--font-size-base) * .75); } }
+  </style>
+
+  <div class="lesson-heading">
+    <span class="text-small text-muted">GPU concepts · Lesson 1 · reviewed edition</span>
+    <h2>From Python to GPU</h2>
+  </div>
+  <div class="lesson-controls" aria-label="Playback controls">
+    <button type="button" class="btn btn-primary" data-action="play">Play</button>
+    <button type="button" class="btn" data-action="back" disabled>Back</button>
+    <button type="button" class="btn" data-action="next">Next step</button>
+    <label class="form-check form-switch">
+      <input class="form-check-input" type="checkbox" data-option="profiler">
+      <span class="form-check-label">Show profiler</span>
+    </label>
+  </div>
+  <div class="lesson-controls" data-slot="wait-control">
+    <label class="form-label">CPU wait
+      <select class="form-select" data-option="wait">
+        <option value="active">Active · on-CPU</option>
+        <option value="sleep">Sleeping · off-CPU</option>
+      </select>
+    </label>
+  </div>
+  <div class="lesson-step" aria-live="polite" aria-atomic="true">
+    <h3 data-slot="step-title">1 / 6 · Prepare on the CPU</h3>
+    <div data-slot="step-detail">Python prepares inputs; the GPU has no work yet.</div>
+  </div>
+
+  <div class="lane-key text-small" aria-label="Timeline legend">
+    <span><i class="swatch" aria-hidden="true"></i>CPU execution</span>
+    <span><i class="swatch gpu" aria-hidden="true"></i>GPU execution</span>
+    <span><i class="swatch wait" aria-hidden="true"></i><span data-slot="wait-legend">Active CPU wait</span></span>
+    <span class="text-muted">Muted = upcoming</span>
+  </div>
+  <div class="lane-key text-small" data-slot="launch-key" hidden><span><i class="swatch" style="transform:rotate(45deg)" aria-hidden="true"></i>Launch-stack probe · 1 in 8 launches</span></div>
+  <div data-slot="diagram-host">
+    <svg class="lesson-diagram" role="img" aria-label="Illustrative CPU and GPU execution timeline"></svg>
+  </div>
+
+  <div class="attribution" data-slot="profiler-evidence" hidden>
+    <h3>GPU profile: who launched this kernel?</h3>
+    <div class="stack-chain" data-slot="stack-chain" aria-live="polite"></div>
+    <div class="text-small" data-slot="caller-status"></div>
+    <label class="form-check form-switch sample-options">
+      <input class="form-check-input" type="checkbox" data-option="caller" checked>
+      <span class="form-check-label">This launch was sampled</span>
+    </label>
+    <span class="text-small text-muted">Example launch sampler: 1 in 8 launches, independent of CPU timer samples.</span>
+  </div>
+
+  <div class="viz-row text-small text-muted" data-slot="provenance">
+    <span>Illustrative model · one CPU thread · one GPU stream</span>
+    <span>Timings and sample dots are not captured data.</span>
+  </div>
+  <hr>
+  <div class="knowledge-check">
+    <h3>Does a returned launch prove the kernel has finished?</h3>
+    <div class="lesson-controls" role="group" aria-label="Knowledge check">
+      <button type="button" class="btn" data-answer="yes" aria-pressed="false">Yes</button>
+      <button type="button" class="btn" data-answer="no" aria-pressed="false">No</button>
+    </div>
+    <div class="quiz-result" data-slot="quiz-result" aria-live="polite"></div>
+    <h3>Do sampled launch widths reveal every caller’s share of GPU time?</h3>
+    <div class="lesson-controls" role="group" aria-label="Launch sampling knowledge check">
+      <button type="button" class="btn" data-width-answer="yes" aria-pressed="false">Yes</button>
+      <button type="button" class="btn" data-width-answer="no" aria-pressed="false">No</button>
+    </div>
+    <div class="quiz-result" data-slot="width-result" aria-live="polite"></div>
+  </div>
+
+  <script>
+    (() => {
+      const root = document.getElementById('pa-gpu-lesson-one');
+      const find = s => root.querySelector(s);
+      const svg = find('svg');
+      const host = find('[data-slot="diagram-host"]');
+      const play = find('[data-action="play"]');
+      const back = find('[data-action="back"]');
+      const next = find('[data-action="next"]');
+      const profiler = find('[data-option="profiler"]');
+      const caller = find('[data-option="caller"]');
+      const waitMode = find('[data-option="wait"]');
+      const steps = [
+        { t:1, from:0, title:'Prepare on the CPU', detail:'Python prepares inputs; the GPU has no work yet.' },
+        { t:2.6, from:2, title:'Submit GPU work', detail:'A CUDA launch submits a kernel; its CPU call is not the kernel execution.' },
+        { t:4.5, from:3, title:'CPU and GPU overlap', detail:'The launch returned. The CPU does other work while the GPU runs.' },
+        { t:7.5, from:6, title:'Wait for the result', detail:'The CPU thread actively waits here; periodic CPU samples can include the wait.' },
+        { t:10.6, from:10, title:'Use the result', detail:'The kernel finished. The CPU thread resumes with its result.' },
+        { t:12, from:11.5, title:'Connect the evidence', detail:'GPU elapsed duration is measured; a separately sampled launch stack can identify its caller.' }
+      ];
+      const state = { time:1, overlay:false, sampled:true, wait:'active', answer:null, widthAnswer:null };
+      const instanceKey = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+      let running = false, raf = null, lastStamp = null, lastStep = -1;
+      let lastReducedStep = 0;
+      const reduced = window.matchMedia('(prefers-reduced-motion: reduce)');
+      const stepAt = time => steps.reduce((index, item, i) => time >= item.from ? i : index, 0);
+      const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+      function applySaved(snapshot) {
+        const saved = snapshot?.modelContent;
+        if (!saved || saved.lesson !== 'cpu-to-gpu-v2') return;
+        if (Number.isInteger(saved.step) && saved.step >= 0 && saved.step < steps.length) state.time = steps[saved.step].t;
+        if (typeof saved.profiler === 'boolean') state.overlay = saved.profiler;
+        if (typeof saved.launchStack === 'boolean') state.sampled = saved.launchStack;
+        if (saved.wait === 'active' || saved.wait === 'sleep') state.wait = saved.wait;
+        if (saved.answer === 'yes' || saved.answer === 'no') state.answer = saved.answer;
+        if (saved.widthAnswer === 'yes' || saved.widthAnswer === 'no') state.widthAnswer = saved.widthAnswer;
+      }
+      function save() {
+        if (root.hasAttribute('data-course-embedded')) {
+          root.dispatchEvent(new CustomEvent('gpu-model-change',{bubbles:true,detail:{step:stepAt(state.time),profiler:state.overlay,launchStack:state.sampled,wait:state.wait,answer:state.answer,widthAnswer:state.widthAnswer}}));
+          return;
+        }
+        if (typeof window.openai?.setWidgetState !== 'function') return;
+        window.openai.setWidgetState({
+          modelContent:{ lesson:'cpu-to-gpu-v2', step:stepAt(state.time), profiler:state.overlay, launchStack:state.sampled, wait:state.wait, answer:state.answer, widthAnswer:state.widthAnswer },
+          privateContent:{ instanceKey }
+        }).catch(() => {});
+      }
+      const el = (name, attrs = {}, text) => {
+        const node = document.createElementNS('http://www.w3.org/2000/svg', name);
+        for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+        if (text !== undefined) node.textContent = text;
+        svg.appendChild(node);
+        return node;
+      };
+      const text = (x, y, value, attrs = {}) => el('text', { x, y, ...attrs }, value);
+
+      function draw() {
+        const width = Math.max(220, host.getBoundingClientRect().width);
+        const x0 = 54, plot = Math.max(160, width - x0 - 8), x = t => x0 + plot * t / 12;
+        const mobile = plot < 430;
+        const time = Math.min(state.time,12);
+        svg.setAttribute('viewBox', `0 0 ${width} ${state.overlay ? 290 : 264}`);
+        svg.style.height = `${state.overlay ? 290 : 264}px`;
+        svg.replaceChildren();
+        el('title', {}, `One CPU thread submits a kernel, works concurrently, ${state.wait === 'sleep' ? 'sleeps' : 'actively waits'} for the GPU, then resumes.`);
+        el('desc', {}, 'Illustrative execution, not a recorded trace. Dots represent periodic CPU samples. A separate diamond marks a launch-stack probe, not a timer sample. CUPTI start/end measurements become available after kernel completion.');
+        text(x0, 15, 'Earlier', { class:'secondary text-small' });
+        text(x(12), 15, 'Later →', { class:'secondary text-small', 'text-anchor':'end' });
+        text(0, 94, 'CPU');
+        text(0, 219, 'GPU');
+        text(0, 237, 'stream 0', { class:'secondary text-small' });
+        el('line', { x1:x0, y1:113, x2:x(12), y2:113, class:'structure' });
+        el('line', { x1:x0, y1:242, x2:x(12), y2:242, class:'structure' });
+        const segment = (start, end, y, label, color) => {
+          const left = x(start), total = x(end) - left - 2;
+          el('rect', { x:left, y, width:total, height:38, rx:3, class:'future-fill' });
+          const filled = clamp((time - start) / (end - start), 0, 1) * total;
+          if (filled > 0) el('rect', { x:left, y, width:filled, height:38, rx:3, class:color, opacity:.34 });
+          if (total > label.length * 7.5 + 5) text(left + total/2, y + 24, label, { 'text-anchor':'middle' });
+        };
+        segment(0,2,74,'Prep','cpu-fill');
+        segment(2,3,74,mobile || state.overlay ? '' : 'Launch','cpu-fill');
+        segment(3,6,74,mobile ? 'Work' : 'Other work','cpu-fill');
+        segment(6,10,74,'Wait','wait-fill');
+        segment(10,12,74,'Use','cpu-fill');
+        segment(3,10,202,mobile ? 'Kernel' : 'Kernel execution','gpu-fill');
+        if (time >= 2) {
+          const source = x(2.5), dest = x(3) + 6;
+          el('path', { d:`M ${source} 114 V 151 H ${dest} V 198`, class:'observation' });
+          el('polyline', { points:`${dest-4},192 ${dest},198 ${dest+4},192`, class:'observation' });
+          text(x0 + plot/2, 176, state.overlay ? 'CUPTI correlation ID' : 'Submit kernel to stream', { 'text-anchor':'middle', class:'secondary' });
+        }
+        if (state.overlay) {
+          const samples = [.4,.9,1.4,1.8,2.2,3.4,4.1,4.9,5.6,10.4,11.1,11.7];
+          if (state.wait === 'active') samples.push(6.4,7.2,7.9,8.6,9.3);
+          for (const t of samples.filter(t => t <= time)) el('circle', { cx:x(t), cy:55, r:3, class:'cpu-fill' });
+          text(x0, 39, 'eBPF: periodic CPU samples', { class:'secondary text-small' });
+          if (time >= 2.5 && state.sampled) {
+            const sx = x(2.5);
+            el('polygon', { points:`${sx},87 ${sx+6},93 ${sx},99 ${sx-6},93`, class:'cpu-fill', 'data-marker':'launch-probe' });
+          }
+          if (time >= 6 && state.wait === 'sleep') {
+            el('line', { x1:x(6), y1:124, x2:x(Math.min(time,10)), y2:124, class:'observation' });
+            text(x(12), 147, mobile ? 'Off-CPU wait' : 'Sleeping wait: optional --offcpu', { 'text-anchor':'end', class:'secondary text-small' });
+          }
+          if (time >= 10) {
+            el('path', { d:`M ${x(3)} 250 v 7 H ${x(10)} v -7`, class:'observation', 'data-marker':'completed-duration' });
+            text(x0 + plot/2, 280, mobile ? 'CUPTI: start/end → duration' : 'CUPTI start/end → kernel elapsed duration', { 'text-anchor':'middle', class:'secondary text-small' });
+          } else if (time >= 3) {
+            text(x0 + plot/2, 280, 'CUPTI activity record pending', { 'text-anchor':'middle', class:'secondary text-small' });
+          }
+        }
+        el('line', { x1:x(time), y1:62, x2:x(time), y2:114, class:'cursor-line' });
+        el('line', { x1:x(time), y1:194, x2:x(time), y2:245, class:'cursor-line' });
+        el('circle', { cx:x(time), cy:62, r:3, fill:'currentColor' });
+      }
+
+      function drawReal(width) {
+        svg.setAttribute('viewBox', `0 0 ${width} 310`);
+        svg.style.height='310px';
+        el('title', {}, 'Real capture loop/002: approximately 6.23 seconds of recorded GPU kernel durations. 12.1 percent has a captured caller; 87.9 percent has no captured caller. CPU synchronization under item has approximately 9.33 seconds of sampled on-CPU time.');
+        el('desc', {}, 'GPU fractions describe recorded kernel duration in this capture, not sampling guarantees, utilization or wall-clock runtime. CPU and GPU values are separate accumulated measurements.');
+        text(0,24,'Recorded GPU durations · ≈6.23 s');
+        const full=width-8, split=full*.121;
+        el('rect',{x:0,y:48,width:split,height:32,rx:2,class:'gpu-fill',opacity:.8});
+        el('rect',{x:split+2,y:48,width:full-split-2,height:32,rx:2,class:'gpu-fill',opacity:.3});
+        text(0,112,'Captured caller');
+        text(full,112,'≈0.75 s · 12.1%',{'text-anchor':'end'});
+        text(0,146,'Unknown caller');
+        text(full,146,'≈5.48 s · 87.9%',{'text-anchor':'end'});
+        text(0,194,'CPU: synchronization under .item()');
+        text(0,224,'≈9.33 s of on-CPU samples');
+        text(0,248,'12.1% of the CPU sample total',{class:'secondary text-small'});
+        text(0,285,'Accumulated values ≠ wall-clock time',{class:'secondary text-small'});
+      }
+
+      function render() {
+        const i = stepAt(state.time);
+        const real = false;
+        profiler.checked = state.overlay;
+        profiler.disabled = real;
+        caller.checked = state.sampled;
+        waitMode.value = state.wait;
+        find('[data-slot="wait-control"]').hidden=real;
+        find('.lane-key').hidden=real;
+        find('[data-slot="launch-key"]').hidden = !state.overlay || real;
+        play.textContent = running ? 'Pause' : state.time >= 12 ? 'Replay' : 'Play';
+        back.disabled = i === 0;
+        next.disabled = i === steps.length - 1;
+        find('[data-slot="profiler-evidence"]').hidden = !state.overlay || real;
+        find('[data-slot="wait-legend"]').textContent = state.wait === 'sleep' ? 'Sleeping CPU wait' : 'Active CPU wait';
+        const titleText=`${i+1} / 6 · ${steps[i].title}`;
+        const detailText=i === 3 ? state.wait === 'sleep'
+          ? 'This CPU thread sleeps here. Optional off-CPU profiling records its descheduled wait.'
+          : 'This CPU thread actively waits here; periodic CPU samples can include synchronization.' : steps[i].detail;
+        if (find('[data-slot="step-title"]').textContent !== titleText) find('[data-slot="step-title"]').textContent=titleText;
+        if (find('[data-slot="step-detail"]').textContent !== detailText) find('[data-slot="step-detail"]').textContent=detailText;
+        lastStep=i;
+        find('[data-slot="provenance"]').textContent = real ? 'Real capture · loop/002 · synthetic PyTorch workload · recorded 20 Nov 2026' : 'Illustrative model · one CPU thread · one GPU stream · timings, dots and call path are not captured data.';
+        const chain = find('[data-slot="stack-chain"]');
+        find('[data-slot="caller-status"]').textContent = state.time < 3 ? 'No GPU execution yet.' : state.time < 10
+          ? 'Illustrated kernel running; completed activity record pending.' : state.sampled
+          ? 'Measured kernel elapsed duration, linked to a sampled caller.' : 'Measured kernel elapsed duration; caller unknown.';
+        const names = state.time < 2.5 ? ['Launch has not been observed yet'] : state.time < 10 ? state.sampled ? ['CPU launch path', 'launch-stack probe'] : ['No launch stack captured'] : state.sampled
+          ? ['CPU launch path', '[gpu:launch]', '[gpu:kernel:example_kernel]']
+          : ['[gpu:launch unsampled]', '[gpu:kernel:example_kernel]'];
+        const key = names.join('|');
+        if (chain.dataset.key !== key) {
+          chain.replaceChildren();
+          names.forEach((name,index) => {
+            if (index) { const arrow = document.createElement('span'); arrow.textContent = '→'; arrow.setAttribute('aria-hidden','true'); chain.appendChild(arrow); }
+            const part = document.createElement(names.length > 1 ? 'code' : 'span'); part.textContent = name; chain.appendChild(part);
+          });
+          chain.dataset.key = key;
+        }
+        root.querySelectorAll('[data-answer]').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.answer === state.answer)));
+        find('[data-slot="quiz-result"]').textContent = state.answer === 'no'
+          ? 'Correct. The launch can return before the kernel finishes—or even starts.'
+          : state.answer === 'yes' ? 'Not necessarily. A returned launch does not prove completion; synchronization can establish it.' : '';
+        root.querySelectorAll('[data-width-answer]').forEach(button => button.setAttribute('aria-pressed',String(button.dataset.widthAnswer===state.widthAnswer)));
+        find('[data-slot="width-result"]').textContent = state.widthAnswer === null ? '' : state.widthAnswer === 'no'
+          ? 'Correct. The captured callers are a sample of launches. Their widths do not reveal all callers’ GPU-time shares.'
+          : 'No. One in eight launches does not mean one eighth of GPU time: kernels can have different durations.';
+        draw();
+      }
+
+      function stop() {
+        running = false;
+        if (raf !== null) cancelAnimationFrame(raf);
+        raf = null; lastStamp = null; lastReducedStep = 0;
+      }
+      function tick(stamp) {
+        if (!running || !root.isConnected) { stop(); return; }
+        if (lastStamp === null) lastStamp = stamp;
+        const dt = Math.min((stamp - lastStamp) / 1000, .1);
+        lastStamp = stamp;
+        if (reduced.matches) {
+          lastReducedStep += dt;
+          if (lastReducedStep >= 3) {
+            state.time = steps[Math.min(stepAt(state.time)+1,5)].t;
+            lastReducedStep = 0;
+          }
+        } else state.time = Math.min(12, state.time + dt*.38);
+        if (state.time >= 12) { stop(); save(); }
+        render();
+        if (running) raf = requestAnimationFrame(tick);
+      }
+
+      play.addEventListener('click', () => {
+        if (running) stop();
+        else { if (state.time >= 12) state.time = steps[0].t; running = true; lastStamp = null; raf = requestAnimationFrame(tick); }
+        render(); save();
+      });
+      back.addEventListener('click', () => { stop(); state.time = steps[Math.max(0,stepAt(state.time)-1)].t; render(); save(); });
+      next.addEventListener('click', () => { stop(); state.time = steps[Math.min(6,stepAt(state.time)+1)].t; render(); save(); });
+      profiler.addEventListener('change', () => { state.overlay = profiler.checked; render(); save(); });
+      caller.addEventListener('change', () => { state.sampled = caller.checked; render(); save(); });
+      waitMode.addEventListener('change', () => { state.wait = waitMode.value; render(); save(); });
+      root.querySelectorAll('[data-answer]').forEach(button => button.addEventListener('click', () => { state.answer = button.dataset.answer; render(); save(); }));
+      root.querySelectorAll('[data-width-answer]').forEach(button => button.addEventListener('click', () => { state.widthAnswer = button.dataset.widthAnswer; render(); save(); }));
+      root.addEventListener('gpu-model-restore',event=>{stop();applySaved({modelContent:{lesson:'cpu-to-gpu-v2',...event.detail}});render();});
+      root.addEventListener('gpu-model-pause',event=>{stop();render();if(event.detail?.persist)save();});
+      window.addEventListener('openai:set_globals', event => {
+        if(root.hasAttribute('data-course-embedded'))return;
+        const snapshot = event.detail?.globals?.widgetState;
+        if (!snapshot || snapshot.privateContent?.instanceKey === instanceKey) return;
+        stop(); applySaved(snapshot); render();
+      });
+      document.addEventListener('visibilitychange', () => { if (document.hidden && running) { stop(); render(); save(); } });
+      new ResizeObserver(draw).observe(host);
+      if(!root.hasAttribute('data-course-embedded'))applySaved(window.openai?.widgetState);
+      render();
+    })();
+  </script>
+</div>
+
+  </section>
+  <section class="course-panel" data-course-panel="inspect" aria-label="Explore recorded profile evidence" hidden>
+    <div class="course-actions" role="group" aria-label="Profile measurement">
+      <button type="button" class="btn" data-inspect="gpu" aria-pressed="true">GPU durations</button>
+      <button type="button" class="btn" data-inspect="cpu" aria-pressed="false">CPU synchronization</button>
+    </div>
+    <div class="inspection" data-inspection="gpu">
+      <h3>Recorded GPU durations · ≈6.23 s accumulated</h3>
+      <svg class="profile-split" role="img" aria-label="Recorded GPU duration: 12.1 percent with a captured caller, 87.9 percent without one"></svg>
+      <div class="course-actions" role="group" aria-label="Caller population">
+        <button type="button" class="btn" data-population="captured" aria-pressed="true">Captured caller · 12.1%</button>
+        <button type="button" class="btn" data-population="unknown" aria-pressed="false">Unknown caller · 87.9%</button>
+      </div>
+      <h3 data-course-slot="path-title">Example within captured callers</h3>
+      <ol class="path" data-course-slot="gpu-path"></ol>
+      <div data-course-slot="path-detail" aria-live="polite"></div>
+      <details data-course-slot="symbol-details">
+        <summary>Full recorded kernel symbol</summary>
+        <code class="recorded-symbol">[gpu:kernel:_ZN7cutlass7Kernel2I42cutlass_80_simt_sgemm_128x32_8x5_nt_align1EEvNT_6ParamsE]</code>
+      </details>
+      <span class="text-small text-muted">Selected frames shown root to leaf; intermediate frames omitted. GPU weights are accumulated durations, not an execution timeline.</span>
+    </div>
+    <div class="inspection" data-inspection="cpu" hidden>
+      <h3>Synchronization under .item()</h3>
+      <ol class="path">
+        <li><code>torch::autograd::THPVariable_item(...)</code></li>
+        <li><code>_local_scalar_dense(...)</code></li>
+        <li><code>cudaStreamSynchronize</code></li>
+        <li><code>cuStreamSynchronize</code></li>
+      </ol>
+      <div class="tabular-nums">≈9.33 s of on-CPU samples · 12.1% of the CPU sample total</div>
+      <div>This records CPU activity inside synchronization. It does not mean the GPU kernel ran on the CPU.</div>
+      <span class="text-small text-muted">Scope: cudaStreamSynchronize beneath THPVariable_item. CPU weights can accumulate across threads; they are separate from GPU durations.</span>
+    </div>
+    <span class="text-small text-muted">Real capture · loop/002 · synthetic PyTorch workload · 20 Nov 2026. Source values rounded; no new capture. Accumulated CPU and GPU values are not wall-clock runtime.</span>
+  </section>
+  <section class="course-panel" data-course-panel="check" aria-label="Check your interpretation" hidden>
+    <div class="question">
+      <h3>A kernel has no captured caller. What can still be known?</h3>
+      <div class="answers" role="group" aria-label="Missing caller question">
+        <label class="form-check"><input type="radio" class="form-check-input" name="pa-course-caller" data-question="caller" data-choice="duration"><span class="form-check-label">Its recorded GPU duration</span></label>
+        <label class="form-check"><input type="radio" class="form-check-input" name="pa-course-caller" data-question="caller" data-choice="python"><span class="form-check-label">The Python line that launched it</span></label>
+        <label class="form-check"><input type="radio" class="form-check-input" name="pa-course-caller" data-question="caller" data-choice="idle"><span class="form-check-label">That the GPU was idle</span></label>
+      </div>
+      <div class="feedback" data-course-slot="caller-feedback" aria-live="polite"></div>
+    </div>
+    <div class="question">
+      <h3>Synchronization appears in the CPU profile. What does that establish?</h3>
+      <div class="answers" role="group" aria-label="CPU synchronization question">
+        <label class="form-check"><input type="radio" class="form-check-input" name="pa-course-sync" data-question="sync" data-choice="on_cpu"><span class="form-check-label">The thread was on-CPU inside synchronization</span></label>
+        <label class="form-check"><input type="radio" class="form-check-input" name="pa-course-sync" data-question="sync" data-choice="gpu_on_cpu"><span class="form-check-label">The GPU kernel executed on the CPU</span></label>
+        <label class="form-check"><input type="radio" class="form-check-input" name="pa-course-sync" data-question="sync" data-choice="asleep"><span class="form-check-label">The thread was asleep for that sampled time</span></label>
+      </div>
+      <div class="feedback" data-course-slot="sync-feedback" aria-live="polite"></div>
+    </div>
+    <div data-course-slot="check-status" aria-live="polite">Choose an answer for each question.</div>
+  </section>
+  <div class="course-actions">
+    <button type="button" class="btn" data-course-action="back" disabled>Previous part</button>
+    <span class="text-small text-muted" data-course-slot="part-count">Part 1 of 4</span>
+    <button type="button" class="btn btn-primary" data-course-action="next">Continue to Experiment</button>
+  </div>
+  <div class="course-footer text-small">
+    <a href="https://modal.com/gpu-glossary/device-software/kernel" target="_blank" rel="noopener noreferrer">Concept reference: Modal GPU Glossary</a>
+    <a href="https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/asynchronous-execution.html" target="_blank" rel="noopener noreferrer">CUDA execution model</a>
+  </div>
+  <script>
+    (()=>{
+      const root=document.getElementById('pa-gpu-course');
+      const q=s=>root.querySelector(s), all=s=>Array.from(root.querySelectorAll(s));
+      const model=q('#pa-gpu-lesson-one');
+      const parts=['understand','experiment','inspect','check'];
+      const names=['Understand','Experiment','Inspect','Check'];
+      const prompts={understand:'Where can CPU and GPU execution overlap?',experiment:'What changes when the CPU actively waits or sleeps?',inspect:'What can this capture tell us about the caller?',check:'What can you infer from the evidence?'};
+      const instanceKey=globalThis.crypto?.randomUUID?.()||`${Date.now()}-${Math.random()}`;
+      const state={part:'understand',models:{understand:{step:0,profiler:false,launchStack:true,wait:'active'},experiment:{step:3,profiler:true,launchStack:true,wait:'active'}},inspect:'gpu',population:'captured',answers:{caller:null,sync:null}};
+
+      function restore(snapshot){
+        const saved=snapshot?.modelContent;
+        if(!saved||saved.lesson!=='gpu-learning-course-v1')return;
+        if(parts.includes(saved.part))state.part=saved.part;
+        if(['gpu','cpu'].includes(saved.inspect))state.inspect=saved.inspect;
+        if(['captured','unknown'].includes(saved.population))state.population=saved.population;
+        for(const name of ['understand','experiment']){
+          const m=saved.models?.[name];if(!m)continue;
+          if(Number.isInteger(m.step)&&m.step>=0&&m.step<=5)state.models[name].step=m.step;
+          if(typeof m.profiler==='boolean')state.models[name].profiler=m.profiler;
+          if(typeof m.launchStack==='boolean')state.models[name].launchStack=m.launchStack;
+          if(['active','sleep'].includes(m.wait))state.models[name].wait=m.wait;
+        }
+        if(['duration','python','idle'].includes(saved.answers?.caller))state.answers.caller=saved.answers.caller;
+        if(['on_cpu','gpu_on_cpu','asleep'].includes(saved.answers?.sync))state.answers.sync=saved.answers.sync;
+      }
+      function persist(){
+        if(typeof window.openai?.setWidgetState!=='function')return;
+        window.openai.setWidgetState({modelContent:{lesson:'gpu-learning-course-v1',...state},privateContent:{instanceKey}}).catch(()=>{});
+      }
+      function drawSplit(){
+        const svg=q('.profile-split'), width=Math.max(220,svg.getBoundingClientRect().width), full=width-8, known=full*.121;
+        svg.setAttribute('viewBox',`0 0 ${width} 100`);svg.style.height='100px';svg.replaceChildren();
+        const add=(tag,attrs,text)=>{const n=document.createElementNS('http://www.w3.org/2000/svg',tag);Object.entries(attrs).forEach(([k,v])=>n.setAttribute(k,v));if(text!==undefined)n.textContent=text;svg.appendChild(n);};
+        add('title',{},'Observed share of recorded GPU duration, not a mathematical consequence of one-in-eight launch sampling.');
+        add('rect',{x:0,y:4,width:known,height:30,rx:2,class:'gpu-duration',opacity:state.population==='captured'?.85:.3});
+        add('rect',{x:known+2,y:4,width:full-known-2,height:30,rx:2,class:'gpu-duration',opacity:state.population==='unknown'?.85:.3});
+        add('text',{x:0,y:65},'Captured: ≈0.75 s');
+        add('text',{x:full,y:91,'text-anchor':'end'},'Unknown: ≈5.48 s');
+      }
+      function renderInspection(){
+        all('[data-inspect]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.inspect===state.inspect)));
+        all('[data-inspection]').forEach(p=>p.hidden=p.dataset.inspection!==state.inspect);
+        all('[data-population]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.population===state.population)));
+        const captured=state.population==='captured';
+        q('[data-course-slot="path-title"]').textContent=captured?'Example within captured callers':'This population has no captured CPU caller';
+        const path=captured?['torch::autograd::Engine::thread_main(...)','cublasSgemm_v2','cuLaunchKernel','[gpu:instrumentation]','on_launch(...)','[gpu:launch]','cutlass_80_simt_sgemm_128x32… (kernel symbol shortened)']:['[gpu:launch unsampled]','[gpu:kernel:…]'];
+        const list=q('[data-course-slot="gpu-path"]');list.replaceChildren();
+        for(const frame of path){const li=document.createElement('li'),code=document.createElement('code');code.textContent=frame;li.appendChild(code);list.appendChild(li);}
+        q('[data-course-slot="path-detail"]').textContent=captured?'Selected recorded stack: ≈1.93 ms GPU weight. This backward launch comes from a C++ autograd thread.':'≈5.48 s of recorded GPU duration has no captured launch stack. A missing caller is an attribution gap.';
+        q('[data-course-slot="symbol-details"]').hidden=!captured;
+        if(state.part==='inspect'&&state.inspect==='gpu')drawSplit();
+      }
+      function renderAnswers(){
+        all('[data-question]').forEach(b=>b.checked=state.answers[b.dataset.question]===b.dataset.choice);
+        const caller={duration:'Correct. CUPTI execution timestamps can retain duration even when the launch stack is missing.',python:'The Python line is unknown without caller attribution. The GPU duration can still be recorded.',idle:'A missing caller does not mean idle hardware. This capture still records the GPU work.'};
+        const sync={on_cpu:'Correct. CPU samples establish CPU activity in synchronization, not execution of the GPU kernel on the CPU.',gpu_on_cpu:'The kernel executes on the GPU. These samples describe the CPU thread inside synchronization.',asleep:'Sleeping time is off-CPU. Ordinary on-CPU samples do not measure that descheduled interval.'};
+        q('[data-course-slot="caller-feedback"]').textContent=caller[state.answers.caller]||'';
+        q('[data-course-slot="sync-feedback"]').textContent=sync[state.answers.sync]||'';
+        const correct=state.answers.caller==='duration'&&state.answers.sync==='on_cpu';
+        q('[data-course-slot="check-status"]').textContent=correct?'Both interpretations are correct. You can revisit the profile to check the evidence.':state.answers.caller||state.answers.sync?'Read the explanations, then choose or revise your answers.':'Choose an answer for each question.';
+      }
+      function render(){
+        root.dataset.part=state.part;
+        all('button[data-part]').forEach(b=>{const active=b.dataset.part===state.part;b.setAttribute('aria-pressed',String(active));if(active)b.setAttribute('aria-current','step');else b.removeAttribute('aria-current');});
+        q('[data-course-slot="prompt"]').textContent=prompts[state.part];
+        const hasModel=state.part==='understand'||state.part==='experiment';
+        all('[data-course-panel]').forEach(p=>p.hidden=hasModel?p.dataset.coursePanel!=='model':p.dataset.coursePanel!==state.part);
+        const index=parts.indexOf(state.part);
+        q('[data-course-action="back"]').disabled=index===0;
+        q('[data-course-slot="part-count"]').textContent=`Part ${index+1} of 4`;
+        q('[data-course-action="next"]').textContent=index===3?'Review the profile':`Continue to ${names[index+1]}`;
+        if(hasModel)model.dispatchEvent(new CustomEvent('gpu-model-restore',{detail:state.models[state.part]}));
+        else model.dispatchEvent(new CustomEvent('gpu-model-pause'));
+        renderInspection();renderAnswers();
+      }
+      function navigate(part){
+        if(!parts.includes(part))return;
+        if(['understand','experiment'].includes(state.part))model.dispatchEvent(new CustomEvent('gpu-model-pause',{detail:{persist:true}}));
+        state.part=part;render();persist();
+      }
+      all('button[data-part]').forEach(b=>b.addEventListener('click',()=>navigate(b.dataset.part)));
+      q('[data-course-action="back"]').addEventListener('click',()=>navigate(parts[Math.max(0,parts.indexOf(state.part)-1)]));
+      q('[data-course-action="next"]').addEventListener('click',()=>{const i=parts.indexOf(state.part);navigate(i===3?'inspect':parts[i+1]);});
+      root.addEventListener('gpu-model-change',event=>{
+        if(!['understand','experiment'].includes(state.part))return;
+        state.models[state.part]={...event.detail};persist();
+      });
+      all('[data-inspect]').forEach(b=>b.addEventListener('click',()=>{state.inspect=b.dataset.inspect;renderInspection();persist();}));
+      all('[data-population]').forEach(b=>b.addEventListener('click',()=>{state.population=b.dataset.population;renderInspection();persist();}));
+      all('[data-question]').forEach(b=>b.addEventListener('change',()=>{state.answers[b.dataset.question]=b.dataset.choice;renderAnswers();persist();}));
+      window.addEventListener('openai:set_globals',event=>{const snapshot=event.detail?.globals?.widgetState;if(!snapshot||snapshot.privateContent?.instanceKey===instanceKey)return;restore(snapshot);render();});
+      new ResizeObserver(()=>{if(state.part==='inspect'&&state.inspect==='gpu')drawSplit();}).observe(q('.profile-split'));
+      restore(window.openai?.widgetState);render();
+    })();
+  </script>
+</div>

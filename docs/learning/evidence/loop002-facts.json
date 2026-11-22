@@ -1,0 +1,27 @@
+{
+  "source": "loop/002 cand1, existing real capture of synthetic PyTorch workload",
+  "gpu": {
+    "recorded_total_seconds_rounded": 6.23,
+    "captured_caller_seconds_rounded": 0.75,
+    "captured_caller_percent": 12.1,
+    "unknown_caller_seconds_rounded": 5.48,
+    "unknown_caller_percent": 87.9
+  },
+  "cpu": {
+    "path": "THPVariable_item -> cudaStreamSynchronize",
+    "on_cpu_sample_seconds_rounded": 9.33,
+    "percent_of_cpu_sample_total": 12.1,
+    "all_callers_sync_seconds_rounded": 9.65
+  },
+  "limitations": [
+    "All seconds shown rounded; GPU values sum recorded kernel elapsed durations.",
+    "CPU values are sampled on-CPU cumulative weights, across threads.",
+    "CPU and GPU totals are not wall-clock runtime and must not be added as runtime.",
+    "The observed GPU duration split does not follow mathematically from a launch-sampling period.",
+    "No new profiling capture or coverage audit was performed."
+  ],
+  "source_sha256": {
+    "002-cand1-gpu.pb.gz": "b27a3387886ca6128998a9a4620dd13ada8b8e6ef1958514b7820f99a041b993",
+    "002-cand1-cpu.pb.gz": "4ea13d72ae2fe50b00ba44d2ea99f48eeaf326e5d3ec6676951e6b4de01b24b7"
+  }
+}

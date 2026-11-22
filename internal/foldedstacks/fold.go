@@ -125,6 +125,14 @@ const UnsampledLaunchFrame = "[gpu:launch unsampled]"
 // attaches to the sampled population only.
 const SamplePeriodLabel = "gpu_sample_period"
 
+// EveryLaunchSampled reports whether a SamplePeriodLabel summary says every
+// launch carried its CPU stack: it has one value, and that value is 1. Then
+// the call path under [gpu:launch] is not a sample of launches but all of
+// them, and a warning that says otherwise would be false.
+func EveryLaunchSampled(l LabelSummary) bool {
+	return l.Key == SamplePeriodLabel && l.Distinct <= 1 && len(l.Top) == 1 && l.Top[0].Value == "1"
+}
+
 // DefaultInexactLabels encodes gpu/projection.go's honesty contract:
 // gpu_join is written unconditionally as exactly "exact", "heuristic" or
 // "unmatched", and gpu_ambiguous appears only when the join picked one of
@@ -211,6 +219,12 @@ type Result struct {
 	SampleTypeName string
 	Unit           string
 	SampleIndex    int
+	// RootSampleTypes is set only by Fuse. It maps each synthetic root label
+	// to the SampleTypeName of the input that hangs under it, because a fused
+	// SampleTypeName ("cpu+gpu") is true of the graph and of no subtree in
+	// it. A label shared by inputs of different types maps to "": that
+	// subtree measures neither.
+	RootSampleTypes map[string]string
 	// SampleTypes lists every type the profile offered, so a page can say
 	// which one it is not showing.
 	SampleTypes []string
@@ -643,7 +657,7 @@ func gpuSamplingWarnings(res *Result) []string {
 	var period string
 	var periodSamples int
 	for _, l := range res.Labels {
-		if l.Key == SamplePeriodLabel && len(l.Top) > 0 {
+		if l.Key == SamplePeriodLabel && len(l.Top) > 0 && !EveryLaunchSampled(l) {
 			period = l.Top[0].Value
 			periodSamples = l.Count
 		}
@@ -664,7 +678,7 @@ func SamplingNotes(unsampled, total int64, period string, periodSamples int) []s
 	var w []string
 	if unsampled > 0 {
 		w = append(w, fmt.Sprintf(
-			"%.1f%% of the total sits under %s: measured GPU time whose launch was not one of the sampled ones, so it has no CPU caller and none is borrowed from a sampled sibling.",
+			"%.1f%% of the total sits under %s: measured GPU time whose launch carried no CPU stack, so it has no CPU caller and none is borrowed from a sampled sibling.",
 			pct(unsampled, total), UnsampledLaunchFrame))
 	}
 	if period != "" {

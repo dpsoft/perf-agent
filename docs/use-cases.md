@@ -9,22 +9,35 @@ included, not just at itself.
 ```bash
 # The workload must already have loaded the adapter:
 #   CUDA_INJECTION64_PATH=/path/to/libperfagent-gpu-nvidia.so python train.py
-./perf-agent --profile --offcpu --gpu \
-    --gpu-shim /path/to/libperfagent-gpu-nvidia.so --pid <PID>
+# The picture below also set PERFAGENT_GPU_SAMPLE_PERIOD=1 there, so every
+# launch carries its CPU stack instead of one in 8, and labels its GPU root
+# '[gpu] every launch' instead of '[gpu] per sampled launch'.
+./perf-agent --profile --gpu --duration 15s \
+    --gpu-shim /path/to/libperfagent-gpu-nvidia.so --pid <PID> \
+    --profile-output cpu.pb.gz --gpu-output gpu.pb.gz \
+    --gpu-telemetry-output telemetry.jsonl
 
-# One profile per collector; fuse them into the picture below
+# One profile per collector; fuse them, with the telemetry, into the picture below
 go run ./cmd/flamegraph -fuse -o fused.html \
+    -gpu-telemetry telemetry.jsonl \
     -in 'cpu.pb.gz;;[cpu] perf-agent 99 Hz' \
     -in 'gpu.pb.gz;;[gpu] per sampled launch'
 ```
 
-![PyTorch training: Python, torch's C++ autograd, and CUDA kernels in one flame graph](flamegraph-pytorch-gpu.png)
+![PyTorch training: Python, torch's C++ autograd, and CUDA kernels in one flame graph, with GPU telemetry](flamegraph-pytorch-gpu.gif)
 
-*The flame graph those two commands produce: `pa_train_step
-(torch_workload.py:76)` under `Thread.run (threading.py:1001)`, down through
-`torch::autograd` and `cublasSgemm_v2`, across the `[gpu:launch]` boundary into
-the CUDA kernel — Python, C++ and GPU in one tree.
-[Interactive version](flamegraph-pytorch-gpu.html).*
+*The flame graph those two commands produce, being used. One capture of a live
+PyTorch training loop on an RTX 3090: a 15-second CPU and GPU profile fused into
+one graph, with NVML telemetry sampled across the whole 30-second capture,
+attach and setup included. Every launch carried its CPU stack
+(`PERFAGENT_GPU_SAMPLE_PERIOD=1`), so the GPU half is call paths, not unsampled
+time. It follows `pa_train_step (torch_workload.py:76)` under `Thread.run
+(threading.py:1001)`, down through `torch::autograd` and `cublasSgemm_v2`,
+across the `[gpu:launch]` boundary into a `cutlass_80_simt_sgemm` kernel, beside
+torch's autograd engine thread launching `ampere_sgemm_128x64_tn` — then
+highlights every `cublas` frame.
+[Interactive version](https://htmlpreview.github.io/?https://github.com/dpsoft/perf-agent/blob/main/docs/flamegraph-pytorch-gpu.html)
+· [Still image](flamegraph-pytorch-gpu.png).*
 
 Injection happens during `cuInit` and cannot be added to a live process, so
 `CUDA_INJECTION64_PATH` must be set before the workload starts — Parca and

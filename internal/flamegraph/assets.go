@@ -51,8 +51,8 @@ const darkChrome = `--bg:#16151a;--panel:#1e1d23;--ink:#eceaf2;--muted:#a29caf;-
 // a caption. On a GPU profile every CPU frame is as wide as the DEVICE time
 // launched from it, not the CPU time spent in it; a reader fluent in flame
 // graphs assumes the opposite and the page carries no other signal to correct
-// them (issue #123). It decides from the axis label, so a CPU profile says
-// nothing.
+// them (issue #123). It decides from the axis of the frame's subtree, so a
+// CPU profile, or the CPU half of a fused one, says nothing.
 //
 // one-line note, the fixed status bar, the cursor tooltip and the info panel
 // — plus the frame box itself.
@@ -470,7 +470,12 @@ func rowCSS(maxDepth int) string {
 // that call path, not the CPU time spent in the frame. A reader fluent in
 // flame graphs assumes the opposite, because that is what the shape means
 // everywhere else, and the page carries no other signal to correct them
-// (issue #123). It decides from the axis label, so a CPU profile says nothing.
+// (issue #123). It decides from the axis of the frame's own subtree (axisOf):
+// on a fused page that is the data-axis of the root above it, elsewhere the
+// chart's axis label. So a CPU profile says nothing, and neither does the CPU
+// half of a fused one, whose chart axis also names gpu. The fused root itself
+// is the one frame whose axis is a sum, and a CPU+GPU sum adds sampled CPU
+// time to measured device time, so it says that rather than either.
 const script = `
 (function(){
 "use strict";
@@ -487,6 +492,7 @@ var mods=(function(){var e=doc.getElementById("modules");if(!e){return [];}
 function moduleOf(d){var i=d.m;return i===undefined?"":(mods[+i]||"");}
 var idle=st.textContent,zoomTarget=null;
 var axis=chart.getAttribute("aria-label");
+var everyLaunch=chart.dataset.everyLaunch==="1";
 var inverted=false,treeOn=false,treeRoot=null;
 var nav=[],navIdx=-1,cur=null,tally="";
 
@@ -562,12 +568,18 @@ function resolutionNote(d){
   if(d.domain==="unsym"){return "no symbol: the unwind found this frame, nothing could name it";}
   return "";
 }
+function axisOf(it){
+  for(var r=it;r;r=r.up){if(r.el.dataset.axis!==undefined){return r.el.dataset.axis;}}
+  return axis;
+}
 function widthMeaning(it,d){
-  if(unit.indexOf("nanoseconds")<0||axis.indexOf("gpu/")<0){return "";}
+  var types=axisOf(it).replace(/^Flame graph, /,"").split("/")[0].split("+");
+  if(unit.indexOf("nanoseconds")<0||types.indexOf("gpu")<0){return "";}
+  if(types.length>1){return types.indexOf("cpu")<0?"":"width: CPU samples and GPU time added together \u2014 compare within one root";}
   switch(d.domain){
   case "gpu-kernel": return "width: measured time this kernel ran on the device";
-  case "boundary": return "width: device time launched from this path, sampled one launch in N";
-  case "boundary-unattributed": return "width: measured device time whose launch was not stack-sampled, so it has no caller";
+  case "boundary": return everyLaunch?"width: device time launched from this path":"width: device time launched from this path, sampled one launch in N";
+  case "boundary-unattributed": return "width: measured device time whose launch carried no CPU stack, so it has no caller";
   default: return "width: GPU time launched from this call path \u2014 not CPU time spent here";
   }
 }

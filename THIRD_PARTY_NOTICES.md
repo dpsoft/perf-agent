@@ -21,7 +21,7 @@ The Go standard library and runtime are covered by the Go license, BSD-3-Clause
 | github.com/NVIDIA/go-nvml | v0.13.4-1 | `third_party/licenses/go/github.com/NVIDIA/go-nvml/`: `LICENSE` |
 | github.com/cenkalti/backoff/v5 | v5.0.3 | `third_party/licenses/go/github.com/cenkalti/backoff/v5/`: `LICENSE` |
 | github.com/cespare/xxhash/v2 | v2.3.0 | `third_party/licenses/go/github.com/cespare/xxhash/v2/`: `LICENSE.txt` |
-| github.com/cilium/ebpf | v0.21.0 | `third_party/licenses/go/github.com/cilium/ebpf/`: `LICENSE` |
+| github.com/cilium/ebpf | v0.22.0 | `third_party/licenses/go/github.com/cilium/ebpf/`: `LICENSE` |
 | github.com/dustin/go-humanize | v1.0.1 | `third_party/licenses/go/github.com/dustin/go-humanize/`: `LICENSE` |
 | github.com/go-logr/logr | v1.4.4 | `third_party/licenses/go/github.com/go-logr/logr/`: `LICENSE` |
 | github.com/go-logr/stdr | v1.2.2 | `third_party/licenses/go/github.com/go-logr/stdr/`: `LICENSE` |

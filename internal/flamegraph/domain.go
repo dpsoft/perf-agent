@@ -133,7 +133,7 @@ var domainInfo = [numDomains]DomainInfo{
 	},
 	DomainBoundaryUnattributed: {
 		Key: "boundary-unattributed", Label: "GPU work with no CPU stack", Fill: "var(--fill-boundary-unattributed)", Overlay: "var(--hatch-gap)", Stroke: "var(--edge-unattributed)",
-		Desc: "[gpu:launch unsampled] — measured GPU time whose launch was not one of the sampled ones: its duration is measured, its caller unknown and not borrowed from a sampled sibling. The same boundary grey, but paler, hatched and dashed: a boundary with nothing behind it.",
+		Desc: "[gpu:launch unsampled] — measured GPU time whose launch carried no CPU stack: its duration is measured, its caller unknown and not borrowed from a sampled sibling. The same boundary grey, but paler, hatched and dashed: a boundary with nothing behind it.",
 	},
 	DomainGPUKernel: {
 		Key: "gpu-kernel", Label: "GPU kernel execution", Fill: "var(--fill-gpu-kernel)",

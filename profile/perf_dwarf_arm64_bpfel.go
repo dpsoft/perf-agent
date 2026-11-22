@@ -94,6 +94,34 @@ type perf_dwarfWalkPersist struct {
 	Pad             uint32
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	perf_dwarfMapCfiLengths          = "cfi_lengths"
+	perf_dwarfMapCfiMissEvents       = "cfi_miss_events"
+	perf_dwarfMapCfiMissRatelimit    = "cfi_miss_ratelimit"
+	perf_dwarfMapCfiRules            = "cfi_rules"
+	perf_dwarfMapHandoffRanges       = "handoff_ranges"
+	perf_dwarfMapInterpProgs         = "interp_progs"
+	perf_dwarfMapInterpStats         = "interp_stats"
+	perf_dwarfMapKernStackmap        = "kern_stackmap"
+	perf_dwarfMapPidMappingLengths   = "pid_mapping_lengths"
+	perf_dwarfMapPidMappings         = "pid_mappings"
+	perf_dwarfMapPids                = "pids"
+	perf_dwarfMapStackEvents         = "stack_events"
+	perf_dwarfMapWalkStates          = "walk_states"
+	perf_dwarfMapWalkerScratch       = "walker_scratch"
+	perf_dwarfProgInterpResumeStep   = "interp_resume_step"
+	perf_dwarfProgInterpResumeWalk   = "interp_resume_walk"
+	perf_dwarfProgPerfDwarf          = "perf_dwarf"
+	perf_dwarfVarBtfAnchorCfiEntry   = "_btf_anchor_cfi_entry"
+	perf_dwarfVarBtfAnchorPidMapping = "_btf_anchor_pid_mapping"
+	perf_dwarfVarInterpEnabled       = "interp_enabled"
+	perf_dwarfVarKernelStacksEnabled = "kernel_stacks_enabled"
+	perf_dwarfVarSystemWide          = "system_wide"
+)
+
 // loadPerf_dwarf returns the embedded CollectionSpec for perf_dwarf.
 func loadPerf_dwarf() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_Perf_dwarfBytes)
@@ -114,7 +142,7 @@ func loadPerf_dwarf() (*ebpf.CollectionSpec, error) {
 //	*perf_dwarfMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadPerf_dwarfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadPerf_dwarfObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadPerf_dwarf()
 	if err != nil {
 		return err

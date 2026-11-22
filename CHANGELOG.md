@@ -62,6 +62,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The stdio `perf-agent-mcp` links no networking package; it has no page
   tools and no `--live` flag. Headless loops keep using it.
 
+## [1.5.3] - 2026-11-15
+
+A fix release that adds support for Linux 7.1 and later. The kernel floor is
+unchanged: Linux 6.2 and later. On Linux 7.1 and later, whose BTF header was
+extended, perf-agent 1.5.2 and earlier cannot load any BPF program; 1.5.3 can.
+On kernels before 7.1 both versions work.
+
+### Fixed
+
+- On Linux 7.1 and later every BPF program failed to load with `apply CO-RE
+  relocations: load kernel spec: load vmlinux: parsing .BTF header: header
+  contains non-zero trailer`, so no profiler could start. The header in
+  `/sys/kernel/btf/vmlinux` grew from 24 to 32 bytes to describe the new BTF
+  layout section, and cilium/ebpf v0.21.0 refused a longer header whose extra
+  bytes are not zero. perf-agent now uses cilium/ebpf v0.22.0, which reads it
+  ([#266](https://github.com/dpsoft/perf-agent/pull/266)). Seen on Fedora 44
+  with kernel 7.3.3; kernels before 7.1 are not affected.
+- The "Interactive version" links in the README and in
+  `docs/use-cases.md` opened the flame graph's HTML source on GitHub. They
+  now open the rendered page through htmlpreview.github.io
+  ([#267](https://github.com/dpsoft/perf-agent/pull/267)).
+
+### Changed
+
+- With cilium/ebpf v0.22.0 the kernel's BTF is no longer cached for the life
+  of the process: each set of BPF programs parses it again when it loads. That
+  adds a few tens of milliseconds per load at start-up, and less memory stays
+  in use afterwards.
+- cilium/ebpf v0.22.0 uses a BPF token when one is available. As root or with
+  file capabilities on the host nothing changes. Inside a user namespace that
+  delegates BPF through a token (LXC, Incus, systemd), the token's limits
+  apply.
+
+### Internal
+
+- `github.com/cilium/ebpf` is v0.22.0 in both `go.mod` and `test/go.mod`, and
+  the bpf2go wrappers are regenerated with it. No BPF object changed.
+
 ## [1.5.2] - 2026-11-12
 
 A packaging and licensing release. Release archives and both container images
@@ -698,7 +736,8 @@ interpreter — neither of which modifies the application being measured.
 
 - PGO examples: `create_llvm_prof` + rustc invocations so the cycle works end-to-end ([#18](https://github.com/dpsoft/perf-agent/pull/18)).
 
-[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.5.2...HEAD
+[Unreleased]: https://github.com/dpsoft/perf-agent/compare/v1.5.3...HEAD
+[1.5.3]: https://github.com/dpsoft/perf-agent/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/dpsoft/perf-agent/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/dpsoft/perf-agent/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/dpsoft/perf-agent/compare/v1.4.1...v1.5.0

@@ -398,7 +398,8 @@ func (v *View) serialization(n *Node) (Serialization, error) {
 // samplingNotes states launch sampling for the view exactly as Fold does:
 // the period is the gpu_sample_period value with the largest total (ties
 // to the smaller string), counted over every sample carrying the label,
-// and nothing is said when the view's total is 0.
+// and nothing is said when the view's total is 0 or every launch carried a
+// stack (period 1 alone).
 func (v *View) samplingNotes(unsampled int64) ([]string, error) {
 	if v.Total == 0 {
 		return nil, nil
@@ -424,6 +425,12 @@ func (v *View) samplingNotes(unsampled int64) ([]string, error) {
 		if !found || total > totals[period] || (total == totals[period] && p < period) {
 			period, found = p, true
 		}
+	}
+	// At period 1 alone every launch carried its stack, so the call path
+	// under [gpu:launch] is its share of GPU time; Fold says nothing about
+	// sampling then (foldedstacks.EveryLaunchSampled), and neither do we.
+	if len(totals) == 1 && period == "1" {
+		period = ""
 	}
 	return foldedstacks.SamplingNotes(unsampled, v.Total, period, carrying), nil
 }

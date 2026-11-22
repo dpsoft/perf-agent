@@ -3,7 +3,7 @@ module github.com/dpsoft/perf-agent/test
 go 1.26.0
 
 require (
-	github.com/cilium/ebpf v0.21.0
+	github.com/cilium/ebpf v0.22.0
 	github.com/dpsoft/perf-agent v0.0.0
 	github.com/google/pprof v0.0.0-20260402051712-545e8a4df936
 	github.com/stretchr/testify v1.12.1

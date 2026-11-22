@@ -680,12 +680,30 @@ func TestLivePageRacesNothing(t *testing.T) {
 		}
 	})
 	b, a, cn := o.nodeID("b"), o.nodeID("a"), o.nodeID("c")
-	explained := o.args(map[string]any{"explanations": shareClaim(b, "0.411", "b takes {c1}")})
-	rejected := o.args(map[string]any{"explanations": shareClaim(cn, "0.62", "c takes {c1}")})
+	explained := map[string]any{"explanations": shareClaim(b, "0.411", "b takes {c1}")}
+	rejected := map[string]any{"explanations": shareClaim(cn, "0.62", "c takes {c1}")}
+	// The opener below opens more profiles than MaxOpenHandles, so it can
+	// evict o's handle between two publications. A client told "call
+	// open(path) again" does that, and so does this one.
+	explain := func(extra map[string]any) (string, bool) {
+		for {
+			text, isErr := o.c.try("page_explain", o.args(extra))
+			if !isErr || !strings.Contains(text, "is not open in this server") {
+				return text, isErr
+			}
+			o = o.c.open("cpu.pb.gz")
+		}
+	}
 
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	var ok atomic.Int64
+	// A Fatalf below must not leave readers running against a server the
+	// test's cleanup is closing.
+	defer func() {
+		stop.Store(true)
+		wg.Wait()
+	}()
 	for i := range 8 {
 		wg.Go(func() {
 			for !stop.Load() {
@@ -723,9 +741,11 @@ func TestLivePageRacesNothing(t *testing.T) {
 		}
 	})
 	for i := range 50 {
-		p.call("page_explain", explained)
+		if text, isErr := explain(explained); isErr {
+			t.Fatalf("page_explain: %s", text)
+		}
 		if i < 20 {
-			if text, isErr := o.c.try("page_explain", rejected); !isErr {
+			if text, isErr := explain(rejected); !isErr {
 				t.Fatalf("the rejection: %s", text)
 			}
 		}

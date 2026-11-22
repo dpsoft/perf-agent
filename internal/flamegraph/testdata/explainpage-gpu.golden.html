@@ -183,7 +183,7 @@ button.cite{display:inline;font:11px ui-monospace,SFMono-Regular,Menlo,Consolas,
 </header>
 <div class="legend" aria-label="Colour key"><span class="c"><i class="sw" data-domain="app"></i>application</span><span class="c"><i class="sw" data-domain="boundary"></i>CPU→GPU boundary</span><span class="c"><i class="sw" data-domain="boundary-unattributed"></i>GPU work with no CPU stack</span><span class="c"><i class="sw" data-domain="gpu-kernel"></i>GPU kernel execution</span><span class="c key">✦ path with an explanation</span></div>
 <section class="notes" aria-label="Sampling notes"><b>Sampling notes</b>
-<ul><li>20.0% of the total sits under [gpu:launch unsampled]: measured GPU time whose launch was not one of the sampled ones, so it has no CPU caller and none is borrowed from a sampled sibling.</li><li>4 samples carry gpu_sample_period=8: one launch in 8 contributed a CPU stack. The call path beneath [gpu:launch] is therefore a sample of launches, not a sample of GPU time - do not read its width as the share of GPU work that call path is responsible for. Nothing here is scaled by 8; every value is a measured duration.</li></ul>
+<ul><li>20.0% of the total sits under [gpu:launch unsampled]: measured GPU time whose launch carried no CPU stack, so it has no CPU caller and none is borrowed from a sampled sibling.</li><li>4 samples carry gpu_sample_period=8: one launch in 8 contributed a CPU stack. The call path beneath [gpu:launch] is therefore a sample of launches, not a sample of GPU time - do not read its width as the share of GPU work that call path is responsible for. Nothing here is scaled by 8; every value is a measured duration.</li></ul>
 </section>
 <main class="body">
 <div class="graph">

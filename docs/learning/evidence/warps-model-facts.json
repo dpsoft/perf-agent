@@ -1,0 +1,45 @@
+{
+  "verified_at": "2026-11-24",
+  "scope": "Synthetic teaching models, not captured workload data or hardware timing predictions",
+  "scheduler": {
+    "scope": "One illustrative scheduler on one SM; one issue opportunity per step",
+    "instructions_per_warp": ["load", "use data", "finish"],
+    "default_load_result_delay_steps": 4,
+    "shared_data_arrival_step": 8,
+    "selection": "Round robin among eligible resident warps",
+    "cases": [
+      {"warps": 1, "shared_delay": false, "issued_instructions": 3, "opportunities": 6, "empty_slots": 3},
+      {"warps": 4, "shared_delay": false, "issued_instructions": 12, "opportunities": 12, "empty_slots": 0},
+      {"warps": 1, "shared_delay": true, "issued_instructions": 3, "opportunities": 10, "empty_slots": 7},
+      {"warps": 4, "shared_delay": true, "issued_instructions": 12, "opportunities": 16, "empty_slots": 4}
+    ],
+    "limitations": [
+      "More warps add work; total steps across these cases are not a fixed-work speedup comparison",
+      "Active, eligible and selected are nested descriptions, not a partition",
+      "No registers, shared-memory capacity, execution pipelines, issue-width limits or memory bandwidth are simulated",
+      "The shared data arrival is a teaching scenario, not evidence of memory saturation"
+    ]
+  },
+  "profiler": {
+    "scope": "Independent synthetic example, not measurements derived from the simulated scheduler",
+    "example_kernel_duration_us": 100,
+    "example_sample_counts": [6, 3, 1],
+    "example_allocated_duration_us": [60, 30, 10],
+    "categories": ["load dependency", "other dependency", "selected for issue"],
+    "projection_source": "gpu/projection.go:distributeExecutionWeight at 13c31b8887d3ae3d5913b9949d07be55eb6c70eb",
+    "semantics": "Measured kernel duration is distributed by PC sample Count. Integer nanosecond rounding residue is added to the last allocation, preserving the duration total.",
+    "limitations": [
+      "Per-PC and per-state allocations are not independently measured instruction or stall durations",
+      "A sampled warp waiting does not imply that the whole SM or scheduler issued nothing",
+      "These observations alone do not prove memory bandwidth saturation",
+      "PC evidence depends on device support, capture configuration and attribution support"
+    ]
+  },
+  "sources": [
+    "https://modal.com/gpu-glossary/device-software/warp",
+    "https://modal.com/gpu-glossary/perf/latency-hiding",
+    "https://modal.com/gpu-glossary/perf/warp-execution-state",
+    "https://docs.nvidia.com/cupti/api/group__CUPTI__ACTIVITY__API.html",
+    "https://docs.nvidia.com/nsight-compute/ProfilingGuide/"
+  ]
+}

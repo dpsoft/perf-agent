@@ -1,0 +1,197 @@
+<div id="pa-warp-learning">
+  <div class="wl-heading"><span class="text-small text-muted">GPU learning · Lesson 2</span><h2>Inside a kernel</h2></div>
+  <div class="viz-controls" role="group" aria-label="Lesson sections">
+    <button type="button" class="btn" data-part="explore" aria-pressed="true">Explore</button>
+    <button type="button" class="btn" data-part="profiler" aria-pressed="false">Profiler</button>
+    <button type="button" class="btn" data-part="check" aria-pressed="false">Check</button>
+  </div>
+  <section data-panel="explore" aria-label="Warp scheduler simulation">
+    <div class="viz-controls">
+      <label class="form-label">Resident warps
+        <select class="form-select" data-option="warps"><option value="1">1 warp</option><option value="4" selected>4 warps</option></select>
+      </label>
+      <label class="form-check"><input type="checkbox" class="form-check-input" data-option="shared"><span class="form-check-label">Shared data ready at step 8</span></label>
+    </div>
+    <div class="viz-row"><span class="viz-badge">Illustrative scheduler</span><span class="text-small">One issue opportunity per step · not GPU clock cycles</span></div>
+    <div class="wl-model" role="img" aria-label="Resident warps on one streaming multiprocessor and the instruction selected at the current simulation step">
+      <div class="wl-subheading"><h3>One SM · one scheduler shown</h3><span class="text-small">Warp = 32 NVIDIA threads</span></div>
+      <div class="wl-program text-small"><code>load → use data → finish</code><span>Load result: 4 steps later, or shared data at step 8</span></div>
+      <div class="text-small">Same program per warp; adding warps adds work.</div>
+      <div data-slot="warps" class="wl-warps"></div>
+      <div class="wl-issue"><span class="text-small text-muted">Instruction issue</span><span data-slot="issue"></span></div>
+      <div class="wl-subheading"><span>Issue history</span><span class="text-small">Letter = warp issued · — = no eligible warp</span></div>
+      <div data-slot="history" class="wl-history" role="img" aria-label="Instruction issue history by simulation step"></div>
+      <div data-slot="utilization" class="text-small tabular-nums"></div>
+    </div>
+    <div class="viz-controls"><button type="button" class="btn" data-action="back">Back</button><button type="button" class="btn btn-primary" data-action="play">Play</button><button type="button" class="btn" data-action="next">Step</button><span class="tabular-nums" data-slot="step"></span></div>
+    <div data-slot="detail" class="wl-detail" aria-live="polite"></div>
+  </section>
+  <section data-panel="profiler" aria-label="Reading profiler evidence" hidden>
+    <div class="viz-row"><span class="viz-badge">Synthetic example</span><span class="text-small">Independent of the scheduler above · not a captured workload</span></div>
+    <div class="wl-evidence">
+      <div class="wl-subheading"><h3>Kernel interval</h3><span class="tabular-nums">100 µs</span></div>
+      <div class="wl-duration" role="img" aria-label="CUPTI kernel start and end delimit an example measured duration of 100 microseconds"><span>Start</span><span>CUPTI activity timestamps</span><span>End</span></div>
+      <label class="form-check"><input type="checkbox" class="form-check-input" data-option="pc"><span class="form-check-label">Add optional PC samples</span></label>
+      <div class="text-small">PC evidence requires a supported device and capture configuration.</div>
+      <div data-slot="pc-data" hidden>
+        <div class="wl-subheading"><h3>Sampled instruction + state</h3><span>10 example observations</span></div>
+        <div class="wl-samples" role="img" aria-label="Ten synthetic observations: six at load dependency, three at another dependency, and one selected for issue">
+          <span data-kind="load">L</span><span data-kind="load">L</span><span data-kind="load">L</span><span data-kind="load">L</span><span data-kind="load">L</span><span data-kind="load">L</span><span data-kind="dep">D</span><span data-kind="dep">D</span><span data-kind="dep">D</span><span data-kind="selected">S</span>
+        </div>
+        <table class="table table-sm"><caption class="sr-only">Synthetic counts and proportional duration allocation in perf-agent</caption><thead><tr><th>Instruction / state</th><th class="text-end">Count</th><th class="text-end">Allocated</th></tr></thead><tbody><tr><td>L · load dependency</td><td class="text-end tabular-nums">6</td><td class="text-end tabular-nums">60 µs</td></tr><tr><td>D · other dependency</td><td class="text-end tabular-nums">3</td><td class="text-end tabular-nums">30 µs</td></tr><tr><td>S · selected for issue</td><td class="text-end tabular-nums">1</td><td class="text-end tabular-nums">10 µs</td></tr></tbody></table>
+        <div class="text-small">Allocated duration = kernel duration × sample share, rounded in nanoseconds. These are not separate stall stopwatches.</div>
+      </div>
+      <div data-slot="pc-detail" class="wl-detail" aria-live="polite">Kernel duration alone does not identify which instructions were waiting.</div>
+    </div>
+  </section>
+  <section data-panel="check" aria-label="Check your interpretation" hidden>
+    <fieldset><legend>A warp is waiting for a load. Must instruction issue stop?</legend><label class="form-check"><input class="form-check-input" type="radio" name="wl-check" value="yes"><span class="form-check-label">Yes, the whole SM must wait.</span></label><label class="form-check"><input class="form-check-input" type="radio" name="wl-check" value="eligible"><span class="form-check-label">Another eligible warp may issue an instruction.</span></label><label class="form-check"><input class="form-check-input" type="radio" name="wl-check" value="more"><span class="form-check-label">More resident warps always remove every stall.</span></label></fieldset>
+    <div data-slot="feedback" class="wl-detail" aria-live="polite"></div>
+  </section>
+  <div class="wl-footer text-small"><a href="https://modal.com/gpu-glossary/device-software/warp" target="_blank" rel="noopener noreferrer">Modal: Warp</a> · <a href="https://modal.com/gpu-glossary/perf/latency-hiding" target="_blank" rel="noopener noreferrer">Latency hiding</a> · <a href="https://docs.nvidia.com/cupti/api/group__CUPTI__ACTIVITY__API.html" target="_blank" rel="noopener noreferrer">NVIDIA: PC states</a> · <a href="https://github.com/dpsoft/perf-agent/blob/13c31b8887d3ae3d5913b9949d07be55eb6c70eb/gpu/projection.go#L836" target="_blank" rel="noopener noreferrer">perf-agent allocation</a></div>
+</div>
+<style>
+#pa-warp-learning {display:grid;gap:calc(var(--font-size-base) * 1);color:var(--foreground);min-width:0;}
+#pa-warp-learning .wl-heading {display:grid;gap:calc(var(--font-size-base) * .25);padding-right:calc(var(--font-size-base) * 6.5);}
+#pa-warp-learning section:not([hidden]),#pa-warp-learning .wl-evidence {display:grid;gap:calc(var(--font-size-base) * 1);min-width:0;}
+#pa-warp-learning [hidden] {display:none !important;}
+#pa-warp-learning .wl-model {display:grid;gap:calc(var(--font-size-base) * .8);min-width:0;}
+#pa-warp-learning .wl-subheading,#pa-warp-learning .wl-program {display:flex;align-items:baseline;justify-content:space-between;gap:calc(var(--font-size-base) * .5);flex-wrap:wrap;}
+#pa-warp-learning .wl-warps {display:grid;gap:calc(var(--font-size-base) * .5);}
+#pa-warp-learning .wl-warp {display:grid;grid-template-columns:5em 1fr;gap:calc(var(--font-size-base) * .5);align-items:center;}
+#pa-warp-learning .wl-state {padding:calc(var(--font-size-base) * .65);background:var(--muted);color:var(--foreground);overflow-wrap:anywhere;}
+#pa-warp-learning .wl-state[data-selected="true"] {background:color-mix(in srgb,var(--viz-series-1) 18%,var(--background));}
+#pa-warp-learning .wl-state[data-waiting="true"] {background:color-mix(in srgb,var(--viz-series-2) 15%,var(--background));}
+#pa-warp-learning .wl-issue {display:grid;gap:calc(var(--font-size-base) * .25);padding-block:calc(var(--font-size-base) * .5);}
+#pa-warp-learning .wl-history {display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:calc(var(--font-size-base) * .3);}
+#pa-warp-learning .wl-tick {display:grid;justify-items:center;gap:calc(var(--font-size-base) * .25);padding:calc(var(--font-size-base) * .35) 0;color:var(--foreground);background:var(--muted);}
+#pa-warp-learning .wl-tick[data-issued="true"] {background:color-mix(in srgb,var(--viz-series-1) 18%,var(--background));}
+#pa-warp-learning .wl-tick[aria-current="step"] {outline:2px solid var(--foreground);outline-offset:1px;}
+#pa-warp-learning .wl-tick[data-future="true"] {background:transparent;}
+#pa-warp-learning .wl-detail {min-height:calc(var(--font-size-base) * 3);overflow-wrap:anywhere;}
+#pa-warp-learning .wl-duration {display:flex;justify-content:space-between;gap:calc(var(--font-size-base) * .5);padding:calc(var(--font-size-base) * .8);background:color-mix(in srgb,var(--viz-series-1) 18%,var(--background));flex-wrap:wrap;}
+#pa-warp-learning .wl-samples {display:flex;gap:calc(var(--font-size-base) * .4);flex-wrap:wrap;}
+#pa-warp-learning .wl-samples span {display:grid;place-items:center;min-width:calc(var(--font-size-base) * 1.8);min-height:calc(var(--font-size-base) * 1.8);background:var(--muted);}
+#pa-warp-learning .wl-samples [data-kind="load"] {background:color-mix(in srgb,var(--viz-series-2) 18%,var(--background));}
+#pa-warp-learning .wl-samples [data-kind="dep"] {background:color-mix(in srgb,var(--viz-series-1) 18%,var(--background));}
+#pa-warp-learning fieldset {border:0;margin:0;padding:0;min-width:0;display:grid;gap:calc(var(--font-size-base) * .5);}
+#pa-warp-learning legend {padding:0;margin-bottom:calc(var(--font-size-base) * .6);}
+#pa-warp-learning .wl-footer {overflow-wrap:anywhere;}
+</style>
+<script>
+(() => {
+  const root = document.getElementById('pa-warp-learning');
+  const q = selector => root.querySelector(selector);
+  const parts = ['explore','profiler','check'];
+  const instance = Math.random().toString(36).slice(2);
+  let state = {part:'explore',warps:4,shared:false,step:1,pc:false,answer:null};
+  let timer = null;
+  const names = ['A','B','C','D'];
+  const operations = ['load','use data','finish'];
+  function schedule() {
+    const warps = Array.from({length:state.warps}, () => ({pc:0,ready:0}));
+    const result = [];
+    let turn = 0;
+    for (let t=0;t<32 && warps.some(w=>w.pc<3);t++) {
+      const before = warps.map(w => ({...w}));
+      let selected = -1;
+      for(let offset=0;offset<warps.length;offset++) {
+        const index = (turn+offset)%warps.length;
+        if(warps[index].pc<3 && warps[index].ready<=t) {selected=index;break;}
+      }
+      const op = selected<0 ? null : warps[selected].pc;
+      result.push({t,warps:before,selected,op});
+      if(selected>=0) {
+        const warp=warps[selected];
+        if(warp.pc===0) warp.ready=state.shared ? 8 : t+4;
+        warp.pc++;
+        turn=(selected+1)%warps.length;
+      }
+    }
+    return result;
+  }
+  function stop() {if(timer!==null)clearInterval(timer);timer=null;}
+  function save() {
+    const snapshot={modelContent:{lesson:'gpu-warps-v1',...state},privateContent:{instance}};
+    if(window.openai?.setWidgetState) window.openai.setWidgetState(snapshot).catch(()=>{});
+  }
+  function render() {
+    const rows=schedule();
+    state.step=Math.min(Math.max(0,state.step),rows.length-1);
+    const frame=rows[state.step];
+    root.dataset.part=state.part;
+    for(const button of root.querySelectorAll('[data-part]'))button.setAttribute('aria-pressed',String(button.dataset.part===state.part));
+    for(const panel of root.querySelectorAll('[data-panel]'))panel.hidden=panel.dataset.panel!==state.part;
+    q('[data-option="warps"]').value=String(state.warps);
+    q('[data-option="shared"]').checked=state.shared;
+    q('[data-option="pc"]').checked=state.pc;
+    q('[data-slot="pc-data"]').hidden=!state.pc;
+    q('[data-slot="pc-detail"]').textContent=state.pc
+      ? '60 µs is an allocation from 6 of 10 samples, not a measured 60 µs wait. PC samples do not replay every warp or prove bandwidth saturation.'
+      : 'Kernel duration alone does not identify which instructions were waiting.';
+    q('[data-slot="warps"]').replaceChildren(...frame.warps.map((warp,index)=>{
+      const row=document.createElement('div');row.className='wl-warp';
+      const label=document.createElement('span');label.textContent='Warp '+names[index];
+      const value=document.createElement('span');value.className='wl-state';
+      const selected=index===frame.selected,waiting=warp.pc<3&&warp.ready>frame.t;
+      value.dataset.selected=String(selected);value.dataset.waiting=String(waiting);
+      value.textContent=warp.pc===3 ? 'Exited' : waiting ? 'Active · waiting for load' : selected ? 'Active · eligible · selected: '+operations[warp.pc] : 'Active · eligible';
+      row.append(label,value);return row;
+    }));
+    q('[data-slot="issue"]').textContent=frame.selected<0 ? 'No eligible warp → no instruction issued' : 'Warp '+names[frame.selected]+' → '+operations[frame.op];
+    q('[data-slot="history"]').replaceChildren(...rows.map((row,index)=>{
+      const cell=document.createElement('span');cell.className='wl-tick';
+      cell.dataset.issued=String(index<=state.step&&row.selected>=0);cell.dataset.future=String(index>state.step);
+      if(index===state.step)cell.setAttribute('aria-current','step');
+      const label=document.createElement('span');label.className='text-small tabular-nums';label.textContent=String(index);
+      const value=document.createElement('span');value.textContent=index>state.step ? '·' : row.selected<0 ? '—' : names[row.selected];
+      cell.setAttribute('aria-label','Step '+index+': '+(index>state.step?'not shown yet':row.selected<0?'no eligible warp':'warp '+names[row.selected]+' issues '+operations[row.op]));
+      cell.append(label,value);return cell;
+    }));
+    q('[data-slot="step"]').textContent='Step '+state.step+' / '+(rows.length-1);
+    q('[data-slot="utilization"]').textContent=rows.filter(row=>row.selected>=0).length+' instructions / '+rows.length+' issue opportunities in the full toy schedule';
+    q('[data-action="back"]').disabled=state.step===0;
+    q('[data-action="next"]').disabled=state.step===rows.length-1;
+    q('[data-action="play"]').textContent=timer===null ? state.step===rows.length-1?'Replay':'Play' : 'Pause';
+    const waiting=frame.warps.some(w=>w.pc<3&&w.ready>frame.t);
+    q('[data-slot="detail"]').textContent=frame.selected<0
+      ? state.shared ? 'A shared data dependency leaves every active warp waiting. More resident warps cannot issue until the data arrives.' : 'The active warp is waiting. No other eligible warp is available to fill this issue opportunity.'
+      : waiting ? 'A warp is waiting, while another issues. Waiting does not necessarily leave this scheduler idle.'
+      : frame.op===0 ? 'A load issues now; its result arrives later. Other eligible warps can use the intervening opportunities.'
+      : 'Ready operands allow the next instruction to issue. This is a simplified schedule, not a hardware trace.';
+    const feedback={eligible:'Correct. Eligible work can hide another warp’s latency. Active includes waiting warps; selected is also eligible.',yes:'Only if no eligible warp is available. A waiting warp remains active while the scheduler can choose other eligible work.',more:'Resident does not mean eligible. Shared dependencies, resource limits and issue capacity can leave more warps unable to help.'};
+    q('[data-slot="feedback"]').textContent=feedback[state.answer]||'Choose an interpretation.';
+    for(const input of root.querySelectorAll('input[name="wl-check"]'))input.checked=input.value===state.answer;
+  }
+  root.addEventListener('click',event=>{
+    const button=event.target.closest('button');if(!button||!root.contains(button))return;
+    if(button.dataset.part) {stop();state.part=button.dataset.part;}
+    if(button.dataset.action==='back') {stop();state.step--;}
+    if(button.dataset.action==='next') {stop();state.step++;}
+    if(button.dataset.action==='play') {
+      if(timer!==null) stop();
+      else {
+        if(state.step===schedule().length-1)state.step=0;
+        timer=setInterval(()=>{state.step++;if(state.step>=schedule().length-1){stop();render();save();}else render();},900);
+      }
+    }
+    render();save();
+  });
+  root.addEventListener('change',event=>{
+    const input=event.target;
+    if(input.dataset.option==='warps') {stop();state.warps=input.value==='1'?1:4;state.step=1;}
+    if(input.dataset.option==='shared') {stop();state.shared=input.checked;state.step=1;}
+    if(input.dataset.option==='pc')state.pc=input.checked;
+    if(input.name==='wl-check')state.answer=input.value;
+    render();save();
+  });
+  function restore(snapshot) {
+    const saved=snapshot?.modelContent;if(saved?.lesson!=='gpu-warps-v1')return;
+    stop();state={part:parts.includes(saved.part)?saved.part:'explore',warps:saved.warps===1?1:4,shared:saved.shared===true,step:Number.isInteger(saved.step)?saved.step:1,pc:saved.pc===true,answer:['yes','eligible','more'].includes(saved.answer)?saved.answer:null};
+    render();
+  }
+  window.addEventListener('openai:set_globals',event=>{const snapshot=event.detail?.globals?.widgetState;if(snapshot?.privateContent?.instance!==instance)restore(snapshot);});
+  document.addEventListener('visibilitychange',()=>{if(document.hidden){stop();render();}});
+  restore(window.openai?.widgetState);render();
+})();
+</script>
